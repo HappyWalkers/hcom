@@ -71,6 +71,20 @@ fmt:
 
 [unix]
 [group("checks")]
+[doc("Run every local check except mock setup and real-tool tests")]
+check:
+    @just ci dist-check typecheck fmt clippy test msrv
+
+# scripts/ci-windows.ps1 has no dist-check/typecheck/msrv steps and rejects
+# unknown step names, so Windows runs the subset it has.
+[windows]
+[group("checks")]
+[doc("Run every local check except mock setup and real-tool tests")]
+check:
+    just ci fmt clippy test
+
+[unix]
+[group("checks")]
 [doc("cargo test under the ci TMPDIR; extra args are forwarded to cargo")]
 test *args:
     env TMPDIR="{{ci-tmp}}" cargo test --locked {{ args }}
