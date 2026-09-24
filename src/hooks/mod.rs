@@ -178,6 +178,9 @@ pub mod test_helpers {
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &test_home);
+            // CODEX_HOME overrides HOME; inheriting it would write test hooks
+            // into the user's real Codex configuration.
+            std::env::remove_var("CODEX_HOME");
             std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.129.0");
         }
         crate::config::Config::reset();

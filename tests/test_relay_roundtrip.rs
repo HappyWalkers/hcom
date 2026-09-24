@@ -1536,7 +1536,12 @@ fn test_relay_roundtrip() {
     // real message separately via `hcom send`, so this enter only flushes
     // the marker and doesn't step on the test.
     let clear_out = hcom_with_dir(&format!("term inject {remote_name} --enter"), &path_a);
-    assert!(clear_out.status.success());
+    assert!(
+        clear_out.status.success(),
+        "remote term inject (enter) failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&clear_out.stdout),
+        String::from_utf8_lossy(&clear_out.stderr)
+    );
     let rpc_inject_enter = poll_rpc_result_on_device(&path_b, "term_inject");
     assert_eq!(
         rpc_inject_enter["ok"].as_bool(),
