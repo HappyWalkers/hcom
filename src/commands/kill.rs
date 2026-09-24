@@ -672,12 +672,22 @@ fn kill_single(
 /// Kill a process and close its terminal pane.
 /// Returns (KillResult, pane_closed, pane_retry_command, preset_name, pane_id).
 fn kill_instance(
-    _db: &HcomDb,
+    db: &HcomDb,
     name: &str,
     pid: u32,
     instance: &crate::db::InstanceRow,
     is_headless: bool,
 ) -> (terminal::KillResult, bool, Option<String>, String, String) {
+    // The PTY cleanup thread may run as soon as the signal lands. Record the
+    // requested reason first so it cannot turn an explicit kill into a
+    // stopped snapshot with reason "closed".
+    if let Err(e) = db.set_status(name, "inactive", "exit:killed") {
+        log_info(
+            "kill",
+            "lifecycle.kill_status",
+            &format!("name={name} err={e}"),
+        );
+    }
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =

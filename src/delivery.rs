@@ -2563,7 +2563,8 @@ pub(crate) fn cleanup_deleted_instance(db: &mut HcomDb, current_name: &str) {
         }
     };
 
-    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire);
+    let was_killed = EXIT_WAS_KILLED.load(std::sync::atomic::Ordering::Acquire)
+        || matches!(db.get_status(current_name), Ok(Some((_, context))) if context == "exit:killed");
     let (exit_context, exit_reason) = if was_killed {
         ("exit:killed", "killed")
     } else {
@@ -2756,6 +2757,38 @@ mod tests {
             .collect();
 
         assert_eq!(events, vec![("samu".to_string(), "killed".to_string())]);
+    }
+
+    #[test]
+    fn pty_cleanup_keeps_killed_reason_recorded_by_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let mut db = HcomDb::open_raw(&db_path).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at)
+                 VALUES ('kiro', 'codex', 'active', 'running', 0, 0)",
+                [],
+            )
+            .unwrap();
+        // `hcom kill` records the reason before signalling; the PTY cleanup
+        // can then win the race without having seen the signal itself.
+        db.set_status("kiro", ST_INACTIVE, "exit:killed").unwrap();
+
+        cleanup_deleted_instance(&mut db, "kiro");
+
+        let reason: String = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'kiro'
+                   AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "killed");
     }
 
     #[test]
