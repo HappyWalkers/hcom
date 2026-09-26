@@ -535,7 +535,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         invocation: HookInvocation::JsonStdin,
     },
     // - require_ready_prompt=false: "? for shortcuts" hides in narrow terminals.
-    // - require_prompt_empty=true: VT100 dim detection on the `›` prompt char.
+    // - require_prompt_empty=true: VT100 dim detection after `›` or `»`.
     gates: GatesSpec {
         require_idle: true,
         require_ready_prompt: false,

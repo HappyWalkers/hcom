@@ -369,7 +369,8 @@ impl ScreenTracker {
             if is_codex_startup_line(&line) {
                 return false;
             }
-            pattern_visible |= line.contains(&self.ready_pattern);
+            pattern_visible |= line.contains(&self.ready_pattern)
+                || (self.ready_pattern == "› " && line.contains("» "));
         }
         pattern_visible
     }
@@ -892,8 +893,9 @@ impl ScreenTracker {
 
     /// Extract Codex input text.
     ///
-    /// Codex uses `›` (U+203A) as prompt character. Placeholder text is rendered
-    /// with dim attribute, real user input is not dim.
+    /// Codex uses `›` (U+203A) as its normal prompt character and `»` (U+00BB)
+    /// at Ultra reasoning effort. Placeholder text is rendered with dim
+    /// attribute, real user input is not dim.
     ///
     /// Uses vt100's cell-level dim attribute to distinguish placeholder from
     /// real input, avoiding race conditions where ready pattern is still visible
@@ -908,28 +910,33 @@ impl ScreenTracker {
             return None;
         }
 
-        // Search bottom-to-top for › prompt character
-        // › (U+203A, SINGLE RIGHT-POINTING ANGLE QUOTATION MARK) = 3 bytes UTF-8 + 1 space = 4 bytes total
+        // Submitted history can contain `›` above a live `»` composer.
+        // Search bottom-to-top so the live prompt wins.
         for (row_idx, line) in lines.iter().enumerate().rev() {
             let trimmed = line.trim_start();
-            if let Some(text) = trimmed.strip_prefix("› ") {
-                let text = trim_with_nbsp(text);
+            let (prompt_char, text) = if let Some(text) = trimmed.strip_prefix("› ") {
+                ("›", text)
+            } else if let Some(text) = trimmed.strip_prefix("» ") {
+                ("»", text)
+            } else {
+                continue;
+            };
+            let text = trim_with_nbsp(text);
 
-                if text.is_empty() {
-                    return Some(String::new());
-                }
+            if text.is_empty() {
+                return Some(String::new());
+            }
 
-                // Dim text = placeholder, not real input
-                match self.is_dim_after_prompt(row_idx as u16, "›") {
-                    Some(true) => return Some(String::new()),
-                    Some(false) => return Some(text.to_string()),
-                    None => {
-                        // Can't locate prompt glyph, fall back to ready-pattern logic
-                        if self.is_ready() {
-                            return Some(String::new());
-                        }
-                        return Some(text.to_string());
+            // Dim text = placeholder, not real input.
+            match self.is_dim_after_prompt(row_idx as u16, prompt_char) {
+                Some(true) => return Some(String::new()),
+                Some(false) => return Some(text.to_string()),
+                None => {
+                    // Can't locate prompt glyph, fall back to ready-pattern logic.
+                    if self.is_ready() {
+                        return Some(String::new());
                     }
+                    return Some(text.to_string());
                 }
             }
         }
@@ -1632,6 +1639,36 @@ mod tests {
         let mut t = make_tracker(24, 80, "? for shortcuts");
         t.process("› \r\n".as_bytes());
         assert_eq!(t.get_codex_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn codex_ultra_dim_placeholder_wins_over_submitted_history() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› submitted prompt\r\n» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("codex"));
+    }
+
+    #[test]
+    fn codex_ultra_prompt_satisfies_ready_pattern() {
+        let mut t = make_tracker(24, 80, "› ");
+        t.process("» \x1b[2mAsk Codex to do anything\x1b[0m\r\n".as_bytes());
+
+        assert!(t.is_ready());
+        assert!(t.is_prompt_empty("codex"));
+    }
+
+    #[test]
+    fn codex_ultra_non_dim_draft_wins_over_submitted_history() {
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process("› submitted prompt\r\n» Summarize recent commits\r\n".as_bytes());
+
+        assert_eq!(
+            t.get_codex_input_text(),
+            Some("Summarize recent commits".to_string())
+        );
+        assert!(!t.is_prompt_empty("codex"));
     }
 
     #[test]
