@@ -91,6 +91,7 @@ const CODEX_PLUGIN_STORE_DIRS: &[&str] = &["cache", "data"];
 const CODEX_DEFAULT_PROJECT_ROOT_MARKERS: &[&str] = &[".git"];
 const HCOM_CODEX_CLI_VERSION_KEY: &str = "hcom_codex_cli_version";
 const HCOM_HOOK_DEFINITION_HASH_KEY: &str = "hcom_hook_definition_hash";
+const HCOM_HOOK_TRUST_METADATA_FILE: &str = "hcom-hook-trust.toml";
 #[cfg(not(test))]
 const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
@@ -1492,6 +1493,21 @@ fn write_hcom_hook_trust_state(
     } else {
         DocumentMut::new()
     };
+    let metadata_path = config_path.with_file_name(HCOM_HOOK_TRUST_METADATA_FILE);
+    let mut metadata: DocumentMut = if metadata_path.exists() {
+        std::fs::read_to_string(&metadata_path)
+            .map_err(|e| e.to_string())?
+            .parse::<DocumentMut>()
+            .map_err(|e| e.to_string())?
+    } else {
+        DocumentMut::new()
+    };
+    if !metadata.contains_table("state") {
+        metadata["state"] = Item::Table(toml_edit::Table::new());
+    }
+    let metadata_state = metadata["state"]
+        .as_table_like_mut()
+        .ok_or_else(|| "hcom hook trust metadata state is not a table".to_string())?;
 
     if !doc.contains_table("hooks") {
         doc["hooks"] = Item::Table(toml_edit::Table::new());
@@ -1508,6 +1524,7 @@ fn write_hcom_hook_trust_state(
 
     for key in stale_keys {
         state.remove(key);
+        metadata_state.remove(key);
     }
 
     for entry in entries {
@@ -1522,16 +1539,30 @@ fn write_hcom_hook_trust_state(
         };
         item["trusted_hash"] = value(entry.current_hash.clone());
         item["enabled"] = value(true);
-        item[HCOM_CODEX_CLI_VERSION_KEY] = value(codex_cli_version.to_string());
+        item.as_table_like_mut()
+            .unwrap()
+            .remove(HCOM_CODEX_CLI_VERSION_KEY);
+        item.as_table_like_mut()
+            .unwrap()
+            .remove(HCOM_HOOK_DEFINITION_HASH_KEY);
+        if metadata_state
+            .get(&entry.key)
+            .is_none_or(|item| !item.is_table_like())
+        {
+            metadata_state.insert(&entry.key, Item::Table(toml_edit::Table::new()));
+        }
+        let metadata_entry = metadata_state.get_mut(&entry.key).unwrap();
+        metadata_entry[HCOM_CODEX_CLI_VERSION_KEY] = value(codex_cli_version.to_string());
         if let Some(definition_hash) = definition_hashes.get(&entry.key) {
-            item[HCOM_HOOK_DEFINITION_HASH_KEY] = value(definition_hash.clone());
+            metadata_entry[HCOM_HOOK_DEFINITION_HASH_KEY] = value(definition_hash.clone());
         }
     }
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())
+    paths::atomic_write_io(config_path, &doc.to_string()).map_err(|e| e.to_string())?;
+    paths::atomic_write_io(&metadata_path, &metadata.to_string()).map_err(|e| e.to_string())
 }
 
 /// Rewrite hcom's own `hooks.state` entries from an authoritative hooks/list
@@ -1958,9 +1989,24 @@ fn codex_hcom_hook_keys_trusted_for_version(
         Ok(doc) => doc,
         Err(_) => return false,
     };
+    let metadata_content =
+        match std::fs::read_to_string(config_path.with_file_name(HCOM_HOOK_TRUST_METADATA_FILE)) {
+            Ok(content) => content,
+            Err(_) => return false,
+        };
+    let metadata = match metadata_content.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(_) => return false,
+    };
     let Some(state) = doc
         .get("hooks")
         .and_then(|hooks| hooks.get("state"))
+        .and_then(|state| state.as_table_like())
+    else {
+        return false;
+    };
+    let Some(metadata_state) = metadata
+        .get("state")
         .and_then(|state| state.as_table_like())
     else {
         return false;
@@ -1973,13 +2019,16 @@ fn codex_hcom_hook_keys_trusted_for_version(
         let Some(trusted_hash) = entry.get("trusted_hash").and_then(|v| v.as_str()) else {
             return false;
         };
+        let Some(metadata_entry) = metadata_state.get(key) else {
+            return false;
+        };
         !trusted_hash.is_empty()
             && entry.get("enabled").and_then(|v| v.as_bool()) != Some(false)
-            && entry
+            && metadata_entry
                 .get(HCOM_CODEX_CLI_VERSION_KEY)
                 .and_then(|v| v.as_str())
                 == Some(codex_cli_version)
-            && entry
+            && metadata_entry
                 .get(HCOM_HOOK_DEFINITION_HASH_KEY)
                 .and_then(|v| v.as_str())
                 == definition_hashes.get(key).map(String::as_str)
@@ -2012,11 +2061,23 @@ fn verify_hcom_hook_keys_trusted_for_version(
     let doc = content
         .parse::<DocumentMut>()
         .map_err(|e| VerifyFailReason::HookTrustUnavailable(e.to_string()))?;
+    let metadata_content =
+        std::fs::read_to_string(config_path.with_file_name(HCOM_HOOK_TRUST_METADATA_FILE))
+            .map_err(|e| VerifyFailReason::HookTrustUnavailable(e.to_string()))?;
+    let metadata = metadata_content
+        .parse::<DocumentMut>()
+        .map_err(|e| VerifyFailReason::HookTrustUnavailable(e.to_string()))?;
     let state = doc
         .get("hooks")
         .and_then(|hooks| hooks.get("state"))
         .and_then(|state| state.as_table_like())
         .ok_or_else(|| VerifyFailReason::HookTrustUnavailable("hooks.state missing".to_string()))?;
+    let metadata_state = metadata
+        .get("state")
+        .and_then(|state| state.as_table_like())
+        .ok_or_else(|| {
+            VerifyFailReason::HookTrustUnavailable("hcom hook trust metadata missing".to_string())
+        })?;
 
     for entry in entries {
         let command = entry.command.clone();
@@ -2035,14 +2096,20 @@ fn verify_hcom_hook_keys_trusted_for_version(
         if trusted_hash.is_empty() {
             return Err(VerifyFailReason::HookTrustMissing { command });
         }
-        if state_entry
+        let metadata_entry =
+            metadata_state
+                .get(&entry.key)
+                .ok_or_else(|| VerifyFailReason::HookTrustStale {
+                    command: command.clone(),
+                })?;
+        if metadata_entry
             .get(HCOM_CODEX_CLI_VERSION_KEY)
             .and_then(|v| v.as_str())
             != Some(codex_cli_version)
         {
             return Err(VerifyFailReason::HookTrustStale { command });
         }
-        if state_entry
+        if metadata_entry
             .get(HCOM_HOOK_DEFINITION_HASH_KEY)
             .and_then(|v| v.as_str())
             != Some(entry.definition_hash.as_str())
@@ -2629,6 +2696,7 @@ fn verify_codex_hooks_inner_at(
 fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
     let hooks_path = base.join("hooks.json");
     let rules_file = base.join("rules").join("hcom.rules");
+    let metadata_path = base.join(HCOM_HOOK_TRUST_METADATA_FILE);
     let mut ok = true;
 
     if hooks_path.exists() {
@@ -2651,6 +2719,9 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
 
     if rules_file.exists() {
         ok &= std::fs::remove_file(&rules_file).is_ok();
+    }
+    if metadata_path.exists() {
+        ok &= std::fs::remove_file(&metadata_path).is_ok();
     }
 
     ok
@@ -2818,10 +2889,45 @@ mod tests {
         assert!(verify_codex_hooks_installed(false));
 
         let config_content = std::fs::read_to_string(get_codex_config_path()).unwrap();
+        let metadata_content = std::fs::read_to_string(
+            get_codex_config_path().with_file_name(HCOM_HOOK_TRUST_METADATA_FILE),
+        )
+        .unwrap();
         assert!(config_content.contains("trusted_hash"));
         assert!(config_content.contains("enabled = true"));
-        assert!(config_content.contains("hcom_codex_cli_version = \"0.131.0\""));
-        assert!(config_content.contains("hcom_hook_definition_hash"));
+        assert!(!config_content.contains("hcom_codex_cli_version"));
+        assert!(!config_content.contains("hcom_hook_definition_hash"));
+        assert!(metadata_content.contains("hcom_codex_cli_version = \"0.131.0\""));
+        assert!(metadata_content.contains("hcom_hook_definition_hash"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_setup_codex_hooks_migrates_legacy_config_metadata() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        unsafe { std::env::set_var("HCOM_TEST_CODEX_CLI_VERSION", "codex-cli 0.131.0") };
+        assert!(setup_codex_hooks(false));
+
+        let config_path = get_codex_config_path();
+        let mut doc = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        for (_, entry) in doc["hooks"]["state"]
+            .as_table_like_mut()
+            .unwrap()
+            .iter_mut()
+        {
+            entry[HCOM_CODEX_CLI_VERSION_KEY] = value("0.130.0");
+            entry[HCOM_HOOK_DEFINITION_HASH_KEY] = value("sha256:old");
+        }
+        paths::atomic_write_io(&config_path, &doc.to_string()).unwrap();
+
+        assert!(setup_codex_hooks(false));
+        let config = std::fs::read_to_string(config_path).unwrap();
+        assert!(!config.contains(HCOM_CODEX_CLI_VERSION_KEY));
+        assert!(!config.contains(HCOM_HOOK_DEFINITION_HASH_KEY));
+        assert!(verify_codex_hooks_installed(false));
     }
 
     #[test]
@@ -2896,7 +3002,10 @@ mod tests {
 
         assert!(setup_codex_hooks(false));
         assert!(verify_codex_hooks_installed(false));
-        let repaired = std::fs::read_to_string(get_codex_config_path()).unwrap();
+        let repaired = std::fs::read_to_string(
+            get_codex_config_path().with_file_name(HCOM_HOOK_TRUST_METADATA_FILE),
+        )
+        .unwrap();
         assert!(repaired.contains("hcom_codex_cli_version = \"0.132.0\""));
     }
 

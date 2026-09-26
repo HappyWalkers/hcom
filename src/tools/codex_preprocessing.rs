@@ -634,14 +634,14 @@ mod tests {
     /// Corrupting `trusted_hash` would not work: hcom cannot recompute Codex's
     /// `currentHash`, so it never validates that value locally.
     fn stale_hcom_codex_hook_trust(codex_home: &std::path::Path) {
-        let config_path = codex_home.join("config.toml");
-        let config = std::fs::read_to_string(&config_path).unwrap();
-        let stale = config.replace(
+        let metadata_path = codex_home.join("hcom-hook-trust.toml");
+        let metadata = std::fs::read_to_string(&metadata_path).unwrap();
+        let stale = metadata.replace(
             "hcom_codex_cli_version = \"0.131.0\"",
             "hcom_codex_cli_version = \"0.130.0\"",
         );
-        assert_ne!(config, stale, "expected hcom trust entries to go stale");
-        std::fs::write(&config_path, stale).unwrap();
+        assert_ne!(metadata, stale, "expected hcom trust entries to go stale");
+        std::fs::write(&metadata_path, stale).unwrap();
     }
 
     /// A workspace with no Codex hook definitions of its own. The `.git` marker
@@ -988,16 +988,16 @@ mod tests {
         let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         write_trusted_hcom_codex_hooks(dir.path());
         let workspace = clean_workspace();
-        let config_path = dir.path().join("config.toml");
-        let stale = std::fs::read_to_string(&config_path)
+        let metadata_path = dir.path().join("hcom-hook-trust.toml");
+        let stale = std::fs::read_to_string(&metadata_path)
             .unwrap()
             .replace("0.131.0", "0.130.0");
-        std::fs::write(&config_path, stale).unwrap();
+        std::fs::write(&metadata_path, stale).unwrap();
 
         let args = s(&["-m", "o3"]);
         let result = bypass_args(&args, workspace.path());
         assert!(!result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
-        let healed = std::fs::read_to_string(config_path).unwrap();
+        let healed = std::fs::read_to_string(metadata_path).unwrap();
         assert!(healed.contains("hcom_codex_cli_version = \"0.131.0\""));
     }
 
