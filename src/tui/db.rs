@@ -160,10 +160,13 @@ impl DbDataSource {
     /// file before bootstrapping the new one, and opening it during that window
     /// would create an empty database from the read-only TUI process.
     fn reconnect_if_database_replaced(&mut self) -> bool {
+        #[cfg(unix)]
         let replaced = matches!(
             (self.db_file_id, db_file_id(&self.db_path)),
             (Some(opened), Some(current)) if opened != current
         );
+        #[cfg(not(unix))]
+        let replaced = false;
         if !replaced {
             return false;
         }
