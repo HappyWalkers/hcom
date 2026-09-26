@@ -464,6 +464,12 @@ mod tests {
     }
 
     #[test]
+    fn plugin_stops_only_on_quit() {
+        assert!(PLUGIN_SOURCE.contains("event.reason === undefined || event.reason === \"quit\""));
+        assert!(PLUGIN_SOURCE.contains("if (instanceName && terminal)"));
+    }
+
+    #[test]
     fn plugin_delivery_reports_active_edge() {
         assert!(PLUGIN_SOURCE.contains("reportStatus(ctx, \"active\""));
         assert!(PLUGIN_SOURCE.contains("`deliver:${sender}`"));
@@ -505,6 +511,43 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(accepted);
+
+        cleanup(path);
+    }
+
+    /// reload/new keep the process alive and skip pi-stop, so the next pi-start
+    /// must rebind the same identity through the process binding.
+    #[test]
+    fn start_handler_keeps_identity_across_same_process_session_restart() {
+        let (db, path) = setup_test_db();
+        let temp = tempfile::TempDir::new().unwrap();
+        save_test_instance(&db, "soba", ST_LISTENING);
+        db.set_process_binding("pid-1", "", "soba").unwrap();
+
+        let env = std::collections::HashMap::from([
+            ("HCOM_PROCESS_ID".to_string(), "pid-1".to_string()),
+            ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+            ("HCOM_TOOL".to_string(), "pi".to_string()),
+        ]);
+        let ctx = HcomContext::from_env(&env, temp.path().to_path_buf());
+        let start = |sid: &str| {
+            let (code, output) = handle_start(&ctx, &db, &["--session-id".into(), sid.into()]);
+            assert_eq!(code, 0);
+            serde_json::from_str::<Value>(&output).unwrap()["name"]
+                .as_str()
+                .map(str::to_string)
+        };
+
+        // initial bind, /reload (same session), /new (fresh session)
+        for sid in ["sid-1", "sid-1", "sid-2"] {
+            assert_eq!(start(sid).as_deref(), Some("soba"));
+            let inst = db.get_instance_full("soba").unwrap().unwrap();
+            assert_eq!(inst.session_id.as_deref(), Some(sid));
+            assert_eq!(
+                db.get_session_binding(sid).unwrap().as_deref(),
+                Some("soba")
+            );
+        }
 
         cleanup(path);
     }
