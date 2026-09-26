@@ -32,11 +32,13 @@ use crate::shared::{ST_ACTIVE, ST_LISTENING};
 use super::common::SAFE_HCOM_COMMANDS;
 
 const HCOM_TRIGGER: &str = "<hcom>";
+// `fork` is its own SessionStart source since Codex 0.155 (earlier releases
+// reported forks as `startup`); without it a forked session never binds hooks.
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
         "codex-sessionstart",
-        Some("startup|resume|clear"),
+        Some("startup|resume|clear|fork"),
     ),
     ("UserPromptSubmit", "codex-userpromptsubmit", None),
     ("PreToolUse", "codex-pretooluse", Some("Bash")),
