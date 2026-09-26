@@ -1005,6 +1005,10 @@ pub struct ScreenState {
     /// set. Only ever true for Claude (see `ScreenTracker::is_claude_subagent_nav_visible`
     /// / `is_claude_session_switcher_visible`).
     pub nav_overlay: bool,
+    /// Codex is still starting with nothing to answer (see
+    /// `ScreenTracker::is_codex_startup_loading`); the launch-blocked heuristic
+    /// waits it out rather than reading a quiet loading screen as settled.
+    pub startup_loading: bool,
 }
 
 impl Default for ScreenState {
@@ -1021,6 +1025,7 @@ impl Default for ScreenState {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 }
@@ -1374,6 +1379,9 @@ fn maybe_emit_launch_blocked(
     }
 
     let screen = state.screen.read().unwrap();
+    if screen.startup_loading {
+        return;
+    }
     let tail_text = screen.visible_tail.as_deref().unwrap_or("");
     // Gemini's animated startup banner keeps emitting output for ~60s, defeating
     // the settle heuristic. Its trust prompt is distinctive — fire immediately
@@ -2666,6 +2674,7 @@ mod tests {
             last_prompt_submit: None,
             approval_scrape_latched: false,
             nav_overlay: false,
+            startup_loading: false,
         }
     }
 

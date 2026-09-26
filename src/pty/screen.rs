@@ -166,6 +166,24 @@ pub struct ScreenTracker {
     instance_name: Option<String>,
 }
 
+/// Codex (0.157+) draws its composer, ready pattern included, before startup
+/// finishes: input typed then is held as a draft ("Waiting for startup"), and a
+/// folder-trust screen can still take over the TUI. Its header reads
+/// `model: loading` until startup completes, and its onboarding screens, drawn
+/// over a composer whose ready-pattern row can survive underneath, end in an
+/// `enter continue · esc quit` footer. Either line means not ready.
+fn is_codex_startup_line(line: &str) -> bool {
+    is_codex_loading_header(line) || is_codex_onboarding_footer(line)
+}
+
+fn is_codex_loading_header(line: &str) -> bool {
+    line.contains("model:") && line.contains("loading") && line.contains("/model to change")
+}
+
+fn is_codex_onboarding_footer(line: &str) -> bool {
+    line.contains("enter continue") && line.contains("esc quit")
+}
+
 impl ScreenTracker {
     /// Create a new screen tracker with instance name (for debug logging)
     pub fn new_with_instance(
@@ -346,12 +364,24 @@ impl ScreenTracker {
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
 
+        let mut pattern_visible = false;
         for line in screen.rows(0, cols) {
-            if line.contains(&self.ready_pattern) {
-                return true;
+            if is_codex_startup_line(&line) {
+                return false;
             }
+            pattern_visible |= line.contains(&self.ready_pattern);
         }
-        false
+        pattern_visible
+    }
+
+    /// Codex is still starting and nothing needs answering yet: its header
+    /// says `model: loading` and no onboarding screen has taken over. Startup
+    /// can sit here for seconds (the folder-trust lookup runs first), which must
+    /// not read as a launch that settled without becoming ready.
+    pub fn is_codex_startup_loading(&self) -> bool {
+        let lines = self.get_screen_lines();
+        lines.iter().any(|line| is_codex_loading_header(line))
+            && !lines.iter().any(|line| is_codex_onboarding_footer(line))
     }
 
     /// Check if the latest complete OSC terminal title requires action.
@@ -870,6 +900,13 @@ impl ScreenTracker {
     /// during PTY injection.
     fn get_codex_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
+        // The startup composer's placeholder reads as an empty prompt, but
+        // input there is held as a draft and an onboarding screen can still
+        // take over. Unknown input keeps both launch readiness and delivery
+        // waiting until startup is done.
+        if lines.iter().any(|line| is_codex_startup_line(line)) {
+            return None;
+        }
 
         // Search bottom-to-top for › prompt character
         // › (U+203A, SINGLE RIGHT-POINTING ANGLE QUOTATION MARK) = 3 bytes UTF-8 + 1 space = 4 bytes total
@@ -1595,6 +1632,42 @@ mod tests {
         let mut t = make_tracker(24, 80, "? for shortcuts");
         t.process("› \r\n".as_bytes());
         assert_eq!(t.get_codex_input_text(), Some(String::new()));
+    }
+
+    #[test]
+    fn codex_not_ready_while_startup_header_is_loading() {
+        let header = |model: &str| {
+            format!(
+                "\u{2502} model:     {model}   /model to change \u{2502}\r\n\
+                 \u{203a} \x1b[2mAsk Codex to do anything\x1b[0m\r\n  ? for shortcuts\r\n"
+            )
+        };
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(header("loading").as_bytes());
+        assert!(!t.is_ready(), "composer drawn during startup is not ready");
+        assert!(t.is_codex_startup_loading());
+        assert_eq!(
+            t.get_codex_input_text(),
+            None,
+            "a startup draft is not an empty prompt"
+        );
+
+        let mut t = make_tracker(24, 80, "? for shortcuts");
+        t.process(header("GPT-5.5 default").as_bytes());
+        assert!(t.is_ready());
+        assert_eq!(t.get_codex_input_text(), Some(String::new()));
+
+        // A folder-trust screen over the composer, stale ready row included.
+        t.process(
+            "\u{203a} 1. Open restricted\r\n  2. Quit\r\n  enter continue \u{b7} esc quit\r\n"
+                .as_bytes(),
+        );
+        assert!(!t.is_ready(), "onboarding screen is not ready");
+        assert!(
+            !t.is_codex_startup_loading(),
+            "a screen awaiting an answer is not loading"
+        );
+        assert_eq!(t.get_codex_input_text(), None);
     }
 
     #[test]
