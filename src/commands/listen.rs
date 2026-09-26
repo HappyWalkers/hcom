@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::cli_context::format_envelope_prefix;
 use crate::core::filters::{EventFilterArgs, build_sql_from_flags, resolve_filter_names};
 use crate::db::HcomDb;
 use crate::identity;
@@ -54,52 +55,48 @@ fn update_heartbeat(db: &HcomDb, instance_name: &str) {
     instances::update_instance_position(db, instance_name, &updates);
 }
 
-/// Format messages as JSON for model consumption.
-fn format_messages_json(
+/// Format messages as text for model consumption.
+fn format_messages_text(
     db: &HcomDb,
     messages: &[crate::db::Message],
     instance_name: &str,
 ) -> String {
     let recipient_display = get_display_name(db, instance_name);
-
-    if messages.len() == 1 {
-        let msg = &messages[0];
-        let sender_display = get_display_name(db, &msg.from);
-        let prefix = build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
-        format!(
-            "{prefix} {sender_display} -> {recipient_display}: {}",
-            msg.text
-        )
+    let parts: Vec<String> = messages
+        .iter()
+        .map(|msg| {
+            let sender_display = get_display_name(db, &msg.from);
+            let prefix = format_envelope_prefix(
+                msg.intent.as_deref(),
+                msg.thread.as_deref(),
+                msg.reply_id().as_deref(),
+            );
+            format!(
+                "{prefix} {sender_display} -> {recipient_display}: {}",
+                msg.text
+            )
+        })
+        .collect();
+    if parts.len() == 1 {
+        parts.into_iter().next().unwrap_or_default()
     } else {
-        let parts: Vec<String> = messages
-            .iter()
-            .map(|msg| {
-                let sender_display = get_display_name(db, &msg.from);
-                let prefix =
-                    build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
-                format!(
-                    "{prefix} {sender_display} -> {recipient_display}: {}",
-                    msg.text
-                )
-            })
-            .collect();
         format!("[{} new messages] | {}", parts.len(), parts.join(" | "))
     }
 }
 
-fn build_prefix(intent: Option<&str>, thread: Option<&str>, event_id: Option<i64>) -> String {
-    let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
-    let prefix = match (intent, thread) {
-        (Some(i), Some(t)) => format!("{i}:{t}"),
-        (Some(i), None) => i.to_string(),
-        (None, Some(t)) => format!("thread:{t}"),
-        (None, None) => "new message".to_string(),
-    };
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
-    }
+/// One `--json` line per delivered message. `reply_id` is the value for
+/// `hcom send --reply-to`: the local event id, or `<origin_id>:<DEVICE>` for a
+/// relayed message. `event_id` is always the local row id.
+fn message_json(msg: &crate::db::Message) -> String {
+    serde_json::json!({
+        "from": msg.from,
+        "text": msg.text,
+        "event_id": msg.event_id,
+        "reply_id": msg.reply_id(),
+        "intent": msg.intent,
+        "thread": msg.thread,
+    })
+    .to_string()
 }
 
 /// Status after listen returns. Adhoc has no hooks to move it back out of
@@ -382,14 +379,10 @@ fn listen_loop(
 
             if json_output {
                 for msg in &messages {
-                    let j = serde_json::json!({
-                        "from": msg.from,
-                        "text": msg.text,
-                    });
-                    println!("{}", serde_json::to_string(&j).unwrap_or_default());
+                    println!("{}", message_json(msg));
                 }
             } else {
-                let formatted = format_messages_json(db, &messages, instance_name);
+                let formatted = format_messages_text(db, &messages, instance_name);
                 println!("\n{formatted}");
             }
             return 0;
@@ -625,16 +618,12 @@ fn filter_listen_loop(
             if !real_messages.is_empty() {
                 if json_output {
                     for msg in &real_messages {
-                        let j = serde_json::json!({
-                            "from": msg.from,
-                            "text": msg.text,
-                        });
-                        println!("{}", serde_json::to_string(&j).unwrap_or_default());
+                        println!("{}", message_json(msg));
                     }
                 } else {
                     let owned: Vec<crate::db::Message> =
                         real_messages.iter().map(|m| (*m).clone()).collect();
-                    let formatted = format_messages_json(db, &owned, instance_name);
+                    let formatted = format_messages_text(db, &owned, instance_name);
                     println!("\n{formatted}");
                 }
                 set_listen_done_status(db, instance_name, instance_data, "message received");
@@ -834,6 +823,105 @@ mod tests {
             .unwrap();
         backdate_status(&db, 120);
         assert!(!cleanup_keeps_luna(&db));
+
+        cleanup_test_db(path);
+    }
+
+    /// #118: `--json` must carry what a reply needs, and `reply_id` must
+    /// resolve through `send --reply-to` to the received event, for local and
+    /// relay-imported messages alike.
+    #[test]
+    #[serial]
+    fn json_envelope_reply_id_links_reply_to_received_message() {
+        let (db, path, _env) = setup_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, created_at, tool) VALUES \
+                 ('luna', 1000.0, 'adhoc'), ('nova', 1000.0, 'adhoc')",
+                [],
+            )
+            .unwrap();
+
+        let envelope = crate::messages::MessageEnvelope {
+            intent: Some(crate::messages::MessageIntent::Request),
+            thread: Some("t1".into()),
+            ..Default::default()
+        };
+        let (local_id, _) = crate::commands::send::send_message(
+            &db,
+            &crate::shared::SenderIdentity {
+                kind: crate::shared::SenderKind::Instance,
+                name: "nova".into(),
+                instance_data: None,
+                session_id: None,
+            },
+            "@luna local",
+            Some(&envelope),
+            Some(&["luna".to_string()]),
+        )
+        .unwrap();
+        let relay_local_id = db
+            .log_event(
+                "message",
+                "remo:BOXE",
+                &serde_json::json!({
+                    "from": "remo:BOXE",
+                    "text": "remote",
+                    "intent": "request",
+                    "thread": "t2",
+                    "_relay": {"id": 42, "short": "BOXE", "device": "dev-boxe"},
+                }),
+            )
+            .unwrap();
+
+        let lines: Vec<serde_json::Value> = db
+            .get_unread_messages("luna")
+            .iter()
+            .map(|m| serde_json::from_str(&message_json(m)).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event_id"], local_id);
+        assert_eq!(lines[0]["reply_id"], local_id.to_string());
+        assert_eq!(lines[0]["intent"], "request");
+        assert_eq!(lines[0]["thread"], "t1");
+        assert_eq!(lines[1]["event_id"], relay_local_id);
+        assert_eq!(lines[1]["reply_id"], "42:BOXE");
+        assert_eq!(lines[1]["thread"], "t2");
+
+        for (line, expected_local, expected_thread) in [
+            (&lines[0], local_id, "t1"),
+            (&lines[1], relay_local_id, "t2"),
+        ] {
+            use clap::Parser;
+            let reply_id = line["reply_id"].as_str().unwrap();
+            let mut args = crate::commands::send::SendArgs::try_parse_from([
+                "send",
+                "@nova",
+                "--intent",
+                "ack",
+                "--reply-to",
+                reply_id,
+                "--",
+                "ok",
+            ])
+            .unwrap();
+            args.had_separator = true;
+            assert_eq!(
+                crate::commands::send::cmd_send(&db, &args, Some(&ctx("luna"))),
+                0
+            );
+            let (reply_to_local, thread): (i64, String) = db
+                .conn()
+                .query_row(
+                    "SELECT json_extract(data, '$.reply_to_local'), json_extract(data, '$.thread') \
+                     FROM events WHERE type = 'message' ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(reply_to_local, expected_local);
+            assert_eq!(thread, expected_thread);
+        }
 
         cleanup_test_db(path);
     }

@@ -330,6 +330,8 @@ fn start_send_events_roundtrip() {
     assert_eq!(delivered.len(), 1, "listen output={listen_out}");
     assert_eq!(delivered[0]["from"], sender.as_str());
     assert_eq!(delivered[0]["text"], "hello there");
+    let event_id = delivered[0]["event_id"].as_i64().expect("event_id");
+    assert_eq!(delivered[0]["reply_id"], event_id.to_string());
 
     let (c7, list_after_listen_out, _) = h.run(["list", "--json"]);
     assert_eq!(c7, 0);

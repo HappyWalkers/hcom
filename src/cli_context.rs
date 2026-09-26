@@ -334,38 +334,38 @@ pub fn format_messages_human(
     }
 }
 
-/// Build message prefix from envelope fields.
-///
-/// Format: `[intent:thread #id]` or `[intent #id]` or `[thread:name #id]` or `[new message #id]`
+/// Build message prefix from envelope fields of a raw message event.
 fn build_message_prefix(
     intent: Option<&str>,
     thread: Option<&str>,
     event_id: Option<i64>,
     msg: &serde_json::Value,
 ) -> String {
-    // Build ID reference (local or remote)
-    let relay = msg.get("_relay");
-    let id_ref = if let Some(relay) = relay {
-        let short = relay.get("short").and_then(|v| v.as_str()).unwrap_or("");
-        let rid = relay.get("id").and_then(|v| v.as_i64());
-        if !short.is_empty() {
-            if let Some(id) = rid {
-                format!("#{id}:{short}")
+    // Relayed messages are referenced by origin id + device, local ones by event id.
+    let reply_id = match msg.get("_relay") {
+        Some(relay) => {
+            let short = relay.get("short").and_then(|v| v.as_str()).unwrap_or("");
+            if short.is_empty() {
+                event_id.map(|id| id.to_string())
             } else {
-                String::new()
+                relay
+                    .get("id")
+                    .and_then(|v| v.as_i64())
+                    .map(|id| format!("{id}:{short}"))
             }
-        } else if let Some(id) = event_id {
-            format!("#{id}")
-        } else {
-            String::new()
         }
-    } else if let Some(id) = event_id {
-        format!("#{id}")
-    } else {
-        String::new()
+        None => event_id.map(|id| id.to_string()),
     };
+    format_envelope_prefix(intent, thread, reply_id.as_deref())
+}
 
-    // Build prefix based on envelope fields
+/// Format: `[intent:thread #id]` or `[intent #id]` or `[thread:name #id]` or `[new message #id]`,
+/// where `id` is what `hcom send --reply-to` accepts.
+pub(crate) fn format_envelope_prefix(
+    intent: Option<&str>,
+    thread: Option<&str>,
+    reply_id: Option<&str>,
+) -> String {
     let prefix = match (intent, thread) {
         (Some(i), Some(t)) => format!("{i}:{t}"),
         (Some(i), None) => i.to_string(),
@@ -373,10 +373,9 @@ fn build_message_prefix(
         (None, None) => "new message".to_string(),
     };
 
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
+    match reply_id {
+        Some(id) => format!("[{prefix} #{id}]"),
+        None => format!("[{prefix}]"),
     }
 }
 
@@ -472,11 +471,10 @@ fn format_hook_messages_simple_from_msgs(
 
     if messages.len() == 1 {
         let msg = &messages[0];
-        let prefix = build_message_prefix(
+        let prefix = format_envelope_prefix(
             msg.intent.as_deref(),
             msg.thread.as_deref(),
-            msg.event_id,
-            &serde_json::json!({}),
+            msg.reply_id().as_deref(),
         );
         let sender_display = identity::get_display_name(db, &msg.from);
 
@@ -497,11 +495,10 @@ fn format_hook_messages_simple_from_msgs(
         let parts: Vec<String> = messages
             .iter()
             .map(|msg| {
-                let prefix = build_message_prefix(
+                let prefix = format_envelope_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
-                    msg.event_id,
-                    &serde_json::json!({}),
+                    msg.reply_id().as_deref(),
                 );
                 let sender_display = identity::get_display_name(db, &msg.from);
 
