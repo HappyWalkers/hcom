@@ -14,7 +14,6 @@ const BYPASS_HOOK_TRUST_MIN_VERSION: (u64, u64, u64) = (0, 131, 0);
 /// Sandbox modes aligned with Codex TUI presets.
 ///
 /// - `workspace`: Default — --sandbox workspace-write (interactive: on-request approvals)
-/// - `untrusted`: Workspace writes, approval before untrusted commands
 /// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
 /// - `none`: Raw codex, user's own settings (hcom may not work)
 ///
@@ -36,24 +35,12 @@ pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
             flags.extend(net);
             flags
         }
-        "untrusted" => {
-            // Read-only-equivalent UX for hcom: codex's actual read-only sandbox
-            // can't be used (hcom needs DB writes), so we keep workspace-write FS
-            // and gate every non-safe command on user approval via -a untrusted.
-            let mut flags = vec![
-                "--sandbox".to_string(),
-                "workspace-write".to_string(),
-                "-a".to_string(),
-                "untrusted".to_string(),
-            ];
-            flags.extend(net);
-            flags
-        }
         "danger-full-access" => {
             vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
         }
         "none" => vec![],
-        // Default to workspace
+        // Default to workspace (config normalizes the retired `untrusted` and
+        // `full-auto` to it; this also covers them arriving via raw env).
         _ => {
             let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
             flags.extend(net);
@@ -736,12 +723,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_flags_untrusted() {
+    fn test_sandbox_flags_retired_untrusted_is_workspace() {
+        // Codex 0.152 removed `-a untrusted`; passing it makes Codex exit.
         let flags = get_sandbox_flags("untrusted");
-        assert!(flags.contains(&"--sandbox".to_string()));
-        assert!(flags.contains(&"workspace-write".to_string()));
-        assert!(flags.contains(&"-a".to_string()));
-        assert!(flags.contains(&"untrusted".to_string()));
+        assert_eq!(flags, get_sandbox_flags("workspace"));
+        assert!(!flags.contains(&"-a".to_string()));
     }
 
     #[test]
@@ -1603,13 +1589,12 @@ mod tests {
         let result = preprocess_codex_args(
             &args,
             "BOOTSTRAP",
-            "untrusted",
+            "workspace",
             CodexHookTrustOutcome::NoActionNeeded,
         );
         let approval_position = result.iter().position(|t| t == "-a").unwrap();
         assert_eq!(result[approval_position + 1], "on-request");
         assert_eq!(result.iter().filter(|t| *t == "-a").count(), 1);
-        assert!(!result.contains(&"untrusted".to_string()));
         assert!(!result.contains(&"--sandbox".to_string()));
         assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
         assert!(!has_writable_roots(&result));
@@ -1623,7 +1608,7 @@ mod tests {
         let result = preprocess_codex_args(
             &args,
             "BOOTSTRAP",
-            "untrusted",
+            "workspace",
             CodexHookTrustOutcome::NoActionNeeded,
         );
 

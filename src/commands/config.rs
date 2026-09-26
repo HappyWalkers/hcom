@@ -116,7 +116,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ),
     (
         "HCOM_CODEX_SANDBOX_MODE",
-        "Codex permission profile (workspace | untrusted | danger-full-access | none)",
+        "Codex permission profile (workspace | danger-full-access | none)",
         "string",
     ),
     (
@@ -1453,15 +1453,12 @@ picks which set.
 Values:
   workspace          Codex auto-runs; asks only when the model judges
                      necessary.
-  untrusted          Codex prompts before every command that isn't a
-                     known-safe read. Effectively read-only unless you
-                     approve writes case-by-case.
   danger-full-access No sandbox, no approvals.
   none               Inject nothing. Codex uses your own config; DB
                      writes fail unless your config allows ~/.hcom.
 
 Usage:
-  hcom config codex_sandbox_mode untrusted
+  hcom config codex_sandbox_mode danger-full-access
   hcom config codex_sandbox_mode \"\"        # Reset to default",
         ),
 

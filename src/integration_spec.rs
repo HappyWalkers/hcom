@@ -356,7 +356,7 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
     (
         "HCOM_CODEX_SANDBOX_MODE",
-        "workspace | untrusted | danger-full-access | none",
+        "workspace | danger-full-access | none",
     ),
 ];
 
