@@ -306,6 +306,7 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-pretooluse",
     "copilot-permissionrequest",
     "copilot-posttooluse",
+    "copilot-erroroccurred",
     "copilot-posttoolusefailure",
     "copilot-notification",
     "copilot-agentstop",

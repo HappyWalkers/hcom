@@ -33,6 +33,7 @@ const COPILOT_HOOK_COMMANDS: &[(&str, &str, bool, Option<&str>)] = &[
     ("PreToolUse", "copilot-pretooluse", false, None),
     ("PermissionRequest", "copilot-permissionrequest", true, None),
     ("PostToolUse", "copilot-posttooluse", false, None),
+    ("ErrorOccurred", "copilot-erroroccurred", false, None),
     (
         "PostToolUseFailure",
         "copilot-posttoolusefailure",
@@ -450,6 +451,33 @@ fn handle_notification(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     }
 }
 
+fn handle_erroroccurred(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
+    let Some(instance) = resolved_instance(db, ctx, payload) else {
+        return json!({});
+    };
+    let context = payload
+        .raw
+        .get("error_context")
+        .or_else(|| payload.raw.get("errorContext"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let recoverable = payload.raw.get("recoverable").and_then(Value::as_bool);
+    let error_name = payload
+        .raw
+        .pointer("/error/name")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    log::log_warn(
+        "hooks",
+        "copilot.error_occurred",
+        &format!(
+            "instance={} context={context} error={error_name} recoverable={recoverable:?}",
+            instance.name
+        ),
+    );
+    json!({})
+}
+
 fn command_looks_safe_hcom(command: &str) -> bool {
     let trimmed = command.trim();
     for prefix in ["hcom", "uvx hcom"] {
@@ -564,6 +592,7 @@ pub fn dispatch_copilot_hook_native(hook_name: &str) -> i32 {
                     handle_agentstop(&db, &ctx, &payload)
                 }
                 "copilot-notification" => (handle_notification(&db, &ctx, &payload), None),
+                "copilot-erroroccurred" => (handle_erroroccurred(&db, &ctx, &payload), None),
                 "copilot-subagentstart" => (handle_subagentstart(&db, &ctx, &payload), None),
                 "copilot-sessionend" => (handle_sessionend(&db, &ctx, &payload), None),
                 _ => (json!({}), None),
@@ -640,6 +669,13 @@ mod tests {
                 .iter()
                 .any(|hook| hook["command"]
                     == build_copilot_hook_command("copilot-permissionrequest"))
+        );
+        assert!(
+            root["hooks"]["ErrorOccurred"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hook| hook["command"] == build_copilot_hook_command("copilot-erroroccurred"))
         );
     }
 

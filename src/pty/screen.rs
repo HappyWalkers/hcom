@@ -966,14 +966,41 @@ impl ScreenTracker {
 
     /// Extract GitHub Copilot CLI input text.
     ///
-    /// Copilot uses `❯` as the prompt glyph and has no dim placeholder in the
-    /// empty state: an empty prompt is just a bare `❯` line.
+    /// Copilot has shipped both a `❯` box with `─` borders and a `┃` box
+    /// with half-block borders. Anchor to the bottom border near the footer so
+    /// prompt-looking text in the transcript cannot be mistaken for input.
     fn get_copilot_input_text(&self) -> Option<String> {
         let lines = self.get_screen_lines();
-        for line in lines.iter().rev() {
-            let trimmed = line.trim_start();
-            if let Some(text) = trimmed.strip_prefix('❯') {
-                return Some(trim_with_nbsp(text.trim_start()).to_string());
+        for bottom in (0..lines.len()).rev().take(4) {
+            let border = lines[bottom].trim();
+            let prompt = if border.starts_with('╹') && border.contains('▀') {
+                '┃'
+            } else if border.chars().count() >= 3 && border.chars().all(|c| c == '─') {
+                '❯'
+            } else {
+                continue;
+            };
+
+            for top in (bottom.saturating_sub(12)..bottom).rev() {
+                let upper = lines[top].trim();
+                let matching_top = if prompt == '┃' {
+                    upper.starts_with('╻') && upper.contains('▄')
+                } else {
+                    upper.chars().count() >= 3 && upper.chars().all(|c| c == '─')
+                };
+                if !matching_top {
+                    continue;
+                }
+                let Some(first) = lines[top + 1].trim_start().strip_prefix(prompt) else {
+                    break;
+                };
+                let mut text = vec![trim_with_nbsp(first).to_string()];
+                for line in &lines[top + 2..bottom] {
+                    let continuation = line.trim_start();
+                    let continuation = continuation.strip_prefix(prompt).unwrap_or(continuation);
+                    text.push(trim_with_nbsp(continuation).to_string());
+                }
+                return Some(text.join("\n").trim().to_string());
             }
         }
         None
@@ -1608,6 +1635,53 @@ mod tests {
     }
 
     // ---- Cursor input extraction ----
+
+    #[test]
+    fn copilot_extracts_current_framed_prompt() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 19];
+        lines.extend_from_slice(&[
+            " ~/Dev/project                                      Session: 0 AIC used",
+            "────────────────────────────────────────────────────────────────────────────────",
+            "❯ hello copilot",
+            "────────────────────────────────────────────────────────────────────────────────",
+            " ← open sidebar · / commands · ? help                              Auto",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some("hello copilot"));
+        assert!(!t.is_prompt_empty("copilot"));
+    }
+
+    #[test]
+    fn copilot_extracts_half_block_prompt() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 20];
+        lines.extend_from_slice(&[
+            "╻▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+            "┃",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " @ files · # issues               / commands                     Auto",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some(""));
+        assert!(t.is_prompt_empty("copilot"));
+    }
+
+    #[test]
+    fn copilot_ignores_prompt_glyph_in_transcript() {
+        let mut t = make_tracker(24, 80, "/ commands");
+        let mut lines = vec![""; 18];
+        lines.extend_from_slice(&[
+            "❯ Thought for 4s … ┃",
+            "╻▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄",
+            "┃ actual draft",
+            "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+            " @ files · # issues               / commands                     Auto",
+            "",
+        ]);
+        render_rows(&mut t, &lines);
+        assert_eq!(t.get_copilot_input_text().as_deref(), Some("actual draft"));
+    }
 
     #[test]
     fn cursor_extracts_non_dim_text_after_prompt() {
