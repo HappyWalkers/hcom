@@ -18,16 +18,10 @@ use super::real_tool::{
     FORK_PROOF, INBOUND_PROOF, INITIAL_PROOF, RESUME_PROOF, ScenarioIds, ToolCase, ToolMeta,
 };
 
-// Pinned at >= 2.1.198 (not just >= 2.1.196 for `prompt_id`): 2.1.198 is also
-// where Agent/Task calls started backgrounding by default
-// (tool_response.status="async_launched"), which hcom's hook routing must
-// handle. Pinning below 2.1.198 would let real-tool CI pass without ever
-// exercising either behavior.
 const CLAUDE_META: ToolMeta = ToolMeta {
     tool: "claude",
     binary: "claude",
-    pinned_version: "2.1.216",
-    install_command: "npm install --global @anthropic-ai/claude-code@2.1.216",
+    package: "@anthropic-ai/claude-code",
 };
 
 pub const MODEL: &str = "claude-sonnet-4-6";
@@ -69,6 +63,27 @@ pub fn claude_startup_gate(screen: &str) -> Option<ClaudeStartupGate> {
     } else {
         None
     }
+}
+
+/// Whether the trust dialog's cursor (`❯`) sits on the option that accepts.
+pub fn trust_accept_selected(screen: &str) -> bool {
+    screen
+        .lines()
+        .find(|line| line.contains('❯'))
+        .is_some_and(|line| line.to_lowercase().contains("yes"))
+}
+
+#[test]
+fn trust_accept_selected_follows_the_cursor() {
+    assert!(!trust_accept_selected(
+        "❯ No, exit\n  Yes, I trust this folder"
+    ));
+    assert!(trust_accept_selected(
+        "  No, exit\n❯ Yes, I trust this folder"
+    ));
+    assert!(trust_accept_selected(
+        "❯ 1. Yes, I trust this folder\n  2. No, exit"
+    ));
 }
 
 #[derive(Default)]
@@ -328,6 +343,18 @@ impl ToolCase for ClaudeCase {
             // mode-agnostic, so it also serves the default-mode approval test.
             if screen_code == 0 && json.contains("\"prompt_empty\":true") && gate.is_none() {
                 return;
+            }
+            // Claude >= 2.1.2xx preselects "No, exit" on the trust dialog, so a
+            // bare Enter would quit. Move the cursor onto the accepting option
+            // first; the next frame re-checks before anything is submitted.
+            if gate == Some(ClaudeStartupGate::Trust) && !trust_accept_selected(&screen) {
+                let (code, stdout, stderr) = h.run(["term", "inject", name, "\u{1b}[B"]);
+                assert_eq!(
+                    code, 0,
+                    "drive_startup: moving to the trust option failed: stdout={stdout} stderr={stderr}"
+                );
+                std::thread::sleep(Duration::from_millis(800));
+                continue;
             }
             if let Some(gate) = gate.filter(|gate| answers.answer_once(*gate)) {
                 let what = gate.label();
