@@ -271,21 +271,15 @@ pub fn function_call(call_id: &str, name: &str, arguments: &str) -> (&'static st
     )
 }
 
-/// Platform-specific shell function advertised by pinned Codex.
+/// The shell function pinned Codex advertises. Since 0.152 that is
+/// `exec_command` on every platform (openai/codex#39772); Windows no longer
+/// accepts `shell_command` ("unsupported call").
 pub fn shell_call(call_id: &str, command: &str) -> (&'static str, Value) {
-    if cfg!(windows) {
-        function_call(
-            call_id,
-            "shell_command",
-            &serde_json::json!({ "command": command }).to_string(),
-        )
-    } else {
-        function_call(
-            call_id,
-            "exec_command",
-            &serde_json::json!({ "cmd": command }).to_string(),
-        )
-    }
+    function_call(
+        call_id,
+        "exec_command",
+        &serde_json::json!({ "cmd": command }).to_string(),
+    )
 }
 
 /// A shell call that asks to run outside the sandbox. Under Codex's default
@@ -296,16 +290,11 @@ pub fn escalated_shell_call(
     command: &str,
     justification: &str,
 ) -> (&'static str, Value) {
-    let (name, command_key) = if cfg!(windows) {
-        ("shell_command", "command")
-    } else {
-        ("exec_command", "cmd")
-    };
     function_call(
         call_id,
-        name,
+        "exec_command",
         &serde_json::json!({
-            command_key: command,
+            "cmd": command,
             "sandbox_permissions": "require_escalated",
             "justification": justification,
         })

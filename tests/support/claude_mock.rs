@@ -65,11 +65,20 @@ pub fn claude_startup_gate(screen: &str) -> Option<ClaudeStartupGate> {
     }
 }
 
-/// Whether the trust dialog's cursor (`❯`) sits on the option that accepts.
+/// Whether the trust dialog's cursor sits on the option that accepts. Claude
+/// draws the cursor as `❯`, or `>` on Windows consoles; `hcom term` prefixes
+/// each row with its number (`14:`).
 pub fn trust_accept_selected(screen: &str) -> bool {
     screen
         .lines()
-        .find(|line| line.contains('❯'))
+        .map(|line| {
+            let line = line.trim_start();
+            line.split_once(':')
+                .filter(|(row, _)| !row.is_empty() && row.bytes().all(|b| b.is_ascii_digit()))
+                .map_or(line, |(_, rest)| rest)
+                .trim_start()
+        })
+        .find(|line| line.starts_with(['❯', '>']))
         .is_some_and(|line| line.to_lowercase().contains("yes"))
 }
 
@@ -80,6 +89,13 @@ fn trust_accept_selected_follows_the_cursor() {
     ));
     assert!(trust_accept_selected(
         "  No, exit\n❯ Yes, I trust this folder"
+    ));
+    // Windows console glyph, as `hcom term` prints it (row numbers included).
+    assert!(trust_accept_selected(
+        "   13:    No, exit\n   14:  > Yes, I trust this folder"
+    ));
+    assert!(!trust_accept_selected(
+        "   13:  > No, exit\n   14:    Yes, I trust this folder"
     ));
     assert!(trust_accept_selected(
         "❯ 1. Yes, I trust this folder\n  2. No, exit"
