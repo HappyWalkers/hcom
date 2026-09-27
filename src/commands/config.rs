@@ -1447,7 +1447,7 @@ Merged with launch-time cli args (launch args win on conflict).",
             "\
 HCOM_GEMINI_ARGS - Default args passed to gemini on launch
 
-Example: hcom config gemini_args \"--model gemini-2.5-flash\"
+Example: hcom config gemini_args \"--model flash\"
 Clear:   hcom config gemini_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
@@ -1624,7 +1624,7 @@ Notes:
             "\
 HCOM_OPENCODE_ARGS - Default args passed to opencode on launch
 
-Example: hcom config opencode_args \"--model o3\"
+Example: hcom config opencode_args \"--agent plan\"
 Clear:   hcom config opencode_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
@@ -1644,7 +1644,7 @@ Prepended to launch-time cli args.",
             "\
 HCOM_COPILOT_ARGS - Default args passed to copilot on launch
 
-Example: hcom config copilot_args \"--model claude-haiku-4.5\"
+Example: hcom config copilot_args \"--model auto\"
 Clear:   hcom config copilot_args \"\"
 
 Prepended to launch-time cli args.",
@@ -1664,7 +1664,7 @@ Prepended to launch-time cli args.",
             "\
 HCOM_KIMI_ARGS - Default args passed to kimi on launch
 
-Example: hcom config kimi_args \"--model kimi-k2.6\"
+Example: hcom config kimi_args \"--yolo\"
 Clear:   hcom config kimi_args \"\"
 
 Prepended to launch-time cli args.",

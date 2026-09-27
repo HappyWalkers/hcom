@@ -320,7 +320,7 @@ const COPILOT_HOOKS: &[&str] = &[
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
     (
-        "hcom claude --model sonnet|opus|haiku",
+        "hcom claude --model fable|opus|sonnet|haiku",
         "Use a specific model",
     ),
 ];
@@ -332,23 +332,17 @@ const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
 const GEMINI_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom N gemini --yolo", "Flags forwarded to gemini"),
     (
-        "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
+        "hcom gemini --model pro|flash|flash-lite",
         "Use a specific model",
     ),
 ];
 const GEMINI_HELP_EXTRA_ENV: &[HelpEntry] =
     &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")];
 
-const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom codex --sandbox danger-full-access",
-        "Flags forwarded to codex",
-    ),
-    (
-        "hcom codex --model gpt-5.4|gpt-5.4-mini",
-        "Use a specific model",
-    ),
-];
+const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom codex --sandbox danger-full-access",
+    "Flags forwarded to codex",
+)];
 const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     (
         "HCOM_CODEX_SYSTEM_PROMPT",
@@ -360,21 +354,16 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
 ];
 
-const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[(
-    "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
-    "Use a specific model",
-)];
+const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[];
 
 const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
     "hcom kilo --model kilo/kilo-auto/free",
     "Use Kilo's free auto model",
 )];
 
-const PI_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom pi --model claude-3-5-sonnet", "Use a specific model")];
+const PI_HELP_EXAMPLES: &[HelpEntry] = &[];
 
-const OMP_HELP_EXAMPLES: &[HelpEntry] =
-    &[("hcom omp --model claude-3-5-sonnet", "Use a specific model")];
+const OMP_HELP_EXAMPLES: &[HelpEntry] = &[];
 
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
@@ -383,7 +372,7 @@ const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
 ];
 
 const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom cursor-agent --model sonnet-4", "Use a specific model"),
+    ("hcom cursor-agent --model auto", "Use a specific model"),
     (
         "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
@@ -391,15 +380,15 @@ const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
 ];
 
 const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom kimi --model kimi-k2.6", "Use a specific model"),
-    ("hcom kimi --yolo", "Bypass permission prompts"),
+    (
+        "hcom kimi --yolo",
+        "Auto-run routine actions; risky ones still ask",
+    ),
+    ("hcom kimi --auto", "Never ask for approval"),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
-    (
-        "hcom copilot --model claude-haiku-4.5",
-        "Use a specific model",
-    ),
+    ("hcom copilot --model auto", "Use a specific model"),
     (
         "hcom copilot --allow-tool 'shell(hcom:*)'",
         "Flags forwarded to copilot",
