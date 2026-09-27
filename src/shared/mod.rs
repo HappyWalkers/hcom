@@ -5,6 +5,7 @@ pub mod constants;
 pub mod context;
 pub mod errors;
 pub mod identity;
+pub mod nested;
 pub mod platform;
 pub mod suggest;
 pub mod terminal_presets;

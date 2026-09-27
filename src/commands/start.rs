@@ -733,6 +733,45 @@ fn start_bare(
         return Ok(0);
     }
 
+    // An HCOM_PROCESS_ID that still belongs to a live instance is that agent's
+    // own shell: never mint a second identity or repoint its binding.
+    let process_owner = match ctx.process_id.as_deref() {
+        Some(pid) => match db.get_process_binding(pid)? {
+            Some(owner) => db.get_instance_full(&owner)?,
+            None => None,
+        },
+        None => None,
+    };
+    if explicit_name.is_none()
+        && let Some(ref owner) = process_owner
+    {
+        // Launched but its session not bound yet (SessionStart pending or
+        // failed): connect it here instead of leaving it unregistered.
+        if owner.session_id.as_deref().is_none_or(str::is_empty)
+            && let Some(ref session_id) = vanilla_session_id
+            && let Some(bound) =
+                instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref())
+        {
+            if ctx.tool == crate::tool::Tool::Claude {
+                db.mark_claude_session_validated(session_id, &bound)?;
+            }
+            print_bootstrap(db, hcom_dir, ctx, &bound, &owner.tool);
+            db.log_event(
+                "life",
+                &bound,
+                &json!({
+                    "action": "started",
+                    "tool": owner.tool,
+                    "name": bound,
+                }),
+            )
+            .ok();
+            return Ok(0);
+        }
+        println!("hcom already started for {}", owner.name);
+        return Ok(0);
+    }
+
     // Resolve or generate name
     let name = if let Some(n) = explicit_name {
         n.to_string()
@@ -782,14 +821,40 @@ fn start_bare(
         }
     }
 
-    // Bind process if we have a process_id
+    // Bind process if we have a process_id nobody else live owns
     if let Some(ref process_id) = ctx.process_id
+        && process_owner
+            .as_ref()
+            .is_none_or(|owner| owner.name == name)
         && let Err(e) = db.set_process_binding(process_id, "", &name)
     {
         eprintln!("[hcom] warn: set_process_binding failed for {name}: {e}");
     }
 
-    // Print bootstrap
+    print_bootstrap(db, hcom_dir, ctx, &name, tool);
+
+    // Log
+    db.log_event(
+        "life",
+        &name,
+        &json!({
+            "action": "started",
+            "tool": tool,
+            "name": name,
+        }),
+    )
+    .ok();
+
+    Ok(0)
+}
+
+fn print_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &std::path::Path,
+    ctx: &HcomContext,
+    name: &str,
+    tool: &str,
+) {
     let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
         eprintln!("[hcom] warn: config load failed, using defaults: {e}");
         let mut c = HcomConfig::default();
@@ -800,7 +865,7 @@ fn start_bare(
     let bootstrap_text = bootstrap::get_bootstrap(
         db,
         hcom_dir,
-        &name,
+        name,
         tool,
         false,
         ctx.is_launched,
@@ -816,20 +881,6 @@ fn start_bare(
     // `hcom start | tail -n` shows none of it. A caller that cannot see its own
     // name re-runs start, which is one way duplicate identities appear.
     println!("[hcom:{}]", name);
-
-    // Log
-    db.log_event(
-        "life",
-        &name,
-        &json!({
-            "action": "started",
-            "tool": tool,
-            "name": name,
-        }),
-    )
-    .ok();
-
-    Ok(0)
 }
 
 #[cfg(test)]
@@ -1048,6 +1099,90 @@ mod tests {
             .map(|row| row.name)
             .collect();
         assert_eq!(claude_rows, vec![name], "exactly one identity per session");
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_never_takes_over_a_live_process_binding() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let launched_ctx = |session: Option<&str>| {
+            let mut env = HashMap::from([
+                ("CLAUDECODE".to_string(), "1".to_string()),
+                ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+                ("HCOM_PROCESS_ID".to_string(), "pid-parent".to_string()),
+            ]);
+            if let Some(sid) = session {
+                env.insert("CLAUDE_CODE_SESSION_ID".to_string(), sid.to_string());
+            }
+            HcomContext::from_env(&env, PathBuf::from("/tmp/project"))
+        };
+        assert_eq!(
+            start_bare(&db, &hcom_dir, &launched_ctx(Some("sess-parent")), None).unwrap(),
+            0
+        );
+        let parent = db.get_process_binding("pid-parent").unwrap().unwrap();
+
+        // The parent's own shell without a session var: still the parent.
+        assert_eq!(
+            start_bare(&db, &hcom_dir, &launched_ctx(None), None).unwrap(),
+            0
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+
+        // Another session carrying the same process id never repoints it.
+        assert_eq!(
+            start_bare(&db, &hcom_dir, &launched_ctx(Some("sess-other")), None).unwrap(),
+            0
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        assert_eq!(
+            db.get_process_binding("pid-parent").unwrap().as_deref(),
+            Some(parent.as_str())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_start_binds_session_to_launched_placeholder() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        // Launcher pre-registered the process; SessionStart has not bound it.
+        instance_binding::initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("claude"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        db.set_process_binding("pid-launch", "", "luna").unwrap();
+
+        let env = HashMap::from([
+            ("CLAUDECODE".to_string(), "1".to_string()),
+            ("HCOM_LAUNCHED".to_string(), "1".to_string()),
+            ("HCOM_PROCESS_ID".to_string(), "pid-launch".to_string()),
+            (
+                "CLAUDE_CODE_SESSION_ID".to_string(),
+                "sess-late".to_string(),
+            ),
+        ]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/project"));
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+
+        assert_eq!(
+            db.get_session_binding("sess-late").unwrap().as_deref(),
+            Some("luna")
+        );
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
     }
 
     #[test]
