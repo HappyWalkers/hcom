@@ -715,8 +715,8 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
 
 /// Build PTY wake text for tools whose delivery path is not human-visible.
 ///
-/// Claude and Codex inject the plain `<hcom>` trigger because their hooks already
-/// print the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
+/// Claude and Codex inject the plain `<hcom>` trigger because their hooks show
+/// the full message in the TUI. Gemini, Antigravity, and OpenCode bootstrap
 /// need a human-visible prompt line, but it must stay prompt-safe: metadata only,
 /// no message body, no `@` autocomplete triggers, and no wrapping. If the compact
 /// preview will not fit the current input width, use the same minimal trigger.
@@ -1925,7 +1925,7 @@ pub fn run_delivery_loop(
                             continue;
                         }
 
-                        // Claude/Codex hooks show full delivery in the TUI, so
+                        // Claude/Codex hooks show the full delivery in the TUI, so
                         // they only need a trigger. Gemini-style paths use a
                         // compact, prompt-safe preview for human visibility.
                         use crate::tool::Tool;

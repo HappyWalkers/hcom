@@ -301,13 +301,13 @@ fn update_codex_position(
 
 /// Prepare pending messages for a Codex instance.
 ///
-/// Only additionalContext — no systemMessage. Codex TUI renders both
-/// as separate visible lines ("warning:" + "hook context:"), causing
-/// double output for every delivered message.
+/// Show the delivery in the TUI while also giving it to the model.
+/// Codex renders systemMessage as hook output and keeps additionalContext
+/// out of the TUI; only additionalContext enters model context.
 fn prepare_codex_delivery(db: &HcomDb, instance_name: &str) -> Option<HookResult> {
     common::prepare_pending_messages(db, instance_name).map(|prepared| HookResult::Allow {
+        system_message: Some(prepared.formatted.clone()),
         additional_context: Some(prepared.formatted),
-        system_message: None,
         delivery_ack: Some(prepared.ack),
     })
 }
@@ -361,8 +361,7 @@ fn handle_sessionstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) ->
     crate::relay::worker::ensure_worker(true);
     common::notify_hook_instance_with_db(db, &instance_name);
 
-    // Bootstrap is injected at launch time via developer_instructions flag,
-    // not here — Codex TUI renders hook output visibly ("hook context:").
+    // Bootstrap is injected at launch time via developer_instructions flag.
     hook_noop()
 }
 
