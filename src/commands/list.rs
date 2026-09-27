@@ -194,8 +194,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
                     }
                     return 0;
                 } else {
-                    eprintln!("Error: Not found: {target}");
-                    eprintln!("Use 'hcom list' to see active agents.");
+                    eprintln!("Error: {}", identity::describe_missing_agent(db, target));
                     return 1;
                 }
             }

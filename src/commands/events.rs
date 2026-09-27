@@ -570,6 +570,30 @@ fn cmd_events_unsub(db: &HcomDb, args: &EventsUnsubArgs) -> i32 {
     0
 }
 
+/// An `--agent` typo otherwise looks exactly like "no events yet".
+fn warn_unknown_agent_filters(db: &HcomDb, filters: &crate::core::filters::FilterMap) {
+    let Some(names) = filters.get("instance") else {
+        return;
+    };
+    for name in names {
+        let seen = db
+            .conn()
+            .query_row(
+                "SELECT 1 FROM events WHERE instance = ? LIMIT 1",
+                rusqlite::params![name],
+                |_| Ok(()),
+            )
+            .is_ok()
+            || db.get_instance_full(name).ok().flatten().is_some();
+        if !seen {
+            eprintln!(
+                "Warning: {}",
+                crate::identity::describe_missing_agent(db, name)
+            );
+        }
+    }
+}
+
 /// Install a subscription on a remote device via SUB_CREATE RPC.
 fn cmd_events_sub_remote_create(db: &HcomDb, args: &EventsSubArgs, device: &str) -> i32 {
     // Identity selection for the remote sub:
@@ -1031,6 +1055,11 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
     // Convert clap filter args to FilterMap
     let mut filters = args.filters.to_filter_map();
     resolve_filter_names(&mut filters, db);
+    // --all also searches archives, where an agent may exist only historically;
+    // --wait may legitimately target an agent that hasn't started yet.
+    if !args.remote_fetch && !search_all && wait_timeout.is_none() {
+        warn_unknown_agent_filters(db, &filters);
+    }
 
     // Remote one-shot fetch
     if args.remote_fetch {
@@ -1210,11 +1239,17 @@ pub fn cmd_events(db: &HcomDb, args: &EventsArgs, ctx: Option<&CommandContext>) 
         }
     }
 
-    // Sort by timestamp and limit
-    all_events.sort_by(|a, b| {
-        let ts_a = a.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        let ts_b = b.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        ts_a.cmp(ts_b)
+    // Chronological by timestamp (relay-pulled events keep their original
+    // time, so insertion order isn't chronological). Timestamps have second
+    // resolution; break ties by id to keep same-second events in write order.
+    all_events.sort_by_cached_key(|v| {
+        (
+            v.get("ts")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            v.get("id").and_then(|v| v.as_i64()).unwrap_or(0),
+        )
     });
 
     if all_events.len() > last_n {

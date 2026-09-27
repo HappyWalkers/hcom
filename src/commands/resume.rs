@@ -343,7 +343,9 @@ fn prepare_resume_plan_from_source(
                 && let Ok(Some(inst)) = db.get_instance_full(name)
                 && inst.status != ST_INACTIVE
             {
-                bail!("'{}' is still active — run hcom kill {} first", name, name);
+                bail!(
+                    "'{name}' is still running.\n  Branch a copy instead: hcom f {name}\n  Or stop it first:     hcom kill {name}"
+                );
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
                 load_instance_data(db, name)?
@@ -978,9 +980,10 @@ fn load_stopped_snapshot(
         }
     }
 
+    let known = crate::identity::known_agent_names(db);
     bail!(
-        "No stopped snapshot found for '{name}'. Not a known hcom instance, \
-         session UUID, or recognized thread name."
+        "No agent named '{name}' to resume (not a known hcom agent, session UUID, or thread name){}\n  Stopped agents: hcom list --stopped",
+        crate::shared::suggest::did_you_mean(name, known.iter().map(String::as_str))
     )
 }
 
@@ -3371,7 +3374,7 @@ mod tests {
         // Remote-RPC entrypoint must walk the UUID/thread-name resolution
         // chain. A UUID with no on-disk transcript should error with the
         // adoption "Session not found" message (proving we hit find_session_on_disk),
-        // not the name-based "No stopped snapshot found" message.
+        // not the name-based "No agent named ... to resume" message.
         let db = test_db();
         let err = run_local_resume_result(
             &db,

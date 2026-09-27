@@ -49,6 +49,42 @@ fn is_launch_tool(name: &str) -> bool {
     matches!(name, "f" | "r") || name.parse::<Tool>().is_ok_and(|tool| tool.spec().released)
 }
 
+fn released_tool_names() -> Vec<&'static str> {
+    crate::integration_spec::ALL
+        .iter()
+        .filter(|spec| spec.released)
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Error for an unrecognized first token, with typo suggestions.
+///
+/// `hcom 2 claud` is reported as an unknown tool (not "unknown command '2'").
+fn unknown_command_message(cmd: &str, args: &[String]) -> String {
+    use crate::shared::suggest::did_you_mean;
+    let tools = released_tool_names();
+    if cmd.parse::<u32>().is_ok() {
+        // Flags like --go can sit between the count and the tool.
+        let (stripped, _) = extract_global_flags(args);
+        return match stripped.iter().skip(1).find(|a| !a.starts_with('-')) {
+            Some(tool) => format!(
+                "Unknown tool '{tool}'{}\nTools: {}",
+                did_you_mean(tool, tools.iter().copied()),
+                tools.join(", ")
+            ),
+            None => format!(
+                "Missing tool after count: hcom {cmd} <tool>\nTools: {}",
+                tools.join(", ")
+            ),
+        };
+    }
+    let candidates = COMMANDS.iter().chain(tools.iter()).copied();
+    format!(
+        "Unknown command '{cmd}'{}\nRun 'hcom --help' for usage.",
+        did_you_mean(cmd, candidates)
+    )
+}
+
 fn maybe_external_send_name_hint(
     cmd: &str,
     explicit_name: Option<&str>,
@@ -615,9 +651,8 @@ pub fn dispatch() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
         }
-        Action::Command { ref cmd, .. } => {
-            eprintln!("Error: Unknown command '{}'", cmd);
-            eprintln!("Run 'hcom --help' for usage.");
+        Action::Command { ref cmd, ref args } => {
+            eprintln!("Error: {}", unknown_command_message(cmd, args));
             std::process::exit(1);
         }
         Action::Version => {

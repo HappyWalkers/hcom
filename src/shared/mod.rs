@@ -6,6 +6,7 @@ pub mod context;
 pub mod errors;
 pub mod identity;
 pub mod platform;
+pub mod suggest;
 pub mod terminal_presets;
 pub mod time;
 pub mod tool_detection;

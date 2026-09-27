@@ -1415,7 +1415,7 @@ fn test_relay_roundtrip() {
 
     // Wait for the launched claude on Device B to actually be usable.
     // Without this, the rest of the phases race the tool's boot and see
-    // "No inject port for ..." errors that silently get swallowed by weak
+    // "no terminal registered yet" errors that silently get swallowed by weak
     // assertions. The lifecycle ready event is the canonical signal —
     // screen["ready"] is unreliable when the user has dontAsk mode on, but
     // the life event fires from hooks regardless.
@@ -1867,8 +1867,8 @@ fn test_relay_roundtrip() {
     let kill_output = check("A", &format!("kill {remote_name}"), &path_a);
     logln!(log, "{}", kill_output.trim_end());
     assert!(
-        kill_output.contains("Sent SIGTERM")
-            || kill_output.contains("already terminated")
+        kill_output.contains("Sent SIGTERM to '")
+            || kill_output.contains("had already exited")
             || kill_output.contains("already_dead"),
         "Unexpected remote kill output:\n{kill_output}"
     );

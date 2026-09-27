@@ -183,10 +183,10 @@ pub fn inject_prompt_until(
     while prompt_attempts < 5 && Instant::now() < inject_deadline {
         let (code, stdout, stderr) = h.run(["term", "inject", name, prompt, "--enter"]);
         if code != 0 {
-            let retryable = stdout.contains("No inject port")
-                || stdout.contains("No response from")
-                || stderr.contains("No inject port")
-                || stderr.contains("No response from");
+            // The PTY registers its inject port shortly after the row appears.
+            let retryable = ["no terminal registered yet", "No response from"]
+                .iter()
+                .any(|m| stdout.contains(m) || stderr.contains(m));
             if retryable {
                 std::thread::sleep(Duration::from_millis(250));
                 continue;

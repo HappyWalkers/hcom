@@ -228,9 +228,16 @@ impl SendArgs {
 }
 
 /// Get formatted recipient feedback showing who received the message.
-fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String]) -> String {
+///
+/// `thread` is set when delivery was limited to that thread's members.
+fn get_recipient_feedback(db: &HcomDb, delivered_to: &[String], thread: Option<&str>) -> String {
     if delivered_to.is_empty() {
-        return format!("Sent to: {SENDER}");
+        return match thread {
+            Some(thread) => {
+                format!("Sent to: {SENDER} only (no other members of thread '{thread}' are active)")
+            }
+            None => format!("Sent to: {SENDER} only (no other agents are active)"),
+        };
     }
     if delivered_to.len() > 10 {
         return format!("Sent to {} agents", delivered_to.len());
@@ -717,6 +724,46 @@ fn process_positionals(positionals: &[String]) -> (Vec<String>, Option<String>) 
     (targets, None)
 }
 
+/// After a failed send, say which requested targets are stopped (and when) so
+/// the sender can resume them instead of guessing at typos.
+fn print_stopped_target_hints(db: &HcomDb, explicit_targets: &[String], message: &str) {
+    let targets = if explicit_targets.is_empty() {
+        crate::shared::constants::extract_mentions(message)
+    } else {
+        explicit_targets.to_vec()
+    };
+    for target in targets {
+        if let Some(stopped) = identity::last_stopped(db, &target) {
+            eprintln!(
+                "  @{target} {} — resume: hcom r {}",
+                stopped.summary(),
+                stopped.display_name()
+            );
+        }
+    }
+}
+
+/// Reject `hcom send hi` / `hcom send luna`: a lone bare word with no `@` and
+/// no `--` is as likely a target missing its `@` as a broadcast, and guessing
+/// broadcast interrupts every agent. Quoted phrases stay broadcasts.
+fn ambiguous_bare_word_error(db: &HcomDb, targets: &[String], word: &str) -> Option<String> {
+    if !targets.is_empty() || word.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    let mut msg =
+        format!("Error: '{word}' is ambiguous: a target needs '@', a broadcast needs '--'");
+    if identity::resolve_display_name_or_stopped(db, word).is_some() {
+        msg.push_str(&format!(
+            "\nDid you mean @{word}? hcom send @{word} -- <message>"
+        ));
+    } else {
+        msg.push_str(&format!(
+            "\n  Direct:    hcom send @name -- {word}\n  Broadcast: hcom send -- {word}"
+        ));
+    }
+    Some(msg)
+}
+
 /// Main entry point for `hcom send` command.
 ///
 /// Returns exit code (0 = success, 1 = error).
@@ -825,7 +872,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     //   - Pure @targets → explicit targets
     let (effective_targets, compat_message) =
         if !args.has_separator() && !args.stdin && args.file.is_none() && args.base64.is_none() {
-            process_positionals(&args.positionals)
+            let (targets, message) = process_positionals(&args.positionals);
+            if let Some(word) = message.as_deref()
+                && let Some(err) = ambiguous_bare_word_error(db, &targets, word)
+            {
+                eprintln!("{err}");
+                return 1;
+            }
+            (targets, message)
         } else {
             // With -- separator or explicit source: validate @targets
             let mut validated = Vec::new();
@@ -911,6 +965,28 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         return 1;
     }
 
+    // Self-delivery is always filtered out, so an all-self target list would
+    // otherwise "succeed" with no recipients.
+    if !effective_targets.is_empty()
+        && effective_targets.iter().all(|t| {
+            // Routing treats bigboss:DEVICE as bigboss (device-agnostic identity).
+            let base = match t.split_once(':') {
+                Some((base, _)) if base == SENDER => base,
+                _ => t.as_str(),
+            };
+            identity::resolve_display_name(db, base)
+                .as_deref()
+                .unwrap_or(base)
+                == sender_identity.name
+        })
+    {
+        eprintln!(
+            "Error: @{} is you ({}); agents don't receive their own messages",
+            effective_targets[0], sender_identity.name
+        );
+        return 1;
+    }
+
     let targets_to_pass: Option<&[String]> =
         if args.has_separator() || !effective_targets.is_empty() {
             Some(&effective_targets)
@@ -934,6 +1010,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         Ok(delivery) => delivery,
         Err(e) => {
             eprintln!("Error: {e}");
+            print_stopped_target_hints(db, &effective_targets, &message);
             return 1;
         }
     };
@@ -1084,7 +1161,14 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         return 0;
     }
 
-    let feedback = get_recipient_feedback(db, &delivered_to);
+    let feedback = get_recipient_feedback(
+        db,
+        &delivered_to,
+        envelope
+            .thread
+            .as_deref()
+            .filter(|_| preview_delivery.is_thread_resolved),
+    );
 
     // Deliver the receiver's unread messages inline. With --from the outgoing
     // author is external, but the invoking codex/adhoc instance still receives.

@@ -569,12 +569,12 @@ fn config_instance(
                 Ok(matched) => match db.get_instance_full(&matched) {
                     Ok(Some(inst)) => inst,
                     _ => {
-                        eprintln!("Error: Agent '{name}' not found");
+                        eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
                         return 1;
                     }
                 },
                 Err(_) => {
-                    eprintln!("Error: Agent '{name}' not found");
+                    eprintln!("Error: {}", identity::describe_missing_agent(db, &name));
                     return 1;
                 }
             }
@@ -864,7 +864,7 @@ pub fn config_instance_get(
     let instance = db
         .get_instance_full(&name)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+        .ok_or_else(|| identity::describe_missing_agent(db, instance_arg))?;
 
     Ok(match key {
         None => {
@@ -893,7 +893,7 @@ pub fn config_instance_set(
     let instance = db
         .get_instance_full(&name)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Agent '{}' not found", name))?;
+        .ok_or_else(|| identity::describe_missing_agent(db, instance_arg))?;
     let inst_name = &instance.name;
 
     match key {
@@ -1094,7 +1094,7 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     let key_arg = &argv[0];
 
-    if key_arg == "dev_root" {
+    if normalize_key(key_arg) == "HCOM_DEV_ROOT" {
         return config_dev_root(
             db,
             argv.get(1).map(|s| s.as_str()),
@@ -1128,6 +1128,29 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
     if wants_info {
         return show_key_info(&key);
+    }
+
+    // Unknown keys would silently read as "(not set)" or be written to
+    // config.toml where nothing reads them. Reading an env-only setting that
+    // is actually set (e.g. HCOM_DIR) stays allowed.
+    let is_set_mode = argv.len() >= 2;
+    let env_readable = !is_set_mode && std::env::var(&key).is_ok();
+    if !CONFIG_KEYS.iter().any(|(k, _, _)| *k == key) && !env_readable {
+        let typed = key_arg.to_lowercase();
+        let short: Vec<String> = CONFIG_KEYS
+            .iter()
+            .map(|(k, _, _)| k.trim_start_matches("HCOM_").to_lowercase())
+            .chain(["dev_root".to_string()])
+            .collect();
+        eprintln!(
+            "Error: Unknown config key '{key_arg}'{}\nValid keys: {}",
+            crate::shared::suggest::did_you_mean(
+                typed.trim_start_matches("hcom_"),
+                short.iter().map(String::as_str)
+            ),
+            short.join(", ")
+        );
+        return 1;
     }
 
     // Set mode: config KEY VALUE
