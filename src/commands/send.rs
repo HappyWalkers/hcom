@@ -1,18 +1,27 @@
 //! `hcom send` command — send messages to hcom instances.
 
-use std::io::{IsTerminal, Read as IoRead};
+use std::io::{IsTerminal, Read as IoRead, Write as IoWrite};
 
 use crate::db::HcomDb;
 use crate::db::subscriptions::create_request_watches;
 use crate::identity;
-use crate::instances;
+use crate::instance_lifecycle as lifecycle;
 use crate::messages::{
     InstanceInfo, MessageEnvelope, MessageScope, compute_scope, should_deliver_message,
     validate_intent, validate_message,
 };
 use crate::shared::{
-    CommandContext, SENDER, SenderIdentity, SenderKind, is_inside_ai_tool, status_icon,
+    CommandContext, MAX_MESSAGES_PER_DELIVERY, SENDER, SenderIdentity, SenderKind,
+    is_inside_ai_tool, status_icon,
 };
+
+/// Set once the outgoing message is persisted. From then on send owns the
+/// receiver's inline delivery: it delivers the batch itself, or deliberately
+/// leaves it unread (--quiet, --json, failed output write). The router's
+/// after-command delivery must not run again. A send that fails earlier leaves
+/// it false, so the router still delivers.
+pub static SENT_OWNS_INLINE_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 const SEND_AFTER_HELP: &str = "\
 Target matching:
@@ -1057,6 +1066,7 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             return 1;
         }
     };
+    SENT_OWNS_INLINE_DELIVERY.store(true, std::sync::atomic::Ordering::Relaxed);
 
     // ── Feedback ──
     if args.json {
@@ -1076,62 +1086,54 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
 
     let feedback = get_recipient_feedback(db, &delivered_to);
 
-    // Show unread messages if instance context (full delivery with cursor advance)
-    if matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            // Advance cursor
-            if let Some(last) = messages.last()
-                && let Some(id) = last.event_id
-            {
-                let mut updates = serde_json::Map::new();
-                updates.insert("last_event_id".into(), serde_json::json!(id));
-                instances::update_instance_position(db, &sender_identity.name, &updates);
-            }
+    // Deliver the receiver's unread messages inline. With --from the outgoing
+    // author is external, but the invoking codex/adhoc instance still receives.
+    // The router skips its own delivery for send, so --quiet leaves messages unread.
+    let receiver = if matches!(sender_identity.kind, SenderKind::Instance) {
+        Some((&sender_identity, None))
+    } else {
+        ctx.and_then(crate::cli_context::inline_receiver)
+            .map(|(actor, tool)| (actor, Some(tool)))
+    };
+    let batch = receiver.and_then(|(r, _)| InlineBatch::take(db, &r.name));
+    let noted_remaining = batch.as_ref().is_some_and(|b| b.remaining > 0);
+    if let (Some((receiver, status_tool)), Some(batch)) = (receiver, batch) {
+        let subagent_names: std::collections::HashSet<String> = db
+            .conn()
+            .prepare("SELECT name FROM instances WHERE parent_name = ?")
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map(rusqlite::params![&receiver.name], |row| row.get(0))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (sub_msgs, main_msgs): (Vec<_>, Vec<_>) = batch
+            .messages
+            .iter()
+            .partition(|msg| subagent_names.contains(&msg.from));
 
-            // Separate subagent messages from main messages
-            let subagent_names: std::collections::HashSet<String> = db
-                .conn()
-                .prepare("SELECT name FROM instances WHERE parent_name = ?")
-                .ok()
-                .map(|mut stmt| {
-                    stmt.query_map(rusqlite::params![&sender_identity.name], |row| row.get(0))
-                        .ok()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|r| r.ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut main_msgs = Vec::new();
-            let mut sub_msgs = Vec::new();
-            for msg in &messages {
-                if subagent_names.contains(&msg.from) {
-                    sub_msgs.push(msg);
-                } else {
-                    main_msgs.push(msg);
-                }
-            }
-
-            const MAX_MSGS: usize = 50;
-
-            print!("{feedback}");
-            if !main_msgs.is_empty() {
-                let capped: Vec<&_> = main_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n{formatted}");
-            }
-            if !sub_msgs.is_empty() {
-                let capped: Vec<&_> = sub_msgs.iter().take(MAX_MSGS).copied().collect();
-                let formatted = format_messages_for_hook(db, &capped, &sender_identity.name);
-                println!("\n[Subagent messages]\n{formatted}");
-            }
-            if main_msgs.is_empty() && sub_msgs.is_empty() {
-                println!();
-            }
-        } else {
-            println!("{feedback}");
+        let mut output = feedback.clone();
+        if !main_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n{}",
+                format_messages_for_hook(db, &main_msgs, &receiver.name)
+            ));
+        }
+        if !sub_msgs.is_empty() {
+            output.push_str(&format!(
+                "\n[Subagent messages]\n{}",
+                format_messages_for_hook(db, &sub_msgs, &receiver.name)
+            ));
+        }
+        output.push('\n');
+        if let Err(e) = batch.emit(db, &receiver.name, &output, status_tool) {
+            eprintln!("Message sent, but {e}");
+            crate::relay::worker::ensure_worker(true);
+            return 1;
         }
     } else {
         println!("{feedback}");
@@ -1149,15 +1151,16 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         println!("  To send '--name {sender_name}' as literal text, don't put it at the very end.");
     }
 
-    // Adhoc unread delivery: for --name instances, show unread preview
-    if explicit_name.is_some() && matches!(sender_identity.kind, SenderKind::Instance) {
-        let messages = db.get_unread_messages(&sender_identity.name);
-        if !messages.is_empty() {
-            println!("\n{}", "─".repeat(40));
-            println!("[hcom] new message(s)");
-            println!("{}", "─".repeat(40));
-            println!("\nRun: hcom listen --name {}", sender_identity.name);
-        }
+    // Messages that arrived after the batch was taken are not in the output or
+    // the remaining note. Say so, or an adhoc caller won't know until its next command.
+    if let Some((receiver, _)) = receiver
+        && !noted_remaining
+        && !db.get_unread_messages(&receiver.name).is_empty()
+    {
+        println!(
+            "[hcom] new message(s) arrived — run: hcom listen --name {}",
+            receiver.name
+        );
     }
 
     // Show intent tip
@@ -1173,6 +1176,92 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
     0
 }
 
+/// One chronological prefix of an instance's unread messages, capped per delivery.
+///
+/// A single cursor acknowledges everything up to the batch's last event, so the
+/// batch must be a prefix: capping per sender or per group would skip messages.
+struct InlineBatch {
+    messages: Vec<crate::db::Message>,
+    /// Unread messages left after this batch.
+    remaining: usize,
+}
+
+impl InlineBatch {
+    fn take(db: &HcomDb, name: &str) -> Option<Self> {
+        let mut messages = db.get_unread_messages(name);
+        if messages.is_empty() {
+            return None;
+        }
+        let remaining = messages.len().saturating_sub(MAX_MESSAGES_PER_DELIVERY);
+        messages.truncate(MAX_MESSAGES_PER_DELIVERY);
+        Some(Self {
+            messages,
+            remaining,
+        })
+    }
+
+    /// Write `output` (plus a note about remaining messages) to stdout, then
+    /// acknowledge the batch.
+    ///
+    /// Nothing is acknowledged if the write fails, so a retry after partial
+    /// output may duplicate messages but never skips them. The cursor only moves
+    /// forward, so a slow writer cannot rewind a newer concurrent delivery.
+    ///
+    /// `status_tool` sets delivery status for a receiver other than the sender
+    /// (--from), matching the router's codex/adhoc delivery.
+    fn emit(
+        &self,
+        db: &HcomDb,
+        name: &str,
+        output: &str,
+        status_tool: Option<&str>,
+    ) -> Result<(), String> {
+        let mut output = output.to_string();
+        if self.remaining > 0 {
+            output.push_str(&format!(
+                "[+{} more unread — run: hcom listen --name {name}]\n",
+                self.remaining
+            ));
+        }
+        let written = {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(output.as_bytes())
+                .and_then(|_| stdout.flush())
+        };
+        if let Err(e) = written {
+            return Err(format!(
+                "incoming message output failed; unread messages retained: {e}"
+            ));
+        }
+
+        let last = self.messages.last();
+        if let Some(id) = last.and_then(|m| m.event_id) {
+            db.advance_instance_cursor(name, id)
+                .map_err(|e| format!("receive acknowledgment failed: {e}"))?;
+        }
+
+        if let Some(tool) = status_tool {
+            let sender_display = identity::get_display_name(db, &self.messages[0].from);
+            lifecycle::set_status(
+                db,
+                name,
+                if tool == "codex" {
+                    crate::shared::ST_ACTIVE
+                } else {
+                    crate::shared::ST_INACTIVE
+                },
+                &format!("deliver:{sender_display}"),
+                lifecycle::StatusUpdate {
+                    msg_ts: last.and_then(|m| m.timestamp.as_deref()).unwrap_or(""),
+                    ..Default::default()
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Format messages for hook display (no ANSI).
 fn format_messages_for_hook(
     db: &HcomDb,
@@ -1184,8 +1273,11 @@ fn format_messages_for_hook(
     if messages.len() == 1 {
         let msg = messages[0];
         let sender_display = identity::get_display_name(db, &msg.from);
-        let prefix =
-            cli_context_build_prefix(msg.intent.as_deref(), msg.thread.as_deref(), msg.event_id);
+        let prefix = crate::cli_context::format_envelope_prefix(
+            msg.intent.as_deref(),
+            msg.thread.as_deref(),
+            msg.reply_id().as_deref(),
+        );
         format!(
             "{prefix} {sender_display} → {recipient_display}: {}",
             msg.text
@@ -1195,10 +1287,10 @@ fn format_messages_for_hook(
             .iter()
             .map(|msg| {
                 let sender_display = identity::get_display_name(db, &msg.from);
-                let prefix = cli_context_build_prefix(
+                let prefix = crate::cli_context::format_envelope_prefix(
                     msg.intent.as_deref(),
                     msg.thread.as_deref(),
-                    msg.event_id,
+                    msg.reply_id().as_deref(),
                 );
                 format!(
                     "{prefix} {sender_display} → {recipient_display}: {}",
@@ -1207,25 +1299,6 @@ fn format_messages_for_hook(
             })
             .collect();
         format!("[{} new messages] | {}", parts.len(), parts.join(" | "))
-    }
-}
-
-fn cli_context_build_prefix(
-    intent: Option<&str>,
-    thread: Option<&str>,
-    event_id: Option<i64>,
-) -> String {
-    let id_ref = event_id.map(|id| format!("#{id}")).unwrap_or_default();
-    let prefix = match (intent, thread) {
-        (Some(i), Some(t)) => format!("{i}:{t}"),
-        (Some(i), None) => i.to_string(),
-        (None, Some(t)) => format!("thread:{t}"),
-        (None, None) => "new message".to_string(),
-    };
-    if id_ref.is_empty() {
-        format!("[{prefix}]")
-    } else {
-        format!("[{prefix} {id_ref}]")
     }
 }
 
