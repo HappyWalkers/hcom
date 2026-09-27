@@ -813,6 +813,18 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Forward-only cursor advance, optionally marking the name announced, in
+    /// one statement.
+    pub fn ack_hook_delivery(&self, name: &str, event_id: i64, announce: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE instances SET last_event_id = MAX(COALESCE(last_event_id, 0), ?),
+             name_announced = CASE WHEN ? THEN 1 ELSE name_announced END
+             WHERE name = ?",
+            params![event_id, announce, name],
+        )?;
+        Ok(())
+    }
+
     /// Update specific fields on an instance row.
     /// Uses a JSON Value map for flexible field specification.
     pub fn update_instance_fields(

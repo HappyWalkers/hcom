@@ -38,7 +38,7 @@ fn send(h: &Hcom, from: &str, to: &str, body: &str) -> String {
 fn queue(db: &Connection, from: &str, to: &str, text: &str) -> i64 {
     let data = serde_json::json!({"from":from,"text":text,"scope":"mentions","mentions":[to],"delivered_to":[to],"sender_kind":"instance","intent":"inform"});
     db.execute(
-        "INSERT INTO events(timestamp,type,instance,data) VALUES(datetime('now'),'message',?,?)",
+        "INSERT INTO events(timestamp,type,instance,data) VALUES(strftime('%Y-%m-%dT%H:%M:%f','now'),'message',?,?)",
         params![from, data.to_string()],
     )
     .unwrap();
@@ -183,7 +183,7 @@ fn failed_stdout_write_preserves_incoming_messages() {
 /// An external outgoing name must not replace the invoking instance's inbox.
 #[test]
 fn external_sender_preserves_inline_receive_delivery() {
-    for tool in ["codex", "adhoc"] {
+    for tool in ["adhoc"] {
         let (h, db, sender, receiver) = setup(tool);
         queue(&db, &sender, &receiver, "external-incoming-sentinel");
         let before = cursor(&db, &receiver);
@@ -228,14 +228,7 @@ fn external_sender_preserves_inline_receive_delivery() {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(
-            status,
-            if tool == "codex" {
-                "active"
-            } else {
-                "inactive"
-            }
-        );
+        assert_eq!(status, "inactive");
         assert!(context.starts_with("deliver:"), "{context}");
         let from: String = db.query_row(
             "SELECT json_extract(data,'$.from') FROM events WHERE type='message' AND json_extract(data,'$.text')='external-outgoing'",
@@ -318,8 +311,9 @@ fn late_send_cannot_rewind_a_newer_cursor() {
 /// Relay references are reply IDs; only the cursor uses local database IDs.
 #[test]
 fn relay_reply_ids_survive_inline_receive() {
-    for tool in ["codex", "adhoc"] {
-        for external in [false, true] {
+    // --from receives inline only for adhoc; codex gets messages via hooks.
+    for (tool, external) in [("codex", false), ("adhoc", false), ("adhoc", true)] {
+        {
             for count in [1, 2] {
                 let (h, db, sender, receiver) = setup(tool);
                 for i in 0..count {
@@ -355,7 +349,7 @@ fn relay_reply_ids_survive_inline_receive() {
 /// A send that fails before persisting still delivers pending messages.
 #[test]
 fn failed_send_still_delivers_pending_messages() {
-    for tool in ["codex", "adhoc"] {
+    for tool in ["adhoc"] {
         let (h, db, sender, receiver) = setup(tool);
         let id = queue(&db, &sender, &receiver, "pending-sentinel");
         let (code, out, _) = h.run([
@@ -377,7 +371,7 @@ fn failed_send_still_delivers_pending_messages() {
 /// --from delivers to the process-bound invoking instance, not only --name.
 #[test]
 fn external_sender_delivers_to_process_bound_instance() {
-    for tool in ["codex", "adhoc"] {
+    for tool in ["adhoc"] {
         let h = Hcom::new();
         let sender = h.start();
         let process_id = format!("send-delivery-{tool}");
@@ -467,6 +461,224 @@ fn message_arriving_mid_send_is_noticed() {
     assert!(child.wait().unwrap().success());
     assert!(!rest.contains("late-sentinel"));
     assert!(!rest.contains("more unread"));
+    assert!(rest.contains("new message(s) arrived"), "{rest}");
+    assert!(cursor(&db, &receiver) < late);
+}
+
+/// Codex has delivery hooks, so other commands and --from sends leave its
+/// messages for the hooks instead of consuming them inline.
+#[test]
+fn codex_messages_are_left_for_hooks() {
+    let (h, db, sender, receiver) = setup("codex");
+    let before = cursor(&db, &receiver);
+    queue(&db, &sender, &receiver, "hook-sentinel");
+    let (code, out, err) = h.run(["list", "--name", &receiver]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("hook-sentinel"), "{out}");
+    let (code, out, err) = h.run([
+        "send",
+        "--name",
+        &receiver,
+        "--from",
+        "operator",
+        &format!("@{sender}"),
+        "--",
+        "external-outgoing",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!out.contains("hook-sentinel"), "{out}");
+    assert_eq!(cursor(&db, &receiver), before);
+}
+
+/// Other adhoc commands deliver a capped prefix after their output.
+#[test]
+fn command_drain_delivers_capped_prefix() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let ids: Vec<i64> = (0..51)
+        .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+        .collect();
+    let (code, out, err) = h.run(["list", "--name", &receiver]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), ids[49]);
+    assert!(out.contains("sentinel-049-end") && !out.contains("sentinel-050-end"));
+    assert!(out.contains("[+1 more unread"), "{out}");
+    let (_, out, _) = h.run(["list", "--name", &receiver]);
+    assert!(out.contains("sentinel-050-end"), "{out}");
+    assert_eq!(cursor(&db, &receiver), ids[50]);
+}
+
+/// listen shows a capped prefix, notes the rest, and acknowledges only what it showed.
+#[test]
+fn listen_delivers_capped_prefix() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let ids: Vec<i64> = (0..101)
+        .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+        .collect();
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(cursor(&db, &receiver), ids[49]);
+    assert!(out.contains("sentinel-049-end") && !out.contains("sentinel-050-end"));
+    assert!(out.contains("[+51 more unread"), "{out}");
+    // JSON stdout stays one object per line; the overflow note goes to stderr.
+    let (code, out, err) = h.run(["listen", "--name", &receiver, "--json", "--timeout", "1"]);
+    assert_eq!(code, 0, "{err}");
+    for line in out.lines().filter(|l| !l.is_empty()) {
+        let _: serde_json::Value = serde_json::from_str(line).expect(line);
+    }
+    assert!(out.contains("sentinel-099-end") && !out.contains("sentinel-100-end"));
+    assert!(err.contains("[+1 more unread"), "{err}");
+    assert_eq!(cursor(&db, &receiver), ids[99]);
+}
+
+/// A filter listen that returns on a recent match, before reading the inbox,
+/// still gets the router's delivery.
+#[test]
+fn early_filter_listen_match_still_delivers() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let id = queue(&db, &sender, &receiver, "early-sentinel");
+    let (code, out, err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "1",
+        "--sql",
+        "type='message'",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("[Match found]"), "{out}");
+    assert!(out.contains("early-sentinel"), "{out}");
+    assert_eq!(cursor(&db, &receiver), id);
+}
+
+/// A failed after-command delivery write leaves messages unread and fails the command.
+#[cfg(unix)]
+#[test]
+fn failed_command_delivery_write_fails_command() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    use std::process::Stdio;
+    let (h, db, sender, receiver) = setup("adhoc");
+    queue(&db, &sender, &receiver, "incoming-sentinel");
+    let before = cursor(&db, &receiver);
+    let (writer, reader) = UnixStream::pair().unwrap();
+    drop(reader);
+    let output = h
+        .cmd()
+        .args(["config", "--name", &receiver, "timeout"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(cursor(&db, &receiver), before);
+}
+
+/// Filter listen shows system messages it acknowledges instead of dropping them.
+#[test]
+fn filter_listen_shows_system_messages() {
+    let (h, db, _sender, receiver) = setup("adhoc");
+    let id = queue(&db, "[hcom-launcher]", &receiver, "launcher-sentinel");
+    let (_, out, err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "1",
+        "--sql",
+        "type='status' AND 0",
+    ]);
+    assert!(out.contains("launcher-sentinel"), "{out}\n{err}");
+    assert_eq!(cursor(&db, &receiver), id);
+}
+
+/// A listen that exits before reading the inbox leaves delivery to the router.
+#[test]
+fn listen_exiting_before_reading_still_delivers() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let id = queue(&db, &sender, &receiver, "unread-sentinel");
+    let (_, out, err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "0",
+        "--sql",
+        "type='status' AND 0",
+    ]);
+    assert!(out.contains("unread-sentinel"), "{out}\n{err}");
+    assert_eq!(cursor(&db, &receiver), id);
+}
+
+/// Filter listen keeps reading past a capped batch (a match may sit beyond it).
+#[test]
+fn filter_listen_reads_past_capped_batch() {
+    let (h, db, sender, receiver) = setup("adhoc");
+    let ids: Vec<i64> = (0..60)
+        .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+        .collect();
+    let (_, out, err) = h.run([
+        "listen",
+        "--name",
+        &receiver,
+        "--timeout",
+        "2",
+        "--sql",
+        "type='status' AND 0",
+    ]);
+    assert!(out.contains("sentinel-059-end"), "{out}\n{err}");
+    assert!(!out.contains("more unread"), "{out}");
+    assert_eq!(cursor(&db, &receiver), ids[59]);
+}
+
+/// A message arriving while listen writes its batch gets a notice.
+#[cfg(unix)]
+#[test]
+fn message_arriving_mid_listen_is_noticed() {
+    use std::io::Read;
+    use std::os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::net::UnixStream,
+    };
+    use std::process::Stdio;
+    use std::time::Duration;
+    let (h, db, sender, receiver) = setup("adhoc");
+    for i in 0..50 {
+        queue(
+            &db,
+            &sender,
+            &receiver,
+            &format!("sentinel-{i:03}-{}", "x".repeat(8192)),
+        );
+    }
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    let size: libc::c_int = 4096;
+    assert_eq!(
+        unsafe {
+            libc::setsockopt(
+                writer.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        },
+        0
+    );
+    reader
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut child = h
+        .cmd()
+        .args(["listen", "--name", &receiver, "--timeout", "1"])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .spawn()
+        .unwrap();
+    let mut first = [0];
+    reader.read_exact(&mut first).unwrap();
+    let late = queue(&db, &sender, &receiver, "late-sentinel");
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(!rest.contains("late-sentinel"));
     assert!(rest.contains("new message(s) arrived"), "{rest}");
     assert!(cursor(&db, &receiver) < late);
 }

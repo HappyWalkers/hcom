@@ -908,10 +908,11 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             Err(e) => {
                 e.print().ok();
                 let code = if e.use_stderr() { 1 } else { 0 };
-                if let Some(output) =
+                if let Err(e) =
                     crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
                 {
-                    print!("{output}");
+                    eprintln!("hcom: {e}");
+                    return 1;
                 }
                 return code;
             }
@@ -941,21 +942,14 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         }
     };
 
-    // Deliver pending messages AFTER command.
-    // Deliver pending messages AFTER command for hookless codex/adhoc instances.
+    // Deliver pending messages AFTER command for adhoc instances (no hooks).
     // This appends unread hcom messages to the command's stdout — keep in mind
     // when changing output contracts or adding machine-readable modes.
-    // Once send has persisted its message it owns the receive batch and output
-    // acknowledgment. A second drain would bypass its cap, quiet flag, or
-    // failed-write protection. Failed sends still get delivery here.
-    let send_owns_delivery = cmd == "send"
-        && crate::commands::send::SENT_OWNS_INLINE_DELIVERY
-            .load(std::sync::atomic::Ordering::Relaxed);
-    if !send_owns_delivery
-        && let Some(output) =
-            crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json)
-    {
-        print!("{output}");
+    // Skipped when the command claimed delivery (send, listen). A failed write
+    // leaves the messages unread and fails the command.
+    if let Err(e) = crate::cli_context::maybe_deliver_pending_messages(&db, &ctx, has_json) {
+        eprintln!("hcom: {e}");
+        return if result == 0 { 1 } else { result };
     }
 
     result

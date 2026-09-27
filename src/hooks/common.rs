@@ -288,12 +288,12 @@ pub fn prepare_pending_messages(db: &HcomDb, instance_name: &str) -> Option<Prep
 
 /// Commit a deferred delivery ack — advance cursor and set status.
 pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(ack.last_event_id));
-    if ack.mark_announced {
-        updates.insert("name_announced".into(), serde_json::json!(true));
+    // Forward-only: a delayed ack must not rewind a newer concurrent delivery.
+    // Cursor and announcement move together so a partial ack can't re-announce.
+    if let Err(e) = db.ack_hook_delivery(&ack.instance_name, ack.last_event_id, ack.mark_announced)
+    {
+        crate::log::log_error("hooks", "commit_delivery_ack", &format!("{e}"));
     }
-    instances::update_instance_position(db, &ack.instance_name, &updates);
 
     lifecycle::set_status(
         db,
