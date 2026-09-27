@@ -380,6 +380,8 @@ Tell agent to run them:
 
 **`hcom run fatcow`** — headless agent reads every file in a path, subscribes to file edit events to stay current, and answers other agents on demand.
 
+**`hcom run onidle`** — waits for an agent to go idle, then types text into another agent (`hcom run onidle luna nova 'luna is done, review it'`) or launches a new one with it as the prompt (`hcom run onidle luna codex 'review what luna just did'`).
+
 Custom scripts: drop `*.sh` or `*.py` into `~/.hcom/scripts/` — auto-discovered, override bundled scripts of the same name. Ask an agent to author one; `hcom run docs --scripts` is the authoring guide.
 
 </details>
