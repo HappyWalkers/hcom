@@ -397,10 +397,11 @@ fn start_rebind(
     // A direct per-run tool (plain `claude`/`codex`) has no hooks but still
     // exposes its native session id; bare start binds its adhoc identity to
     // it, so rebind must use it too or the old identity stays bound.
-    let adhoc_session = session_id.is_none()
-        && ctx.process_id.is_none()
-        && crate::hooks::runtime::is_per_run(ctx.tool);
-    if adhoc_session {
+    // Classified from the context alone: an id found via `--name`'s row must
+    // not turn a hookless direct session into a `claude`/`codex` row.
+    let adhoc_session =
+        !ctx.is_launched && ctx.process_id.is_none() && crate::hooks::runtime::is_per_run(ctx.tool);
+    if adhoc_session && session_id.is_none() {
         session_id = resolve_native_session_id(ctx);
     }
     let tool = if !adhoc_session && (ctx.process_id.is_some() || session_id.is_some()) {
@@ -1379,6 +1380,16 @@ mod tests {
             None,
             "an adhoc identity must not enter Claude's hook validation cache"
         );
+
+        // `--name` resolving the session through the current row keeps the
+        // target adhoc too.
+        assert_eq!(start_rebind(&db, "vega", &ctx, Some("nova")).unwrap(), 0);
+        assert_eq!(db.get_instance_full("vega").unwrap().unwrap().tool, "adhoc");
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-plain").unwrap(),
+            None
+        );
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
 
         // A later bare start returns the rebound identity, and the adhoc
         // identity can be reclaimed again from the same plain Claude.

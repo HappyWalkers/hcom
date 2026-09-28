@@ -1,6 +1,6 @@
 //! Codex native hook handlers and settings management.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 #[cfg(not(test))]
 use std::io::{BufRead, BufReader, Read};
@@ -354,15 +354,30 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     let metadata_path = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
 
     let mut hcom_positions = HashSet::new();
+    // User handlers after an hcom one shift left when it is removed; their
+    // trust keys follow them so the user's hooks stay trusted.
+    let mut moved: HashMap<HandlerPosition, HandlerPosition> = HashMap::new();
     let mut cleaned_hooks = None;
     match std::fs::read_to_string(&hooks_path) {
         Ok(source) => {
             let mut hooks: Value = serde_json::from_str(&source)
                 .with_context(|| format!("Malformed {}", hooks_path.display()))?;
-            hcom_positions = hcom_handler_positions(&hooks);
+            hcom_positions = handler_positions(&hooks, is_hcom_handler)
+                .into_iter()
+                .collect();
             if !hcom_positions.is_empty() {
+                let user_before = handler_positions(&hooks, |h| !is_hcom_handler(h));
                 remove_hcom_hooks_from_json(&mut hooks);
                 remove_legacy_hcom_cmd_hooks_from_json(&mut hooks);
+                // Removal keeps the remaining handlers in order.
+                let user_after = handler_positions(&hooks, |_| true);
+                if user_before.len() == user_after.len() {
+                    moved = user_before
+                        .into_iter()
+                        .zip(user_after)
+                        .filter(|(old, new)| old != new)
+                        .collect();
+                }
                 cleaned_hooks = Some(hooks);
             }
         }
@@ -399,19 +414,33 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
                 .and_then(|hooks| hooks.get_mut("state"))
                 .and_then(Item::as_table_like_mut)
             {
-                let stale: Vec<String> = state
-                    .iter()
-                    .map(|(key, _)| key.to_string())
-                    .filter(|key| {
-                        hcom_hooks_json_state_position(key, &hooks_path).is_some_and(|position| {
-                            recorded_keys.contains(key) || hcom_positions.contains(&position)
-                        })
-                    })
-                    .collect();
+                let mut stale = Vec::new();
+                let mut renames = Vec::new();
+                for (key, _) in state.iter() {
+                    let Some(position) = hcom_hooks_json_state_position(key, &hooks_path) else {
+                        continue;
+                    };
+                    if hcom_positions.contains(&position) {
+                        stale.push(key.to_string());
+                    } else if let Some(new) = moved.get(&position) {
+                        renames.push((key.to_string(), rekey_state_position(key, new)));
+                    } else if recorded_keys.contains(key) {
+                        stale.push(key.to_string());
+                    }
+                }
                 for key in &stale {
                     state.remove(key);
                 }
-                changed = !stale.is_empty();
+                // Take every moved entry out before reinserting: a new key can
+                // be another handler's old one.
+                let taken: Vec<(String, Item)> = renames
+                    .iter()
+                    .filter_map(|(old, new)| state.remove(old).map(|item| (new.clone(), item)))
+                    .collect();
+                for (key, item) in taken {
+                    state.insert(&key, item);
+                }
+                changed = !stale.is_empty() || !renames.is_empty();
             }
             if changed {
                 paths::atomic_write_io(&config_path, &config.to_string())
@@ -441,10 +470,21 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     }
 }
 
-/// `(event_label, group, handler)` of every hcom handler in a hooks.json value,
-/// in the form Codex uses for `hooks.state` keys.
-fn hcom_handler_positions(hooks: &Value) -> HashSet<(String, usize, usize)> {
-    let mut positions = HashSet::new();
+/// `(event_label, group, handler)`: a handler's place in hooks.json, in the
+/// form Codex uses for `hooks.state` keys.
+type HandlerPosition = (String, usize, usize);
+
+fn is_hcom_handler(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(is_hcom_codex_command)
+        || is_legacy_hcom_codex_cmd_entry(handler)
+}
+
+/// Positions of the handlers `select` accepts, in document order.
+fn handler_positions(hooks: &Value, select: impl Fn(&Value) -> bool) -> Vec<HandlerPosition> {
+    let mut positions = Vec::new();
     let Some(events) = hooks.get("hooks").and_then(Value::as_object) else {
         return positions;
     };
@@ -453,18 +493,19 @@ fn hcom_handler_positions(hooks: &Value) -> HashSet<(String, usize, usize)> {
         for (group_index, group) in groups.as_array().into_iter().flatten().enumerate() {
             let handlers = group.get("hooks").and_then(Value::as_array);
             for (handler_index, handler) in handlers.into_iter().flatten().enumerate() {
-                let hcom = handler
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_hcom_codex_command)
-                    || is_legacy_hcom_codex_cmd_entry(handler);
-                if hcom {
-                    positions.insert((label.to_string(), group_index, handler_index));
+                if select(handler) {
+                    positions.push((label.to_string(), group_index, handler_index));
                 }
             }
         }
     }
     positions
+}
+
+/// `<source>:<label>:<group>:<handler>` with the position replaced.
+fn rekey_state_position(key: &str, (label, group, handler): &HandlerPosition) -> String {
+    let source = key.rsplitn(4, ':').nth(3).unwrap_or_default();
+    format!("{source}:{label}:{group}:{handler}")
 }
 
 const HCOM_TOOL_NAMES: &[&str] = &[
@@ -1594,6 +1635,48 @@ mod tests {
             config["hooks"]["state"][&key(0)]["trusted_hash"].as_str(),
             Some("user")
         );
+    }
+
+    #[test]
+    fn per_run_cleanup_moves_trust_of_user_hooks_that_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooks_path = dir.path().join("hooks.json");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "hcom codex-stop"}]},
+                {"hooks": [
+                    {"type": "command", "command": "user-a"},
+                    {"type": "command", "command": "hcom codex-stop"},
+                    {"type": "command", "command": "user-b"},
+                ]},
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        let key = |group: usize, handler: usize| {
+            format!("{}:stop:{group}:{handler}", hooks_path.display())
+        };
+        std::fs::write(
+            &config_path,
+            format!(
+                "[hooks.state]\n'{}' = {{ trusted_hash = 'hcom0' }}\n'{}' = {{ trusted_hash = 'a' }}\n'{}' = {{ trusted_hash = 'hcom1' }}\n'{}' = {{ trusted_hash = 'b' }}\n",
+                key(0, 0),
+                key(1, 0),
+                key(1, 1),
+                key(1, 2)
+            ),
+        )
+        .unwrap();
+
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let state = config["hooks"]["state"].as_table().unwrap();
+        assert_eq!(state.len(), 2, "{state:?}");
+        assert_eq!(state[&key(0, 0)]["trusted_hash"].as_str(), Some("a"));
+        assert_eq!(state[&key(0, 1)]["trusted_hash"].as_str(), Some("b"));
     }
 
     #[test]
