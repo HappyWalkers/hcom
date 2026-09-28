@@ -2,7 +2,6 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
@@ -288,7 +287,8 @@ fn parse_cursor_version_date(output: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn ensure_supported_cursor_version(ctx: &LaunchCtx) -> Result<()> {
-    let output = Command::new("cursor-agent")
+    // Same resolution as the launch, including the ~/.local/bin fallback.
+    let output = crate::terminal::executable_command("cursor-agent")
         .arg("--version")
         .env_clear()
         .envs(&ctx.env)
@@ -339,14 +339,10 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     let path = cursor_hooks_path_for_ctx(ctx);
-    let root = match read_json_object(&path) {
-        Ok(root) => root,
-        Err(error) => return Err(error.into()),
-    };
     if !path.exists() {
         return Ok(());
     }
-    let mut value = Value::Object(root);
+    let mut value = Value::Object(read_json_object(&path)?);
     let before = value.clone();
     remove_hcom_hooks(&mut value);
     if value != before {
@@ -774,7 +770,7 @@ mod tests {
     #[test]
     #[serial]
     fn per_run_artifact_has_cursor_plugin_layout() {
-        let (_dir, workspace, _guard) = cursor_test_env();
+        let (_dir, _workspace, _guard) = cursor_test_env();
         let hooks = runtime_hooks_json().unwrap();
         let plugin_dir = runtime::publish_dir(
             "cursor",
@@ -789,10 +785,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(plugin_dir.join("hooks/hooks.json")).unwrap())
                 .unwrap();
         assert!(root["hooks"]["sessionStart"].is_array());
-        assert_eq!(
-            workspace.join(".hcom/integrations"),
-            runtime::integrations_dir()
-        );
+        assert!(plugin_dir.starts_with(runtime::integrations_dir().join("cursor")));
     }
 
     #[test]

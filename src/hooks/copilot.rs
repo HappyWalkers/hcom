@@ -319,37 +319,37 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let path = copilot_hooks_path_for_ctx(ctx);
-    let root = match read_json_object(&path) {
-        Ok(root) => root,
-        Err(error) => return Err(error.into()),
-    };
+    remove_hooks_at(&copilot_hooks_path_for_ctx(ctx))
+}
+
+/// Strip hcom's entries from a legacy `hooks/hcom.json`. The file is hcom's by
+/// name, so it is deleted once only `version` and empty `hooks` remain.
+fn remove_hooks_at(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let mut value = Value::Object(root);
+    let mut value = Value::Object(read_json_object(path)?);
     let before = value.clone();
     remove_hcom_hooks(&mut value);
-    if value != before {
-        write_json(&path, &value)?;
+    let only_hcom = value.as_object().is_some_and(|root| {
+        root.iter().all(|(key, v)| match key.as_str() {
+            "version" => true,
+            "hooks" => v.as_object().is_some_and(|hooks| hooks.is_empty()),
+            _ => false,
+        })
+    });
+    if only_hcom {
+        std::fs::remove_file(path).with_context(|| format!("Cannot remove {}", path.display()))?;
+    } else if value != before {
+        write_json(path, &value)?;
     }
     Ok(())
 }
 
 pub fn remove_copilot_hooks() -> bool {
-    copilot_hooks_cleanup_paths().iter().all(|path| {
-        if !path.exists() {
-            return true;
-        }
-        match read_json_object(path) {
-            Ok(root) => {
-                let mut value = Value::Object(root);
-                remove_hcom_hooks(&mut value);
-                write_json(path, &value).is_ok()
-            }
-            Err(_) => false,
-        }
-    })
+    copilot_hooks_cleanup_paths()
+        .iter()
+        .all(|path| remove_hooks_at(path).is_ok())
 }
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
@@ -751,6 +751,21 @@ mod tests {
             json!([{ "type": "command", "command": "./custom-start.sh" }])
         );
         assert!(root["hooks"].get("PermissionRequest").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn per_run_cleanup_deletes_hcom_only_legacy_file() {
+        let (_dir, workspace, _guard) = copilot_test_env();
+        let hooks_path = workspace.join(".copilot/hooks/hcom.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        let mut root = json!({ "version": 1 });
+        merge_hcom_hooks(&mut root, true);
+        std::fs::write(&hooks_path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Copilot, false);
+        ctx.cwd = workspace;
+        cleanup_legacy_per_run(&ctx).unwrap();
+        assert!(!hooks_path.exists());
     }
 
     #[test]
