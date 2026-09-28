@@ -11,11 +11,12 @@
 //! `launcher::ensure_hooks_installed`.
 //!
 //! Launch order ([`plan`]): prepare/validate the injection → remove hcom's
-//! legacy installs from the effective config dirs (a failure fails the launch,
-//! otherwise hooks would run twice) → sync permission-only files → inject.
+//! legacy installs from the effective config dirs (a failure is a warning naming
+//! the file) → sync permission-only files → inject.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -96,7 +97,8 @@ pub struct PerRunAdapter {
     /// Remove hcom-owned legacy installs (from older hcom versions) in the dirs
     /// that are effective for this launch only. Delete by ownership (content
     /// match / hcom marker), never by filename; leave malformed files alone and
-    /// return an error naming them. Idempotent and cheap when nothing is there.
+    /// return an error naming them. An error is a launch warning, not a
+    /// failure. Idempotent and cheap when nothing is there.
     pub cleanup_legacy: fn(&LaunchCtx) -> Result<()>,
     /// Keep permission-only files in sync with `ctx.auto_approve` (write when
     /// on, remove hcom's entries when off). Called on every launch and when
@@ -169,12 +171,17 @@ pub fn plan(adapter: &PerRunAdapter, ctx: &LaunchCtx) -> Result<RuntimeInjection
     let tool = ctx.tool.as_str();
     let injection = (adapter.prepare)(ctx)
         .with_context(|| format!("Failed to prepare hcom's per-run {tool} integration"))?;
-    (adapter.cleanup_legacy)(ctx).with_context(|| {
-        format!(
-            "Failed to remove a legacy hcom {tool} install; hcom would load twice.\n\
-             Fix or remove it, or run: hcom hooks remove {tool}"
-        )
-    })?;
+    // A leftover hcom hook the tool can still load would run next to the
+    // per-run one, but most failures are files the tool can't load either
+    // (unreadable, malformed), so warn and launch rather than block.
+    if let Err(error) = (adapter.cleanup_legacy)(ctx) {
+        crate::log::log_warn(
+            "launcher",
+            "runtime.legacy_cleanup_failed",
+            &format!("tool={tool} {error:#}"),
+        );
+        eprintln!("{}", legacy_cleanup_warning(ctx.tool.as_str(), &error));
+    }
     if let Some(ensure_permissions) = adapter.ensure_permissions {
         ensure_permissions(ctx)
             .with_context(|| format!("Failed to sync hcom's {tool} permission rules"))?;
@@ -194,6 +201,56 @@ pub fn plan(adapter: &PerRunAdapter, ctx: &LaunchCtx) -> Result<RuntimeInjection
         ),
     );
     Ok(injection)
+}
+
+/// A file from an older hcom install that legacy cleanup could not fix, and
+/// what the user should do to it. Attach with `.context(LegacyFile { .. })`
+/// so the launch warning can name both.
+#[derive(Debug)]
+pub struct LegacyFile {
+    pub path: PathBuf,
+    /// Imperative fix, e.g. "delete it".
+    pub fix: String,
+}
+
+impl std::fmt::Display for LegacyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.path.display())
+    }
+}
+
+/// Fix text for a settings or hooks file that may still hold hcom's entries.
+pub const FIX_REMOVE_HCOM_HOOKS: &str = "remove the hook entries whose command runs hcom";
+/// Fix text for a plugin or metadata file that is entirely hcom's.
+pub const FIX_DELETE: &str = "delete it";
+
+fn legacy_cleanup_warning(tool: &str, error: &anyhow::Error) -> String {
+    let cause = error.root_cause();
+    match error.downcast_ref::<LegacyFile>() {
+        Some(file) => format!(
+            "Warning: could not clean up a file an older hcom left for {tool}: {}\n  \
+             Reason: {cause}\n  \
+             Fix: {}. Until then {tool} may run hcom's hooks twice.",
+            file.path.display(),
+            file.fix,
+        ),
+        None => format!("Warning: could not clean up an older hcom {tool} install: {error:#}"),
+    }
+}
+
+/// Delete `path` if `owned` says it is hcom's plugin.
+pub fn remove_owned_file(
+    path: &Path,
+    owned: impl Fn(&Path) -> std::io::Result<bool>,
+) -> Result<()> {
+    let legacy = || LegacyFile {
+        path: path.to_path_buf(),
+        fix: FIX_DELETE.to_string(),
+    };
+    if owned(path).with_context(legacy)? {
+        std::fs::remove_file(path).with_context(legacy)?;
+    }
+    Ok(())
 }
 
 // ── Ownership ────────────────────────────────────────────────────────────
@@ -256,9 +313,11 @@ pub fn publish_dir(tool: &str, files: &[(&str, &[u8])]) -> std::io::Result<PathB
 /// [`publish_dir`] under an explicit integrations root.
 ///
 /// Content-addressed and write-once: an existing digest dir is reused as-is
-/// (a running agent may be using it). A new one is written to a temp sibling
-/// and renamed into place, so readers never see a partial dir and concurrent
-/// publishers of the same content both succeed.
+/// (a running agent may be using it) and its mtime refreshed. A new one is
+/// written to a temp sibling and renamed into place, so readers never see a
+/// partial dir and concurrent publishers of the same content both succeed.
+/// Publishing a new digest also sweeps the tool's digests unused for
+/// [`ARTIFACT_MAX_IDLE`].
 pub fn publish_dir_at(
     root: &Path,
     tool: &str,
@@ -267,6 +326,7 @@ pub fn publish_dir_at(
     let tool_dir = root.join(tool);
     let target = tool_dir.join(content_digest(files));
     if target.is_dir() {
+        let _ = set_dir_mtime(&target, SystemTime::now());
         return Ok(target);
     }
     std::fs::create_dir_all(&tool_dir)?;
@@ -287,11 +347,62 @@ pub fn publish_dir_at(
         write_private_file(&path, content)?;
     }
     match std::fs::rename(staging.path(), &target) {
-        Ok(()) => Ok(target),
+        Ok(()) => {}
         // Lost the race to another publisher of the same digest.
-        Err(_) if target.is_dir() => Ok(target),
-        Err(error) => Err(error),
+        Err(_) if target.is_dir() => return Ok(target),
+        Err(error) => return Err(error),
     }
+    if let Some(cutoff) = SystemTime::now().checked_sub(ARTIFACT_MAX_IDLE) {
+        sweep_idle_artifacts(&tool_dir, &target, cutoff);
+    }
+    Ok(target)
+}
+
+/// How long a digest dir can go without a launch using it before it is swept.
+/// Resume and fork republish, so only a session that has run this long and
+/// then reloads its plugin from disk could miss a swept dir.
+pub const ARTIFACT_MAX_IDLE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Remove digest and crashed staging dirs in `tool_dir` last used before
+/// `cutoff`, keeping `keep`. Best effort: a failure only leaves the dir.
+fn sweep_idle_artifacts(tool_dir: &Path, keep: &Path, cutoff: SystemTime) {
+    let Ok(entries) = std::fs::read_dir(tool_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_artifact = name.starts_with(".staging-")
+            || (name.len() == 32 && name.bytes().all(|b| b.is_ascii_hexdigit()));
+        if path == keep || !is_artifact {
+            continue;
+        }
+        let idle = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified < cutoff);
+        if idle && let Err(error) = std::fs::remove_dir_all(&path) {
+            crate::log::log_warn(
+                "launcher",
+                "runtime.artifact_sweep_failed",
+                &format!("{}: {error}", path.display()),
+            );
+        }
+    }
+}
+
+fn set_dir_mtime(path: &Path, time: SystemTime) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_WRITE_ATTRIBUTES; FILE_FLAG_BACKUP_SEMANTICS opens a directory.
+        options.access_mode(0x100).custom_flags(0x0200_0000);
+    }
+    options.open(path)?.set_modified(time)
 }
 
 #[cfg(unix)]
@@ -556,6 +667,35 @@ mod tests {
     }
 
     #[test]
+    fn publishing_a_new_digest_sweeps_idle_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let idle = publish_dir_at(root.path(), "pi", &[("hcom.ts", b"v1")]).unwrap();
+        let recent = publish_dir_at(root.path(), "pi", &[("hcom.ts", b"v2")]).unwrap();
+        let crashed = root.path().join("pi/.staging-x");
+        let user = root.path().join("pi/notes");
+        std::fs::create_dir(&crashed).unwrap();
+        std::fs::create_dir(&user).unwrap();
+        let old = SystemTime::now() - ARTIFACT_MAX_IDLE - Duration::from_secs(60);
+        for dir in [&idle, &crashed, &user] {
+            set_dir_mtime(dir, old).unwrap();
+        }
+
+        // Reuse refreshes the mtime instead of sweeping.
+        set_dir_mtime(&recent, old).unwrap();
+        assert_eq!(
+            publish_dir_at(root.path(), "pi", &[("hcom.ts", b"v2")]).unwrap(),
+            recent
+        );
+        assert!(idle.exists());
+
+        publish_dir_at(root.path(), "pi", &[("hcom.ts", b"v3")]).unwrap();
+        assert!(!idle.exists());
+        assert!(!crashed.exists());
+        assert!(recent.exists());
+        assert!(user.exists());
+    }
+
+    #[test]
     fn concurrent_publishers_of_same_content_all_succeed() {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().to_path_buf();
@@ -721,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_failures_stop_before_later_steps() {
+    fn prepare_failure_stops_plan_but_cleanup_failure_does_not() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CLEANUPS: AtomicUsize = AtomicUsize::new(0);
         static PERMISSIONS: AtomicUsize = AtomicUsize::new(0);
@@ -762,10 +902,20 @@ mod tests {
             managed_value_flags: &[],
             strip_legacy_args: None,
         };
-        let err = format!("{:#}", plan(&adapter, &ctx).unwrap_err());
-        assert!(err.contains("hcom hooks remove codex"), "{err}");
-        assert!(err.contains("malformed /x/hooks.json"), "{err}");
-        assert_eq!(PERMISSIONS.load(Ordering::SeqCst), 0);
+        plan(&adapter, &ctx).unwrap();
+        assert_eq!(PERMISSIONS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn legacy_cleanup_warning_names_the_file_and_fix() {
+        let error = anyhow::anyhow!("permission denied").context(LegacyFile {
+            path: PathBuf::from("/x/hooks.json"),
+            fix: FIX_REMOVE_HCOM_HOOKS.to_string(),
+        });
+        let warning = legacy_cleanup_warning("codex", &error.context("outer"));
+        assert!(warning.contains("/x/hooks.json"), "{warning}");
+        assert!(warning.contains("permission denied"), "{warning}");
+        assert!(warning.contains(FIX_REMOVE_HCOM_HOOKS), "{warning}");
     }
 
     #[test]

@@ -84,10 +84,7 @@ fn project_local_legacy_path() -> Option<std::path::PathBuf> {
 
 fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {
     for path in paths {
-        if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("Cannot remove {}", path.display()))?;
-        }
+        runtime::remove_owned_file(&path, is_hcom_owned)?;
     }
     Ok(())
 }

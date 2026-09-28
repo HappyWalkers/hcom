@@ -411,10 +411,7 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
         paths.push(installer_path);
     }
     for path in paths {
-        if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
-            std::fs::remove_file(&path)
-                .with_context(|| format!("Cannot remove {}", path.display()))?;
-        }
+        crate::hooks::runtime::remove_owned_file(&path, is_hcom_owned)?;
     }
     Ok(())
 }

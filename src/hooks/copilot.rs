@@ -320,7 +320,11 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    remove_hooks_at(&copilot_hooks_path_for_ctx(ctx))
+    let path = copilot_hooks_path_for_ctx(ctx);
+    remove_hooks_at(&path).context(runtime::LegacyFile {
+        path,
+        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
+    })
 }
 
 /// Strip hcom's entries from a legacy `hooks/hcom.json`. When that removed

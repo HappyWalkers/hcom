@@ -2775,7 +2775,11 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    remove_hooks_at(&effective_settings_path(ctx))
+    let path = effective_settings_path(ctx);
+    remove_hooks_at(&path).context(runtime::LegacyFile {
+        path,
+        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
+    })
 }
 
 // Static regexes for hot-path hook command detection

@@ -31,7 +31,7 @@ use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
-use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
+use super::runtime::{self, LaunchCtx, LegacyFile, PerRunAdapter, RuntimeInjection};
 use anyhow::{Context as _, Result as AnyResult, bail};
 
 const HCOM_TRIGGER: &str = "<hcom>";
@@ -352,6 +352,24 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     let hooks_path = codex_hooks_path_at(home);
     let config_path = codex_config_path_at(home);
     let metadata_path = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
+    let hooks_file = || LegacyFile {
+        path: hooks_path.clone(),
+        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
+    };
+    let metadata_file = || LegacyFile {
+        path: metadata_path.clone(),
+        fix: runtime::FIX_DELETE.to_string(),
+    };
+    // A config.toml failure stops cleanup before hooks.json is rewritten (user
+    // trust keys must move first), so the fix covers hooks.json too.
+    let config_file = || LegacyFile {
+        path: config_path.clone(),
+        fix: format!(
+            "make it valid, writable TOML, then {} in {}",
+            runtime::FIX_REMOVE_HCOM_HOOKS,
+            hooks_path.display()
+        ),
+    };
 
     let mut hcom_positions = HashSet::new();
     // User handlers after an hcom one shift left when it is removed; their
@@ -360,8 +378,7 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     let mut cleaned_hooks = None;
     match std::fs::read_to_string(&hooks_path) {
         Ok(source) => {
-            let mut hooks: Value = serde_json::from_str(&source)
-                .with_context(|| format!("Malformed {}", hooks_path.display()))?;
+            let mut hooks: Value = serde_json::from_str(&source).with_context(hooks_file)?;
             hcom_positions = handler_positions(&hooks, is_hcom_handler)
                 .into_iter()
                 .collect();
@@ -383,7 +400,7 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("Cannot read {}", hooks_path.display()));
+            return Err(error).with_context(hooks_file);
         }
     }
 
@@ -400,15 +417,13 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("Cannot read {}", metadata_path.display()));
+            return Err(error).with_context(metadata_file);
         }
     }
 
     match std::fs::read_to_string(&config_path) {
         Ok(source) => {
-            let mut config: DocumentMut = source
-                .parse()
-                .with_context(|| format!("Malformed {}", config_path.display()))?;
+            let mut config: DocumentMut = source.parse().with_context(config_file)?;
             let mut changed = false;
             if let Some(state) = config
                 .get_mut("hooks")
@@ -445,12 +460,12 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
             }
             if changed {
                 paths::atomic_write_io(&config_path, &config.to_string())
-                    .with_context(|| format!("Cannot update {}", config_path.display()))?;
+                    .with_context(config_file)?;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(|| format!("Cannot read {}", config_path.display()));
+            return Err(error).with_context(config_file);
         }
     }
 
@@ -461,11 +476,11 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         } else {
             paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&hooks)?)
         }
-        .with_context(|| format!("Cannot update {}", hooks_path.display()))?;
+        .with_context(hooks_file)?;
     }
     match std::fs::remove_file(&metadata_path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).with_context(|| format!("Cannot remove {}", metadata_path.display()))
+            Err(error).with_context(metadata_file)
         }
         _ => Ok(()),
     }

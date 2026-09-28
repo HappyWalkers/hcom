@@ -795,10 +795,7 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     for root in discovery_roots(ctx) {
         for subdir in ["plugin", "plugins"] {
             let path = root.join(subdir).join(PLUGIN_FILENAME);
-            if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("Cannot remove {}", path.display()))?;
-            }
+            runtime::remove_owned_file(&path, is_hcom_owned)?;
         }
     }
     Ok(())

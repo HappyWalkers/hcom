@@ -105,7 +105,8 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
          3. Delete database (hcom.db)\n  \
          4. Remove hooks and legacy installs ({hook_labels})\n  \
          5. Archive and delete config.toml + env\n  \
-         6. Clear device identity (new UUID on next relay)\n\n\
+         6. Clear device identity (new UUID on next relay)\n  \
+         7. Delete per-run hook files (~/.hcom/integrations/)\n\n\
          Add --go flag and run again to proceed:\n  \
          {hcom_cmd} --go reset all\n",
         instance_count = state.instance_count,
