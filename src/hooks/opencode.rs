@@ -1118,10 +1118,9 @@ mod tests {
         assert!(runtime.starts_with("file://"));
         assert!(runtime.contains("/integrations/opencode/"));
         assert!(runtime.ends_with("/hcom.ts"));
-        assert!(
-            std::path::Path::new(runtime.strip_prefix("file://").unwrap_or(runtime))
-                .starts_with(hcom.join("integrations").join("opencode"))
-        );
+        // Decodes the URL, so Windows `file:///C:/…` compares as a native path.
+        assert!(runtime::is_hcom_runtime_path(runtime), "{runtime}");
+        assert!(runtime::integrations_dir().starts_with(&hcom));
     }
 
     #[test]

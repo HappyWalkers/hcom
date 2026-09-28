@@ -1223,6 +1223,23 @@ fn parse_codex_hook_list_entries(value: &Value) -> Result<Vec<CodexHookListEntry
         .collect())
 }
 
+/// `codex` for the preflight. On Windows the npm `codex.cmd` shim runs through
+/// cmd.exe, which would split the `startup|resume|…` matcher at each `|`, so
+/// call the Node entrypoint directly like interactive launches do.
+#[cfg(not(test))]
+fn codex_app_server_command() -> std::process::Command {
+    #[cfg(windows)]
+    if let Some(resolved) = crate::terminal::which_bin("codex")
+        && let Some((node, prefix)) =
+            crate::terminal::resolve_windows_tool_launcher("codex", &resolved)
+    {
+        let mut command = std::process::Command::new(node);
+        command.args(prefix);
+        return command;
+    }
+    crate::terminal::executable_command("codex")
+}
+
 fn fetch_codex_hook_list_with_overrides(
     cwd: &Path,
     codex_home: &Path,
@@ -1243,7 +1260,7 @@ fn fetch_codex_hook_list_with_overrides(
 
     #[cfg(not(test))]
     {
-        let mut child = crate::terminal::executable_command("codex")
+        let mut child = codex_app_server_command()
             .args(overrides)
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
