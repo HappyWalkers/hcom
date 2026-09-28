@@ -2936,6 +2936,10 @@ fn build_all_claude_permission_patterns() -> Vec<String> {
         }
     }
     patterns.extend(claude_actor_permission_patterns());
+    // Older hcom wrote the flag form with a `:*` suffix.
+    for prefix in &["hcom", "uvx hcom"] {
+        patterns.push(format!("Bash({prefix} --new-terminal:*)"));
+    }
     patterns
 }
 
@@ -3066,6 +3070,9 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
             } else {
                 hooks.insert(event.to_string(), Value::Array(updated_matchers));
             }
+        }
+        if hooks.is_empty() {
+            obj.remove("hooks");
         }
     }
 
@@ -3539,7 +3546,10 @@ mod tests {
         super::cleanup_legacy_per_run(&ctx).unwrap();
         let settings: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(settings["hooks"].get("SessionStart").is_none());
+        assert!(
+            settings.get("hooks").is_none(),
+            "emptied hooks object is dropped"
+        );
         assert_eq!(settings["env"]["CALLER"], "yes");
         assert!(settings["env"].get("HCOM").is_none());
     }
@@ -4462,7 +4472,7 @@ mod tests {
     fn test_build_all_claude_permission_patterns() {
         let patterns = build_all_claude_permission_patterns();
         // Both hcom prefixes and shell variants, plus actor-prelude cleanup.
-        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2 * 2 + 3;
+        let expected = (SAFE_HCOM_COMMANDS.len() + LEGACY_HCOM_COMMANDS.len()) * 2 * 2 + 3 + 2;
         assert_eq!(patterns.len(), expected);
         assert!(patterns.iter().any(|p| p.contains("hcom send")));
         assert!(patterns.iter().any(|p| p == "PowerShell(hcom send:*)"));
