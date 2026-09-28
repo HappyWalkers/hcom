@@ -2,7 +2,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 
 use crate::db::{HcomDb, InstanceRow};
@@ -15,6 +17,8 @@ use crate::paths;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
+
 const HCOM_TRIGGER: &str = "<hcom>";
 const HOOK_TIMEOUT_SECS: u64 = 15;
 const CURSOR_HOOK_COMMANDS: &[(&str, &str)] = &[
@@ -25,6 +29,17 @@ const CURSOR_HOOK_COMMANDS: &[(&str, &str)] = &[
     ("stop", "cursor-stop"),
     ("sessionEnd", "cursor-sessionend"),
 ];
+
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: Some(ensure_per_run_permissions),
+    managed_value_flags: &["--plugin-dir"],
+};
+
+const CURSOR_PLUGIN_MANIFEST: &[u8] =
+    br#"{"name":"hcom","version":"1.0.0","description":"hcom per-run hooks"}"#;
+const MIN_CURSOR_HOOKS_DATE: (u32, u32, u32) = (2026, 8, 11);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
@@ -56,14 +71,53 @@ pub enum SetupError {
         #[source]
         source: std::io::Error,
     },
-    #[error("post-write Cursor hook verification failed for {}", .0.display())]
-    PostWriteVerifyFailed(PathBuf),
-    #[error("Cursor permissions setup failed for {}", .0.display())]
-    PermissionsSetupFailed(PathBuf),
 }
 
 fn cursor_config_dir() -> PathBuf {
     crate::runtime_env::tool_config_root().join(".cursor")
+}
+
+fn tool_config_root_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&ctx.env, &ctx.cwd);
+    hcom_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .or_else(|| ctx.var("HOME").map(PathBuf::from))
+        .unwrap_or_default()
+}
+
+fn user_home_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    ctx.var("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default()
+}
+
+fn cursor_hooks_path_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    tool_config_root_for_ctx(ctx)
+        .join(".cursor")
+        .join("hooks.json")
+}
+
+fn cursor_permissions_path_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    let root = tool_config_root_for_ctx(ctx);
+    if root != user_home_for_ctx(ctx) {
+        return root.join(".cursor").join("cli.json");
+    }
+    if let Some(dir) = ctx.var("CURSOR_CONFIG_DIR") {
+        return PathBuf::from(dir).join("cli-config.json");
+    }
+    if cfg!(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )) && let Some(dir) = ctx.var("XDG_CONFIG_HOME")
+    {
+        return PathBuf::from(dir).join("cursor").join("cli-config.json");
+    }
+    root.join(".cursor").join("cli-config.json")
 }
 
 fn default_cursor_config_dir() -> PathBuf {
@@ -215,29 +269,95 @@ fn write_json(path: &Path, value: &Value) -> Result<(), SetupError> {
     })
 }
 
-fn verify_hooks_at(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(root) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
-        return false;
-    };
-    CURSOR_HOOK_COMMANDS.iter().all(|(event, command)| {
-        hooks
-            .get(*event)
-            .and_then(Value::as_array)
-            .is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.get("command").and_then(Value::as_str)
-                        == Some(build_cursor_hook_command(command).as_str())
-                        && entry.get("timeout").and_then(Value::as_u64).is_some()
-                        && (*event != "stop" || entry.get("loop_limit").is_some_and(Value::is_null))
-                })
-            })
+fn runtime_hooks_json() -> Result<Vec<u8>> {
+    let mut root = json!({});
+    merge_hcom_hooks(&mut root);
+    Ok(serde_json::to_vec_pretty(&root)?)
+}
+
+fn parse_cursor_version_date(output: &str) -> Option<(u32, u32, u32)> {
+    output.split_whitespace().find_map(|version| {
+        let mut parts = version.split('-').next()?.split('.');
+        let date = (
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        );
+        parts.next().is_none().then_some(date)
     })
+}
+
+fn ensure_supported_cursor_version(ctx: &LaunchCtx) -> Result<()> {
+    let output = Command::new("cursor-agent")
+        .arg("--version")
+        .env_clear()
+        .envs(&ctx.env)
+        .current_dir(&ctx.cwd)
+        .output()
+        .context("Could not run cursor-agent --version; update cursor-agent")?;
+    if !output.status.success() {
+        bail!("cursor-agent --version failed; update cursor-agent");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version = parse_cursor_version_date(&stdout)
+        .context("Could not determine cursor-agent version; update cursor-agent")?;
+    if version < MIN_CURSOR_HOOKS_DATE {
+        bail!(
+            "cursor-agent {}.{}.{} is too old for per-run hooks; update cursor-agent",
+            version.0,
+            version.1,
+            version.2
+        );
+    }
+    Ok(())
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    ensure_supported_cursor_version(ctx)?;
+    let hooks = runtime_hooks_json()?;
+    let plugin_dir = runtime::publish_dir(
+        "cursor",
+        &[
+            (".cursor-plugin/plugin.json", CURSOR_PLUGIN_MANIFEST),
+            ("hooks/hooks.json", hooks.as_slice()),
+        ],
+    )
+    .context("Cannot publish Cursor runtime plugin")?;
+    let mut args = ctx.args.clone();
+    runtime::insert_before_separator(
+        &mut args,
+        [
+            "--plugin-dir".to_string(),
+            plugin_dir.to_string_lossy().into_owned(),
+        ],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    let path = cursor_hooks_path_for_ctx(ctx);
+    let root = match read_json_object(&path) {
+        Ok(root) => root,
+        Err(error) => return Err(error.into()),
+    };
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut value = Value::Object(root);
+    let before = value.clone();
+    remove_hcom_hooks(&mut value);
+    if value != before {
+        write_json(&path, &value)?;
+    }
+    Ok(())
+}
+
+fn ensure_per_run_permissions(ctx: &LaunchCtx) -> Result<()> {
+    update_cursor_permissions_at(&cursor_permissions_path_for_ctx(ctx), ctx.auto_approve)?;
+    Ok(())
 }
 
 fn cursor_permission_rules() -> Vec<String> {
@@ -318,34 +438,6 @@ fn update_cursor_permissions_at(path: &Path, add: bool) -> Result<(), SetupError
     write_json(path, &Value::Object(root))
 }
 
-fn update_cursor_permissions(add: bool) -> Result<(), SetupError> {
-    update_cursor_permissions_at(&get_cursor_permissions_path(), add)
-}
-
-fn verify_cursor_permissions() -> bool {
-    let Ok(content) = std::fs::read_to_string(get_cursor_permissions_path()) else {
-        return false;
-    };
-    let Ok(root) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    let expected = cursor_permission_rules();
-    let managed = all_cursor_permission_rules();
-    root.pointer("/permissions/allow")
-        .and_then(Value::as_array)
-        .is_some_and(|allow| {
-            expected
-                .iter()
-                .all(|rule| allow.iter().any(|entry| entry.as_str() == Some(rule)))
-                && allow.iter().all(|entry| {
-                    entry.as_str().is_none_or(|entry| {
-                        !managed.iter().any(|rule| rule == entry)
-                            || expected.iter().any(|rule| rule == entry)
-                    })
-                })
-        })
-}
-
 fn remove_cursor_hooks_at(path: &Path) -> bool {
     if !path.exists() {
         return true;
@@ -415,31 +507,6 @@ pub fn remove_cursor_hooks() -> bool {
         .iter()
         .all(|path| update_cursor_permissions_at(path, false).is_ok());
     hooks_ok && permissions_ok
-}
-
-pub fn try_setup_cursor_hooks(include_permissions: bool) -> Result<(), SetupError> {
-    let hooks_path = get_cursor_hooks_path();
-    let mut hooks = Value::Object(read_json_object(&hooks_path)?);
-    merge_hcom_hooks(&mut hooks);
-    write_json(&hooks_path, &hooks)?;
-    if !verify_hooks_at(&hooks_path) {
-        return Err(SetupError::PostWriteVerifyFailed(hooks_path));
-    }
-    if include_permissions {
-        update_cursor_permissions(true)?;
-        if !verify_cursor_permissions() {
-            return Err(SetupError::PermissionsSetupFailed(
-                get_cursor_permissions_path(),
-            ));
-        }
-    } else {
-        update_cursor_permissions(false)?;
-    }
-    Ok(())
-}
-
-pub fn verify_cursor_hooks_installed(check_permissions: bool) -> bool {
-    verify_hooks_at(&get_cursor_hooks_path()) && (!check_permissions || verify_cursor_permissions())
 }
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
@@ -706,38 +773,36 @@ mod tests {
 
     #[test]
     #[serial]
-    fn setup_is_idempotent_and_preserves_existing_hooks() {
+    fn per_run_artifact_has_cursor_plugin_layout() {
         let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hooks_path,
-            serde_json::to_string_pretty(&json!({
-                "version": 1,
-                "hooks": {
-                    "sessionStart": [{ "command": "./custom-start.sh" }]
-                }
-            }))
-            .unwrap(),
+        let hooks = runtime_hooks_json().unwrap();
+        let plugin_dir = runtime::publish_dir(
+            "cursor",
+            &[
+                (".cursor-plugin/plugin.json", CURSOR_PLUGIN_MANIFEST),
+                ("hooks/hooks.json", hooks.as_slice()),
+            ],
         )
         .unwrap();
-
-        try_setup_cursor_hooks(false).unwrap();
-        let first = std::fs::read_to_string(&hooks_path).unwrap();
-        try_setup_cursor_hooks(false).unwrap();
-        let second = std::fs::read_to_string(&hooks_path).unwrap();
-
-        assert_eq!(first, second);
-        assert!(verify_cursor_hooks_installed(false));
-        let root: Value = serde_json::from_str(&second).unwrap();
-        assert!(
-            root["hooks"]["sessionStart"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|hook| hook["command"] == "./custom-start.sh")
+        assert!(plugin_dir.join(".cursor-plugin/plugin.json").is_file());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(plugin_dir.join("hooks/hooks.json")).unwrap())
+                .unwrap();
+        assert!(root["hooks"]["sessionStart"].is_array());
+        assert_eq!(
+            workspace.join(".hcom/integrations"),
+            runtime::integrations_dir()
         );
-        assert!(!workspace.join(".cursor/cli.json").exists());
+    }
+
+    #[test]
+    fn cursor_version_gate_uses_release_date() {
+        assert_eq!(
+            parse_cursor_version_date("2026.09.26-dd393fe"),
+            Some((2026, 9, 26))
+        );
+        assert!(parse_cursor_version_date("2026.08.10").unwrap() < MIN_CURSOR_HOOKS_DATE);
+        assert!(parse_cursor_version_date("2026.08.11").unwrap() >= MIN_CURSOR_HOOKS_DATE);
     }
 
     #[test]
@@ -757,9 +822,8 @@ mod tests {
         )
         .unwrap();
 
-        try_setup_cursor_hooks(true).unwrap();
-        assert!(verify_cursor_hooks_installed(true));
-        try_setup_cursor_hooks(false).unwrap();
+        update_cursor_permissions_at(&permissions_path, true).unwrap();
+        update_cursor_permissions_at(&permissions_path, false).unwrap();
 
         let root: Value =
             serde_json::from_str(&std::fs::read_to_string(permissions_path).unwrap()).unwrap();
@@ -790,7 +854,7 @@ mod tests {
         )
         .unwrap();
 
-        try_setup_cursor_hooks(true).unwrap();
+        update_cursor_permissions_at(&permissions_path, true).unwrap();
 
         let root: Value =
             serde_json::from_str(&std::fs::read_to_string(permissions_path).unwrap()).unwrap();
@@ -826,17 +890,13 @@ mod tests {
         )
         .unwrap();
 
-        try_setup_cursor_hooks(false).unwrap();
+        let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Cursor, false);
+        ctx.cwd = workspace;
+        cleanup_legacy_per_run(&ctx).unwrap();
 
         let root: Value =
             serde_json::from_str(&std::fs::read_to_string(hooks_path).unwrap()).unwrap();
         let stop = root["hooks"]["stop"].as_array().unwrap();
-        assert_eq!(
-            stop.iter()
-                .filter(|hook| hook["command"] == build_cursor_hook_command("cursor-stop"))
-                .count(),
-            1
-        );
         assert!(
             stop.iter()
                 .any(|hook| hook["command"] == "./custom-stop.sh")
@@ -845,7 +905,7 @@ mod tests {
             stop.iter()
                 .filter(|hook| hook["command"].as_str().is_some_and(is_hcom_cursor_command))
                 .count(),
-            1
+            0
         );
     }
 
@@ -928,7 +988,10 @@ mod tests {
         )
         .unwrap();
 
-        try_setup_cursor_hooks(false).unwrap();
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        merge_hcom_hooks(&mut root);
+        write_json(&hooks_path, &root).unwrap();
         assert!(remove_cursor_hooks());
 
         let root: Value =

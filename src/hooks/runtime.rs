@@ -107,12 +107,12 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
     match tool {
         Tool::Claude => Some(&crate::hooks::claude::PER_RUN),
         Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
-        Tool::Copilot
-        | Tool::Pi
+        Tool::Copilot => Some(&crate::hooks::copilot::PER_RUN),
+        Tool::Cursor => Some(&crate::hooks::cursor::PER_RUN),
+        Tool::Pi
         | Tool::Omp
         | Tool::OpenCode
         | Tool::Kilo
-        | Tool::Cursor
         | Tool::Gemini
         | Tool::Kimi
         | Tool::Antigravity

@@ -96,13 +96,9 @@ impl Tool {
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
-            Tool::Cursor => {
-                crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
-            }
+            Tool::Cursor => true,
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
-            Tool::Copilot => {
-                crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions)
-            }
+            Tool::Copilot => true,
             Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
             Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
             Tool::Adhoc => false,
@@ -133,12 +129,10 @@ impl Tool {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
             }
-            Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
+            Tool::Cursor => Ok(()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Copilot => crate::hooks::copilot::try_setup_copilot_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
+            Tool::Copilot => Ok(()),
             Tool::Pi => match crate::hooks::pi::install_pi_plugin() {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(String::new()),

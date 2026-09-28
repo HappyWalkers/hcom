@@ -612,10 +612,7 @@ fn format_plugin_install_error(
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(
-    tool: &LaunchTool,
-    include_permissions: bool,
-) -> Result<()> {
+fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
         LaunchTool::Gemini => {
@@ -731,23 +728,7 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Cursor => {
-            if crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::cursor::try_setup_cursor_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[("hooks_path", crate::hooks::cursor::get_cursor_hooks_path())],
-                );
-                bail!(
-                    "Failed to setup Cursor hooks: {e}\n\
-                     Run: hcom hooks add cursor\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Cursor => unreachable!("Cursor uses per-run hooks"),
         LaunchTool::Kimi => {
             if crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions) {
                 return Ok(());
@@ -765,26 +746,7 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Copilot => {
-            if crate::hooks::copilot::verify_copilot_hooks_installed(include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::copilot::try_setup_copilot_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "hooks_path",
-                        crate::hooks::copilot::get_copilot_hooks_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Copilot hooks: {e}\n\
-                     Run: hcom hooks add copilot\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
     }
 }
 

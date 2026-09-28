@@ -3,6 +3,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use crate::db::{HcomDb, InstanceRow};
@@ -14,6 +15,8 @@ use crate::log;
 use crate::paths;
 use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
+
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 
 const HCOM_TRIGGER: &str = "<hcom>";
 const HOOK_TIMEOUT_SECS: u64 = 15;
@@ -52,6 +55,16 @@ const COPILOT_HOOK_COMMANDS: &[(&str, &str, bool, Option<&str>)] = &[
     ("SessionEnd", "copilot-sessionend", false, None),
 ];
 
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &["--plugin-dir"],
+};
+
+const COPILOT_PLUGIN_MANIFEST: &[u8] =
+    br#"{"name":"hcom","description":"hcom per-run hooks","hooks":"hooks.json"}"#;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
     #[error("existing Copilot hook file at {} could not be read: {source}", path.display())]
@@ -82,8 +95,6 @@ pub enum SetupError {
         #[source]
         source: std::io::Error,
     },
-    #[error("post-write Copilot hook verification failed for {}", .0.display())]
-    PostWriteVerifyFailed(PathBuf),
 }
 
 fn copilot_config_dir() -> PathBuf {
@@ -95,12 +106,55 @@ fn copilot_config_dir() -> PathBuf {
     crate::runtime_env::tool_config_root().join(".copilot")
 }
 
+fn tool_config_root_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&ctx.env, &ctx.cwd);
+    hcom_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .or_else(|| ctx.var("HOME").map(PathBuf::from))
+        .unwrap_or_default()
+}
+
+fn copilot_hooks_path_for_ctx(ctx: &LaunchCtx) -> PathBuf {
+    ctx.var("COPILOT_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| tool_config_root_for_ctx(ctx).join(".copilot"))
+        .join("hooks")
+        .join("hcom.json")
+}
+
 pub fn get_copilot_hooks_path() -> PathBuf {
     copilot_config_dir().join("hooks").join("hcom.json")
 }
 
 pub fn get_copilot_settings_path() -> PathBuf {
     copilot_config_dir().join("settings.json")
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_absolute() && !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn copilot_hooks_cleanup_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = crate::runtime_env::user_home() {
+        push_unique(
+            &mut paths,
+            home.join(".copilot").join("hooks").join("hcom.json"),
+        );
+    }
+    if let Ok(dir) = std::env::var("COPILOT_HOME")
+        && !dir.is_empty()
+    {
+        push_unique(
+            &mut paths,
+            PathBuf::from(dir).join("hooks").join("hcom.json"),
+        );
+    }
+    push_unique(&mut paths, get_copilot_hooks_path());
+    paths
 }
 
 fn build_copilot_hook_command(command: &str) -> String {
@@ -234,61 +288,68 @@ fn remove_hcom_hooks(root: &mut Value) {
     });
 }
 
-fn verify_hooks_at(path: &Path, include_permissions: bool) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(root) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
-        return false;
-    };
-    COPILOT_HOOK_COMMANDS
-        .iter()
-        .filter(|(_, _, permissions_only, _)| include_permissions || !*permissions_only)
-        .all(|(event, command, _, _)| {
-            hooks
-                .get(*event)
-                .and_then(Value::as_array)
-                .is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry.get("command").and_then(Value::as_str)
-                            == Some(build_copilot_hook_command(command).as_str())
-                            && entry.get("timeoutSec").and_then(Value::as_u64).is_some()
-                    })
-                })
-        })
+fn runtime_hooks_json(include_permissions: bool) -> Result<Vec<u8>> {
+    let mut root = json!({});
+    merge_hcom_hooks(&mut root, include_permissions);
+    Ok(serde_json::to_vec_pretty(&root)?)
 }
 
-pub fn remove_copilot_hooks() -> bool {
-    let path = get_copilot_hooks_path();
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let hooks = runtime_hooks_json(ctx.auto_approve)?;
+    let plugin_dir = runtime::publish_dir(
+        "copilot",
+        &[
+            ("plugin.json", COPILOT_PLUGIN_MANIFEST),
+            ("hooks.json", hooks.as_slice()),
+        ],
+    )
+    .context("Cannot publish Copilot runtime plugin")?;
+    let mut args = ctx.args.clone();
+    runtime::insert_before_separator(
+        &mut args,
+        [
+            "--plugin-dir".to_string(),
+            plugin_dir.to_string_lossy().into_owned(),
+        ],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    let path = copilot_hooks_path_for_ctx(ctx);
+    let root = match read_json_object(&path) {
+        Ok(root) => root,
+        Err(error) => return Err(error.into()),
+    };
     if !path.exists() {
-        return true;
+        return Ok(());
     }
-    match read_json_object(&path) {
-        Ok(root) => {
-            let mut value = Value::Object(root);
-            remove_hcom_hooks(&mut value);
-            write_json(&path, &value).is_ok()
-        }
-        Err(_) => false,
-    }
-}
-
-pub fn try_setup_copilot_hooks(include_permissions: bool) -> Result<(), SetupError> {
-    let hooks_path = get_copilot_hooks_path();
-    let mut hooks = Value::Object(read_json_object(&hooks_path)?);
-    merge_hcom_hooks(&mut hooks, include_permissions);
-    write_json(&hooks_path, &hooks)?;
-    if !verify_hooks_at(&hooks_path, include_permissions) {
-        return Err(SetupError::PostWriteVerifyFailed(hooks_path));
+    let mut value = Value::Object(root);
+    let before = value.clone();
+    remove_hcom_hooks(&mut value);
+    if value != before {
+        write_json(&path, &value)?;
     }
     Ok(())
 }
 
-pub fn verify_copilot_hooks_installed(include_permissions: bool) -> bool {
-    verify_hooks_at(&get_copilot_hooks_path(), include_permissions)
+pub fn remove_copilot_hooks() -> bool {
+    copilot_hooks_cleanup_paths().iter().all(|path| {
+        if !path.exists() {
+            return true;
+        }
+        match read_json_object(path) {
+            Ok(root) => {
+                let mut value = Value::Object(root);
+                remove_hcom_hooks(&mut value);
+                write_json(path, &value).is_ok()
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
@@ -631,36 +692,24 @@ mod tests {
 
     #[test]
     #[serial]
-    fn setup_is_idempotent_and_preserves_other_hooks() {
+    fn per_run_plugin_contains_hooks_and_permissions() {
         let (_dir, workspace, _guard) = copilot_test_env();
-        let hooks_path = workspace.join(".copilot/hooks/hcom.json");
-        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hooks_path,
-            serde_json::to_string_pretty(&json!({
-                "version": 1,
-                "hooks": {
-                    "SessionStart": [{ "type": "command", "command": "./custom-start.sh" }]
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        try_setup_copilot_hooks(true).unwrap();
-        let first = std::fs::read_to_string(&hooks_path).unwrap();
-        try_setup_copilot_hooks(true).unwrap();
-        let second = std::fs::read_to_string(&hooks_path).unwrap();
-
-        assert_eq!(first, second);
-        assert!(verify_copilot_hooks_installed(true));
-        let root: Value = serde_json::from_str(&second).unwrap();
+        let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Copilot, true);
+        ctx.cwd = workspace;
+        ctx.args = vec!["--model".into(), "gpt-5".into(), "--".into(), "hi".into()];
+        let injection = prepare_per_run(&ctx).unwrap();
+        let plugin_dir = PathBuf::from(&injection.args[3]);
+        assert_eq!(&injection.args[..3], ["--model", "gpt-5", "--plugin-dir"]);
+        assert_eq!(&injection.args[4..], ["--", "hi"]);
+        assert!(plugin_dir.join("plugin.json").is_file());
+        let root: Value =
+            serde_json::from_slice(&std::fs::read(plugin_dir.join("hooks.json")).unwrap()).unwrap();
         assert!(
             root["hooks"]["SessionStart"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|hook| hook["command"] == "./custom-start.sh")
+                .any(|hook| hook["command"] == build_copilot_hook_command("copilot-sessionstart"))
         );
         assert!(
             root["hooks"]["PermissionRequest"]
@@ -677,6 +726,31 @@ mod tests {
                 .iter()
                 .any(|hook| hook["command"] == build_copilot_hook_command("copilot-erroroccurred"))
         );
+    }
+
+    #[test]
+    #[serial]
+    fn per_run_cleanup_preserves_unrelated_legacy_hooks() {
+        let (_dir, workspace, _guard) = copilot_test_env();
+        let hooks_path = workspace.join(".copilot/hooks/hcom.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+        let mut root = json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [{ "type": "command", "command": "./custom-start.sh" }]
+            }
+        });
+        merge_hcom_hooks(&mut root, true);
+        std::fs::write(&hooks_path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Copilot, false);
+        ctx.cwd = workspace;
+        cleanup_legacy_per_run(&ctx).unwrap();
+        let root: Value = serde_json::from_slice(&std::fs::read(&hooks_path).unwrap()).unwrap();
+        assert_eq!(
+            root["hooks"]["SessionStart"],
+            json!([{ "type": "command", "command": "./custom-start.sh" }])
+        );
+        assert!(root["hooks"].get("PermissionRequest").is_none());
     }
 
     #[test]
