@@ -618,26 +618,7 @@ fn ensure_hooks_installed(
     codex_home: Option<&std::path::Path>,
 ) -> Result<()> {
     match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => {
-            if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
-                return Ok(());
-            }
-            if let Err(e) = crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
-                let diag = install_diag_context(
-                    tool,
-                    &[(
-                        "settings_path",
-                        crate::hooks::claude::get_claude_settings_path(),
-                    )],
-                );
-                bail!(
-                    "Failed to setup Claude hooks: {e}\n\
-                     Run: hcom hooks add claude\n\
-                     {diag}"
-                );
-            }
-            Ok(())
-        }
+        LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
         LaunchTool::Gemini => {
             if !crate::hooks::gemini::is_gemini_version_supported() {
                 if let Some(ver) = crate::hooks::gemini::get_gemini_version() {

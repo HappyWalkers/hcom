@@ -105,8 +105,8 @@ pub struct PerRunAdapter {
 /// The per-run adapter for `tool`, or `None` for tools on the persistent path.
 pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
     match tool {
-        Tool::Claude
-        | Tool::Codex
+        Tool::Claude => Some(&crate::hooks::claude::PER_RUN),
+        Tool::Codex
         | Tool::Copilot
         | Tool::Pi
         | Tool::Omp

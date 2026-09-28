@@ -6,6 +6,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,7 @@ use crate::config::HcomConfig;
 use crate::db::{HcomDb, InstanceRow};
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::hooks::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 use crate::hooks::{DeliveryAck, HookPayload};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
@@ -2679,6 +2681,133 @@ const CLAUDE_HOOK_TYPES: &[&str] = &[
     "SessionEnd",
 ];
 
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &["--settings"],
+};
+
+fn effective_settings_path(ctx: &LaunchCtx) -> PathBuf {
+    ctx.var("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths::get_project_root().join(".claude"))
+        .join("settings.json")
+}
+
+fn caller_settings(value: &str, cwd: &Path) -> Result<Value> {
+    let source = if value.trim_start().starts_with('{') {
+        value.to_string()
+    } else {
+        std::fs::read_to_string(cwd.join(value))
+            .with_context(|| format!("Cannot read caller --settings file {value}"))?
+    };
+    let settings: Value = serde_json::from_str(&source)
+        .with_context(|| format!("Invalid JSON in caller --settings {value}"))?;
+    if !settings.is_object() {
+        bail!("Caller --settings must contain a JSON object: {value}");
+    }
+    Ok(settings)
+}
+
+fn object_field<'a>(
+    settings: &'a mut Value,
+    field: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
+    let obj = settings.as_object_mut().expect("validated settings object");
+    if !obj.contains_key(field) {
+        obj.insert(field.to_string(), serde_json::json!({}));
+    }
+    obj.get_mut(field)
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("Caller --settings field '{field}' must be an object"))
+}
+
+fn merge_per_run_settings(settings: &mut Value, auto_approve: bool) -> Result<()> {
+    let hooks = object_field(settings, "hooks")?;
+    for &(event, matcher, command, timeout) in CLAUDE_HOOK_CONFIGS {
+        let entries = hooks.entry(event).or_insert_with(|| serde_json::json!([]));
+        let entries = entries
+            .as_array_mut()
+            .with_context(|| format!("Caller --settings hooks.{event} must be an array"))?;
+        let mut hook = serde_json::json!({
+            "type": "command",
+            "command": build_hook_entry_command(command),
+        });
+        if let Some(seconds) = timeout {
+            hook["timeout"] = serde_json::json!(seconds);
+        }
+        let mut group = serde_json::json!({"hooks": [hook]});
+        if !matcher.is_empty() {
+            group["matcher"] = Value::String(matcher.to_string());
+        }
+        entries.push(group);
+    }
+    object_field(settings, "env")?.insert(
+        "HCOM".to_string(),
+        Value::String(crate::runtime_env::build_hcom_command()),
+    );
+    if auto_approve {
+        let permissions = object_field(settings, "permissions")?;
+        let allow = permissions
+            .entry("allow")
+            .or_insert_with(|| serde_json::json!([]));
+        let allow = allow
+            .as_array_mut()
+            .context("Caller --settings permissions.allow must be an array")?;
+        for pattern in build_claude_permissions() {
+            if !allow.iter().any(|entry| entry.as_str() == Some(&pattern)) {
+                allow.push(Value::String(pattern));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let mut args = ctx.args.clone();
+    let values = runtime::take_flag_values(&mut args, &["--settings"]);
+    let mut settings = match values.last() {
+        Some(value) => caller_settings(value, &ctx.cwd)?,
+        None => serde_json::json!({}),
+    };
+    merge_per_run_settings(&mut settings, ctx.auto_approve)?;
+    let json = serde_json::to_vec(&settings)?;
+    let path = runtime::publish_file("claude", "settings.json", &json)
+        .context("Cannot publish Claude runtime settings")?;
+    runtime::insert_before_separator(
+        &mut args,
+        [
+            "--settings".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    let path = effective_settings_path(ctx);
+    let source = match std::fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("Cannot read {}", path.display())),
+    };
+    let mut settings: Value = serde_json::from_str(&source)
+        .with_context(|| format!("Cannot parse {}", path.display()))?;
+    if !settings.is_object() {
+        bail!("{} must contain a JSON object", path.display());
+    }
+    if remove_hcom_hooks_from_settings(&mut settings) {
+        let json = serde_json::to_string_pretty(&settings)?;
+        paths::atomic_write_io(&path, &json)
+            .with_context(|| format!("Cannot update {}", path.display()))?;
+    }
+    Ok(())
+}
+
 // Static regexes for hot-path hook command detection
 static RE_HCOM_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
     let pattern = CLAUDE_HOOK_COMMANDS.join("|");
@@ -3333,6 +3462,87 @@ pub fn remove_claude_hooks() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn per_run_settings_merge_preserves_caller_values() {
+        let mut settings = serde_json::json!({
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "caller"}]}]},
+            "env": {"CALLER": "yes"},
+            "permissions": {"allow": ["Bash(caller:*)"]},
+            "custom": 42
+        });
+        super::merge_per_run_settings(&mut settings, true).unwrap();
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            "caller"
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(settings["env"]["CALLER"], "yes");
+        assert!(settings["env"]["HCOM"].is_string());
+        assert_eq!(settings["permissions"]["allow"][0], "Bash(caller:*)");
+        assert_eq!(settings["custom"], 42);
+    }
+
+    #[test]
+    fn per_run_settings_rejects_invalid_caller_shapes() {
+        assert!(super::caller_settings("{invalid", std::path::Path::new(".")).is_err());
+        let mut settings = serde_json::json!({"hooks": {"SessionStart": "bad"}});
+        assert!(super::merge_per_run_settings(&mut settings, false).is_err());
+        let mut settings = serde_json::json!({"permissions": {"allow": "bad"}});
+        assert!(super::merge_per_run_settings(&mut settings, true).is_err());
+    }
+
+    #[test]
+    fn per_run_uses_last_settings_value_before_separator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("caller.json");
+        std::fs::write(&path, r#"{"custom":"from-file"}"#).unwrap();
+        let mut args = vec![
+            "--settings={broken".to_string(),
+            "--settings".to_string(),
+            path.to_string_lossy().into_owned(),
+            "--".to_string(),
+            "--settings=prompt-text".to_string(),
+        ];
+        let values = super::runtime::take_flag_values(&mut args, &["--settings"]);
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            super::caller_settings(values.last().unwrap(), dir.path()).unwrap()["custom"],
+            "from-file"
+        );
+        assert_eq!(args, ["--", "--settings=prompt-text"]);
+    }
+
+    #[test]
+    fn per_run_cleanup_uses_effective_claude_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("claude");
+        std::fs::create_dir(&config).unwrap();
+        let path = config.join("settings.json");
+        std::fs::write(&path, serde_json::json!({
+            "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "hcom sessionstart"}]}]},
+            "env": {"HCOM": "hcom", "CALLER": "yes"}
+        }).to_string()).unwrap();
+        let ctx = super::LaunchCtx {
+            tool: crate::tool::Tool::Claude,
+            env: [(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config.to_string_lossy().into_owned(),
+            )]
+            .into(),
+            cwd: dir.path().to_path_buf(),
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        super::cleanup_legacy_per_run(&ctx).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(settings["hooks"].get("SessionStart").is_none());
+        assert_eq!(settings["env"]["CALLER"], "yes");
+        assert!(settings["env"].get("HCOM").is_none());
+    }
     use super::*;
 
     fn make_test_db() -> (tempfile::TempDir, HcomDb) {
