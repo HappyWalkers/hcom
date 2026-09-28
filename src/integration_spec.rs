@@ -45,8 +45,8 @@ pub struct HooksSpec {
     /// should resolve those names to the owner, not the borrowing tool.
     ///
     /// Antigravity borrows Gemini hook names and is identified out-of-band by
-    /// `ANTIGRAVITY_AGENT`, so `Tool::Antigravity.owns_hook("gemini-*")` must
-    /// stay false even though this spec lists Gemini's hook names.
+    /// `ANTIGRAVITY_AGENT`, so `Tool::from_hook_name("gemini-*")` must resolve
+    /// to Gemini even though this spec lists Gemini's hook names.
     pub shared_hooks_with: Option<Tool>,
     pub invocation: HookInvocation,
 }

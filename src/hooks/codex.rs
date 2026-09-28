@@ -937,7 +937,8 @@ fn get_codex_config_path() -> PathBuf {
 }
 
 /// Get path to Codex hooks.json.
-pub fn get_codex_hooks_path() -> PathBuf {
+#[cfg(test)]
+fn get_codex_hooks_path() -> PathBuf {
     codex_hooks_path_at(&codex_config_dir())
 }
 
@@ -985,7 +986,7 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 /// Codex passes hook source paths through `AbsolutePathBuf::from_absolute_path`
 /// (codex-rs/utils/absolute-path/src/lib.rs:58), which absolutizes lexically but
 /// does not resolve symlinks, so a `sourcePath` from Codex can differ from
-/// hcom's own `get_codex_hooks_path()` by a `.`/`..` component, a verbatim
+/// hcom's own `codex_hooks_path_at()` by a `.`/`..` component, a verbatim
 /// Windows prefix, or by one side having been canonicalized. Compare lexically
 /// first and only then pay for canonicalization.
 fn paths_equivalent(a: &Path, b: &Path) -> bool {

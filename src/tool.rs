@@ -37,16 +37,9 @@ impl Tool {
     }
 
     /// Hook command names listed for this tool. Some tools borrow another
-    /// tool's names; use `owns_hook` for routing ownership.
+    /// tool's names; use `from_hook_name` for routing ownership.
     pub fn hooks(&self) -> &'static [&'static str] {
         self.spec().hooks.names
-    }
-
-    /// True if this tool owns `name` for routing. Borrowed hook names do not
-    /// count as ownership.
-    pub fn owns_hook(&self, name: &str) -> bool {
-        let hooks = &self.spec().hooks;
-        hooks.shared_hooks_with.is_none() && hooks.names.contains(&name)
     }
 
     /// Resolve the tool that owns a hook command name.
@@ -248,8 +241,6 @@ mod tests {
 
     #[test]
     fn antigravity_borrows_gemini_hooks_without_owning_them() {
-        assert!(Tool::Gemini.owns_hook("gemini-beforeagent"));
-        assert!(!Tool::Antigravity.owns_hook("gemini-beforeagent"));
         assert_eq!(
             Tool::from_hook_name("gemini-beforeagent"),
             Some(Tool::Gemini)
@@ -301,7 +292,6 @@ mod tests {
     #[test]
     fn kilo_shares_opencode_hooks() {
         assert_eq!(Tool::Kilo.hooks(), Tool::OpenCode.hooks());
-        assert!(!Tool::Kilo.owns_hook("opencode-start"));
         assert_eq!(Tool::from_hook_name("opencode-start"), Some(Tool::OpenCode));
     }
 }
