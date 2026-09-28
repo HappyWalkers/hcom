@@ -195,7 +195,11 @@ const LIST_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  hook session, no hcom process",
+    ),
+    (
+        "",
+        "[CLAUDE*] / [claude*]                 hcom process, hooks not bound yet / no binding",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
