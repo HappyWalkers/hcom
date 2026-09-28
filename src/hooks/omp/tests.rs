@@ -855,3 +855,16 @@ fn strip_leaves_prompt_text_after_separator() {
         assert_eq!(args, vec!["--", "-e", "/old/extensions/hcom.ts"]);
     });
 }
+
+#[test]
+fn strip_keeps_user_extension_at_pi_plugin_path() {
+    with_isolated_omp_env(|_| {
+        let pi_path = crate::hooks::pi::get_pi_plugin_path();
+        std::fs::create_dir_all(pi_path.parent().unwrap()).unwrap();
+        std::fs::write(&pi_path, "export default () => {} // mine").unwrap();
+        let arg = pi_path.to_string_lossy().into_owned();
+        let mut args = vec!["-e".to_string(), arg.clone()];
+        strip_managed_extension_args(&mut args);
+        assert_eq!(args, vec!["-e".to_string(), arg]);
+    });
+}

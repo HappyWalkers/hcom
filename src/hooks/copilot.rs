@@ -127,7 +127,12 @@ pub fn get_copilot_hooks_path() -> PathBuf {
     copilot_config_dir().join("hooks").join("hcom.json")
 }
 
+/// Relative paths (e.g. a relative `COPILOT_HOME`) resolve against the
+/// current dir, where the tool run from here would resolve them.
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    let path = std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path);
     if path.is_absolute() && !paths.contains(&path) {
         paths.push(path);
     }

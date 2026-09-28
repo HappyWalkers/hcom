@@ -109,13 +109,9 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
 /// hcom twice). A genuine `-e other.ts` user extension always survives.
 pub fn strip_managed_extension_args(args: &mut Vec<String>) {
     let current = get_omp_plugin_path();
-    let pi_current = crate::hooks::pi::get_pi_plugin_path();
     let is_managed = |value: &str| -> bool {
         let path = std::path::Path::new(value);
-        if runtime::is_hcom_runtime_path(value)
-            || path == current.as_path()
-            || path == pi_current.as_path()
-        {
+        if runtime::is_hcom_runtime_path(value) || path == current.as_path() {
             return true;
         }
         if is_hcom_owned(path).unwrap_or(false)
