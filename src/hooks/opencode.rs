@@ -722,7 +722,7 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
     }
 
     for p in paths {
-        if is_hcom_owned(&p) {
+        if is_hcom_owned(&p)? {
             std::fs::remove_file(&p)?;
         }
     }
@@ -735,14 +735,12 @@ pub const PLUGIN_MARKER: &str = "// hcom-managed-plugin";
 /// True when `path` holds an hcom OpenCode/Kilo plugin: the current source, the
 /// marker, or a pre-marker version (every one exports `HcomPlugin` and reads
 /// `HCOM_DIR`). A user's own `hcom.ts` is not matched.
-pub fn is_hcom_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| {
-            content == PLUGIN_SOURCE
-                || content.contains(PLUGIN_MARKER)
-                || (content.contains("HcomPlugin") && content.contains("HCOM_DIR"))
-        })
-        .unwrap_or(false)
+pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
+    crate::hooks::runtime::file_is_hcom_owned(path, |content| {
+        content == PLUGIN_SOURCE
+            || content.contains(PLUGIN_MARKER)
+            || (content.contains("HcomPlugin") && content.contains("HCOM_DIR"))
+    })
 }
 
 pub fn remove_opencode_plugin() -> std::io::Result<()> {
@@ -1134,6 +1132,26 @@ mod tests {
         assert!(user_file.exists(), "user's own hcom.ts must survive");
         assert!(!legacy.exists());
         assert!(!marked.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_plugin_reports_unreadable_plugin_path() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let custom = dir.path().join("custom-opencode");
+        std::fs::create_dir_all(home.join(".hcom")).unwrap();
+        // A directory where the plugin file should be can't be inspected.
+        std::fs::create_dir_all(custom.join("plugins").join("hcom.ts")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::set_var("XDG_CONFIG_HOME", dir.path().join("xdg"));
+            std::env::set_var("OPENCODE_CONFIG_DIR", &custom);
+        }
+        let err = remove_opencode_plugin().unwrap_err();
+        assert!(err.to_string().contains("hcom.ts"), "{err}");
     }
 
     // ── Transcript path ──

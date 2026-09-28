@@ -139,9 +139,11 @@ pub fn ensure_omp_plugin_installed() -> bool {
 
 pub fn remove_omp_plugin() -> std::io::Result<()> {
     let path = get_omp_plugin_path();
-    if (path.exists() || path.is_symlink())
-        && (plugin_matches_source(&path) || is_hcom_owned(&path))
-    {
+    // Unreadable file → error, not a silent "not ours" that leaves it installed.
+    let owned = crate::hooks::runtime::file_is_hcom_owned(&path, |content| {
+        content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
+    })?;
+    if owned {
         std::fs::remove_file(&path)?;
     }
     Ok(())

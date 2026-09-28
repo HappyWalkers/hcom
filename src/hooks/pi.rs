@@ -397,18 +397,16 @@ pub fn ensure_pi_plugin_installed() -> bool {
 
 /// True when `path` holds an hcom Pi plugin: the current source or any earlier
 /// version (all carry the `hcom-bootstrap` message type).
-pub fn is_hcom_owned(path: &std::path::Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|content| {
-            content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
-        })
-        .unwrap_or(false)
+pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
+    crate::hooks::runtime::file_is_hcom_owned(path, |content| {
+        content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
+    })
 }
 
 /// Remove hcom's plugin file. A user file with the same name is left alone.
 pub fn remove_pi_plugin() -> std::io::Result<()> {
     let path = get_pi_plugin_path();
-    if is_hcom_owned(&path) {
+    if is_hcom_owned(&path)? {
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -632,9 +630,11 @@ mod tests {
         std::fs::write(&current, PLUGIN_SOURCE).unwrap();
         std::fs::write(&older, "sendMessage({ customType: \"hcom-bootstrap\" })").unwrap();
         std::fs::write(&user, "export default function mine() {}").unwrap();
-        assert!(is_hcom_owned(&current));
-        assert!(is_hcom_owned(&older));
-        assert!(!is_hcom_owned(&user));
-        assert!(!is_hcom_owned(&dir.path().join("missing.ts")));
+        assert!(is_hcom_owned(&current).unwrap());
+        assert!(is_hcom_owned(&older).unwrap());
+        assert!(!is_hcom_owned(&user).unwrap());
+        assert!(!is_hcom_owned(&dir.path().join("missing.ts")).unwrap());
+        // Something unreadable in the way is an error, not "not ours".
+        assert!(is_hcom_owned(dir.path()).is_err());
     }
 }

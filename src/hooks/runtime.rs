@@ -188,6 +188,32 @@ pub fn plan(adapter: &PerRunAdapter, ctx: &LaunchCtx) -> Result<RuntimeInjection
     Ok(injection)
 }
 
+// ── Ownership ────────────────────────────────────────────────────────────
+
+/// Whether the file at `path` is hcom's, judged by `owned(content)`.
+///
+/// A missing file (or dangling symlink) is `Ok(false)`, and so is non-UTF-8
+/// content (hcom never writes that). Any other read failure (permissions, a
+/// directory in the way, I/O) is an error, so a remover never reports
+/// success while leaving an hcom plugin it couldn't inspect.
+pub fn file_is_hcom_owned(path: &Path, owned: impl Fn(&str) -> bool) -> std::io::Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(owned(&content)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(std::io::Error::new(
+            e.kind(),
+            format!("cannot read {}: {e}", path.display()),
+        )),
+    }
+}
+
 // ── Artifacts ────────────────────────────────────────────────────────────
 
 /// `<HCOM_DIR>/integrations`: root of every published per-run artifact.
