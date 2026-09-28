@@ -83,10 +83,7 @@ fn project_local_legacy_path() -> Option<std::path::PathBuf> {
 }
 
 fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {
-    for path in paths {
-        runtime::remove_owned_file(&path, is_hcom_owned)?;
-    }
-    Ok(())
+    runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {

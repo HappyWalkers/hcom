@@ -320,11 +320,7 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let path = copilot_hooks_path_for_ctx(ctx);
-    remove_hooks_at(&path).context(runtime::LegacyFile {
-        path,
-        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
-    })
+    remove_hooks_at(&copilot_hooks_path_for_ctx(ctx))
 }
 
 /// Strip hcom's entries from a legacy `hooks/hcom.json`. When that removed
@@ -334,7 +330,10 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let mut value = Value::Object(read_json_object(path)?);
+    let fix = runtime::FIX_REMOVE_HCOM_HOOKS;
+    let mut value = Value::Object(
+        read_json_object(path).with_context(|| runtime::LegacyFile::read(path, fix))?,
+    );
     let before = value.clone();
     remove_hcom_hooks(&mut value);
     if value == before {
@@ -348,11 +347,11 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
         })
     });
     if only_hcom {
-        std::fs::remove_file(path).with_context(|| format!("Cannot remove {}", path.display()))?;
+        std::fs::remove_file(path).map_err(anyhow::Error::from)
     } else {
-        write_json(path, &value)?;
+        write_json(path, &value).map_err(anyhow::Error::from)
     }
-    Ok(())
+    .with_context(|| runtime::LegacyFile::write(path, fix))
 }
 
 /// Clean every path the old installer could have used; one failure doesn't

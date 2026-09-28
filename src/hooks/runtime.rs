@@ -175,12 +175,18 @@ pub fn plan(adapter: &PerRunAdapter, ctx: &LaunchCtx) -> Result<RuntimeInjection
     // per-run one, but most failures are files the tool can't load either
     // (unreadable, malformed), so warn and launch rather than block.
     if let Err(error) = (adapter.cleanup_legacy)(ctx) {
-        crate::log::log_warn(
-            "launcher",
-            "runtime.legacy_cleanup_failed",
-            &format!("tool={tool} {error:#}"),
-        );
-        eprintln!("{}", legacy_cleanup_warning(ctx.tool.as_str(), &error));
+        let errors = match error.downcast::<LegacyErrors>() {
+            Ok(LegacyErrors(errors)) => errors,
+            Err(error) => vec![error],
+        };
+        for error in &errors {
+            crate::log::log_warn(
+                "launcher",
+                "runtime.legacy_cleanup_failed",
+                &format!("tool={tool} {error:#}"),
+            );
+            eprintln!("{}", legacy_cleanup_warning(tool, error));
+        }
     }
     if let Some(ensure_permissions) = adapter.ensure_permissions {
         ensure_permissions(ctx)
@@ -204,13 +210,55 @@ pub fn plan(adapter: &PerRunAdapter, ctx: &LaunchCtx) -> Result<RuntimeInjection
 }
 
 /// A file from an older hcom install that legacy cleanup could not fix, and
-/// what the user should do to it. Attach with `.context(LegacyFile { .. })`
-/// so the launch warning can name both.
+/// what the user should do to it. Attach with `.context(LegacyFile::..)` so
+/// the launch warning can name both.
 #[derive(Debug)]
 pub struct LegacyFile {
     pub path: PathBuf,
     /// Imperative fix, e.g. "delete it".
     pub fix: String,
+    /// hcom's legacy hooks may still load: a write or delete failed on a file
+    /// the tool can read. False when the tool can't read or parse it either.
+    pub still_loads: bool,
+}
+
+impl LegacyFile {
+    /// Reading or parsing failed; the tool can't load the file either.
+    pub fn read(path: &Path, fix: impl Into<String>) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            fix: fix.into(),
+            still_loads: false,
+        }
+    }
+
+    /// A write or delete failed, so hcom's hooks in it may still load.
+    pub fn write(path: &Path, fix: impl Into<String>) -> Self {
+        Self {
+            still_loads: true,
+            ..Self::read(path, fix)
+        }
+    }
+}
+
+/// Several independent cleanup failures; [`plan`] warns once per entry.
+#[derive(Debug)]
+pub struct LegacyErrors(pub Vec<anyhow::Error>);
+
+impl std::fmt::Display for LegacyErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let messages: Vec<String> = self.0.iter().map(|e| format!("{e:#}")).collect();
+        write!(f, "{}", messages.join("; "))
+    }
+}
+
+/// `Ok` when empty, the error itself when one, else [`LegacyErrors`].
+pub fn collect_errors(mut errors: Vec<anyhow::Error>) -> Result<()> {
+    match errors.len() {
+        0 => Ok(()),
+        1 => Err(errors.remove(0)),
+        _ => Err(anyhow::Error::msg(LegacyErrors(errors))),
+    }
 }
 
 impl std::fmt::Display for LegacyFile {
@@ -227,28 +275,39 @@ pub const FIX_DELETE: &str = "delete it";
 fn legacy_cleanup_warning(tool: &str, error: &anyhow::Error) -> String {
     let cause = error.root_cause();
     match error.downcast_ref::<LegacyFile>() {
-        Some(file) => format!(
-            "Warning: could not clean up a file an older hcom left for {tool}: {}\n  \
-             Reason: {cause}\n  \
-             Fix: {}. Until then {tool} may run hcom's hooks twice.",
-            file.path.display(),
-            file.fix,
-        ),
+        Some(file) => {
+            let mut warning = format!(
+                "Warning: could not clean up a file an older hcom left for {tool}: {}\n  \
+                 Reason: {cause}\n  \
+                 Fix: {}.",
+                file.path.display(),
+                file.fix,
+            );
+            if file.still_loads {
+                warning.push_str(&format!(" Until then {tool} may run hcom's hooks twice."));
+            }
+            warning
+        }
         None => format!("Warning: could not clean up an older hcom {tool} install: {error:#}"),
     }
 }
 
-/// Delete `path` if `owned` says it is hcom's plugin.
-pub fn remove_owned_file(
-    path: &Path,
+/// Delete each of `paths` that `owned` says is hcom's plugin. Every path is
+/// tried; failures are collected.
+pub fn remove_owned_files(
+    paths: impl IntoIterator<Item = PathBuf>,
     owned: impl Fn(&Path) -> std::io::Result<bool>,
 ) -> Result<()> {
-    let legacy = || LegacyFile {
-        path: path.to_path_buf(),
-        fix: FIX_DELETE.to_string(),
-    };
-    if owned(path).with_context(legacy)? {
-        std::fs::remove_file(path).with_context(legacy)?;
+    let errors = paths
+        .into_iter()
+        .filter_map(|path| remove_owned_file(&path, &owned).err())
+        .collect();
+    collect_errors(errors)
+}
+
+fn remove_owned_file(path: &Path, owned: impl Fn(&Path) -> std::io::Result<bool>) -> Result<()> {
+    if owned(path).with_context(|| LegacyFile::read(path, FIX_DELETE))? {
+        std::fs::remove_file(path).with_context(|| LegacyFile::write(path, FIX_DELETE))?;
     }
     Ok(())
 }
@@ -908,14 +967,46 @@ mod tests {
 
     #[test]
     fn legacy_cleanup_warning_names_the_file_and_fix() {
-        let error = anyhow::anyhow!("permission denied").context(LegacyFile {
-            path: PathBuf::from("/x/hooks.json"),
-            fix: FIX_REMOVE_HCOM_HOOKS.to_string(),
-        });
+        let path = Path::new("/x/hooks.json");
+        let error = anyhow::anyhow!("permission denied")
+            .context(LegacyFile::write(path, FIX_REMOVE_HCOM_HOOKS));
         let warning = legacy_cleanup_warning("codex", &error.context("outer"));
         assert!(warning.contains("/x/hooks.json"), "{warning}");
         assert!(warning.contains("permission denied"), "{warning}");
         assert!(warning.contains(FIX_REMOVE_HCOM_HOOKS), "{warning}");
+        assert!(warning.contains("twice"), "{warning}");
+
+        let error =
+            anyhow::anyhow!("bad JSON").context(LegacyFile::read(path, FIX_REMOVE_HCOM_HOOKS));
+        let warning = legacy_cleanup_warning("codex", &error);
+        assert!(!warning.contains("twice"), "{warning}");
+    }
+
+    #[test]
+    fn owned_file_removal_tries_every_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let [a, b, c] = ["a.ts", "b.ts", "c.ts"].map(|n| dir.path().join(n));
+        for path in [&a, &b, &c] {
+            std::fs::write(path, "hcom").unwrap();
+        }
+        let owned = |path: &Path| -> std::io::Result<bool> {
+            if path.ends_with("c.ts") {
+                return Ok(true);
+            }
+            Err(std::io::Error::other(format!(
+                "cannot read {}",
+                path.display()
+            )))
+        };
+        let error = remove_owned_files([a.clone(), b.clone(), c.clone()], owned).unwrap_err();
+        let LegacyErrors(errors) = error.downcast::<LegacyErrors>().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .all(|e| !e.downcast_ref::<LegacyFile>().unwrap().still_loads)
+        );
+        assert!(!c.exists());
     }
 
     #[test]

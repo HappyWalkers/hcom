@@ -2775,11 +2775,7 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let path = effective_settings_path(ctx);
-    remove_hooks_at(&path).context(runtime::LegacyFile {
-        path,
-        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
-    })
+    remove_hooks_at(&effective_settings_path(ctx))
 }
 
 // Static regexes for hot-path hook command detection
@@ -3082,20 +3078,20 @@ fn remove_hcom_hooks_from_settings(settings: &mut Value) -> bool {
 /// A missing file is fine; an unreadable or malformed one is an error (left
 /// untouched), and the file is only rewritten when something was removed.
 fn remove_hooks_at(path: &Path) -> Result<()> {
+    let unreadable = || runtime::LegacyFile::read(path, runtime::FIX_REMOVE_HCOM_HOOKS);
     let source = match std::fs::read_to_string(path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).with_context(|| format!("Cannot read {}", path.display())),
+        Err(error) => return Err(error).with_context(unreadable),
     };
-    let mut settings: Value = serde_json::from_str(&source)
-        .with_context(|| format!("Cannot parse {}", path.display()))?;
+    let mut settings: Value = serde_json::from_str(&source).with_context(unreadable)?;
     if !settings.is_object() {
-        bail!("{} must contain a JSON object", path.display());
+        return Err(anyhow::anyhow!("must contain a JSON object")).with_context(unreadable);
     }
     if remove_hcom_hooks_from_settings(&mut settings) {
         let json = serde_json::to_string_pretty(&settings)?;
         paths::atomic_write_io(path, &json)
-            .with_context(|| format!("Cannot update {}", path.display()))?;
+            .with_context(|| runtime::LegacyFile::write(path, runtime::FIX_REMOVE_HCOM_HOOKS))?;
     }
     Ok(())
 }

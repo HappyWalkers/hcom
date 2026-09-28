@@ -792,13 +792,10 @@ fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    for root in discovery_roots(ctx) {
-        for subdir in ["plugin", "plugins"] {
-            let path = root.join(subdir).join(PLUGIN_FILENAME);
-            runtime::remove_owned_file(&path, is_hcom_owned)?;
-        }
-    }
-    Ok(())
+    let paths = discovery_roots(ctx)
+        .into_iter()
+        .flat_map(|root| ["plugin", "plugins"].map(|dir| root.join(dir).join(PLUGIN_FILENAME)));
+    runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
 fn current_home_dir() -> std::path::PathBuf {

@@ -352,24 +352,13 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     let hooks_path = codex_hooks_path_at(home);
     let config_path = codex_config_path_at(home);
     let metadata_path = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
-    let hooks_file = || LegacyFile {
-        path: hooks_path.clone(),
-        fix: runtime::FIX_REMOVE_HCOM_HOOKS.to_string(),
-    };
-    let metadata_file = || LegacyFile {
-        path: metadata_path.clone(),
-        fix: runtime::FIX_DELETE.to_string(),
-    };
+    let fix_hooks = runtime::FIX_REMOVE_HCOM_HOOKS;
     // A config.toml failure stops cleanup before hooks.json is rewritten (user
     // trust keys must move first), so the fix covers hooks.json too.
-    let config_file = || LegacyFile {
-        path: config_path.clone(),
-        fix: format!(
-            "make it valid, writable TOML, then {} in {}",
-            runtime::FIX_REMOVE_HCOM_HOOKS,
-            hooks_path.display()
-        ),
-    };
+    let fix_config = format!(
+        "make it valid, writable TOML, then {fix_hooks} in {}",
+        hooks_path.display()
+    );
 
     let mut hcom_positions = HashSet::new();
     // User handlers after an hcom one shift left when it is removed; their
@@ -378,7 +367,8 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     let mut cleaned_hooks = None;
     match std::fs::read_to_string(&hooks_path) {
         Ok(source) => {
-            let mut hooks: Value = serde_json::from_str(&source).with_context(hooks_file)?;
+            let mut hooks: Value = serde_json::from_str(&source)
+                .with_context(|| LegacyFile::read(&hooks_path, fix_hooks))?;
             hcom_positions = handler_positions(&hooks, is_hcom_handler)
                 .into_iter()
                 .collect();
@@ -400,7 +390,7 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(hooks_file);
+            return Err(error).with_context(|| LegacyFile::read(&hooks_path, fix_hooks));
         }
     }
 
@@ -417,13 +407,16 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(metadata_file);
+            return Err(error)
+                .with_context(|| LegacyFile::read(&metadata_path, runtime::FIX_DELETE));
         }
     }
 
     match std::fs::read_to_string(&config_path) {
         Ok(source) => {
-            let mut config: DocumentMut = source.parse().with_context(config_file)?;
+            let mut config: DocumentMut = source
+                .parse()
+                .with_context(|| LegacyFile::read(&config_path, fix_config.clone()))?;
             let mut changed = false;
             if let Some(state) = config
                 .get_mut("hooks")
@@ -460,12 +453,12 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
             }
             if changed {
                 paths::atomic_write_io(&config_path, &config.to_string())
-                    .with_context(config_file)?;
+                    .with_context(|| LegacyFile::write(&config_path, fix_config.clone()))?;
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error).with_context(config_file);
+            return Err(error).with_context(|| LegacyFile::read(&config_path, fix_config.clone()));
         }
     }
 
@@ -476,11 +469,15 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         } else {
             paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&hooks)?)
         }
-        .with_context(hooks_file)?;
+        .with_context(|| LegacyFile::write(&hooks_path, fix_hooks))?;
     }
     match std::fs::remove_file(&metadata_path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(error).with_context(metadata_file)
+            // Trust metadata never loads hooks.
+            Err(error).with_context(|| LegacyFile {
+                still_loads: false,
+                ..LegacyFile::write(&metadata_path, runtime::FIX_DELETE)
+            })
         }
         _ => Ok(()),
     }

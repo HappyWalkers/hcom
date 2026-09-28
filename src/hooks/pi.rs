@@ -410,10 +410,7 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     if !paths.contains(&installer_path) {
         paths.push(installer_path);
     }
-    for path in paths {
-        crate::hooks::runtime::remove_owned_file(&path, is_hcom_owned)?;
-    }
-    Ok(())
+    crate::hooks::runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
 /// True when `path` holds an hcom Pi plugin: the current source or any earlier
