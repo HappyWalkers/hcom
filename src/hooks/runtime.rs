@@ -106,8 +106,8 @@ pub struct PerRunAdapter {
 pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
     match tool {
         Tool::Claude => Some(&crate::hooks::claude::PER_RUN),
-        Tool::Codex
-        | Tool::Copilot
+        Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
+        Tool::Copilot
         | Tool::Pi
         | Tool::Omp
         | Tool::OpenCode

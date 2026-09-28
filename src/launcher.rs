@@ -615,7 +615,6 @@ fn format_plugin_install_error(
 fn ensure_hooks_installed(
     tool: &LaunchTool,
     include_permissions: bool,
-    codex_home: Option<&std::path::Path>,
 ) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => unreachable!("Claude uses per-run hooks"),
@@ -651,41 +650,7 @@ fn ensure_hooks_installed(
             }
             Ok(())
         }
-        LaunchTool::Codex => {
-            let codex_home = codex_home.expect("Codex launch must resolve CODEX_HOME");
-            if crate::hooks::codex::verify_codex_hooks_installed_at(include_permissions, codex_home)
-                && crate::hooks::codex::codex_current_feature_enabled_at(codex_home)
-            {
-                return Ok(());
-            }
-            if let Err(e) =
-                crate::hooks::codex::try_setup_codex_hooks_at(include_permissions, codex_home)
-            {
-                if matches!(e, crate::hooks::codex::SetupError::HookTrustFailed { .. }) {
-                    crate::log::log_warn(
-                        "codex",
-                        "codex.hook_trust_setup_warn",
-                        &format!(
-                            "Codex hook setup could not write trust state; launch preprocessing may fall back to hook-trust bypass: {e}"
-                        ),
-                    );
-                } else {
-                    let diag = install_diag_context(
-                        tool,
-                        &[
-                            ("config_path", codex_home.join("config.toml")),
-                            ("hooks_path", codex_home.join("hooks.json")),
-                        ],
-                    );
-                    bail!(
-                        "Failed to setup Codex hooks: {e}\n\
-                         Run: hcom hooks add codex\n\
-                         {diag}"
-                    );
-                }
-            }
-            Ok(())
-        }
+        LaunchTool::Codex => unreachable!("Codex uses per-run hooks"),
         LaunchTool::OpenCode => {
             match crate::hooks::opencode::ensure_plugin_installed("opencode") {
                 Ok(true) => return Ok(()),
@@ -1894,11 +1859,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             Some(injection)
         }
         None => {
-            ensure_hooks_installed(
-                &normalized,
-                hcom_config.auto_approve,
-                codex_home.as_ref().map(|(path, _)| path.as_path()),
-            )?;
+            ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
             None
         }
     };
@@ -1985,23 +1946,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         params.args = injection.args;
     }
 
-    // Resolved here, before any trust injection, and threaded to
-    // preprocess_codex_args below. Codex's hook-trust bypass is invocation-wide,
-    // so a bypass hcom grants on the strength of a local hook scan must not be
-    // paired with a project layer that hcom itself just marked trusted — that
-    // layer could contribute a hook source the scan never saw.
-    let codex_hook_trust = if matches!(normalized, LaunchTool::Codex) {
-        codex_preprocessing::resolve_codex_hook_trust_at(
-            &params.args,
-            &canonical_dir,
-            codex_home
-                .as_ref()
-                .map(|(path, _)| path.as_path())
-                .expect("Codex launch must resolve CODEX_HOME"),
-        )
-    } else {
-        codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded
-    };
+    // Per-run Codex hooks carry exact trust hashes in the injected hooks.state.
+    // The old invocation-wide bypass must never be added for these launches.
+    let codex_hook_trust = codex_preprocessing::CodexHookTrustOutcome::NoActionNeeded;
 
     inject_workspace_trust_args(
         &normalized,

@@ -30,6 +30,8 @@ use crate::shared::context::HcomContext;
 use crate::shared::{ST_ACTIVE, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
+use anyhow::{Context as _, Result as AnyResult, bail};
 
 const HCOM_TRIGGER: &str = "<hcom>";
 // `fork` is its own SessionStart source since Codex 0.155 (earlier releases
@@ -45,6 +47,370 @@ const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     ("PostToolUse", "codex-posttooluse", Some("Bash")),
     ("Stop", "codex-stop", None),
 ];
+
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: Some(ensure_per_run_permissions),
+    managed_value_flags: &[],
+};
+
+fn per_run_home(ctx: &LaunchCtx) -> PathBuf {
+    ctx.var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".codex"))
+}
+
+fn parse_override(raw: &str) -> AnyResult<(String, toml::Value)> {
+    let (key, value) = raw
+        .split_once('=')
+        .context("Codex -c override must be key=value")?;
+    let key = key.trim();
+    let doc: toml::Value = toml::from_str(&format!("value = {}", value.trim()))
+        .with_context(|| format!("Invalid Codex -c {key} TOML value"))?;
+    Ok((key.to_string(), doc["value"].clone()))
+}
+
+fn override_key_path(key: &str) -> AnyResult<Vec<String>> {
+    let parsed: toml::Value = toml::from_str(&format!("{key} = 0"))
+        .with_context(|| format!("Invalid Codex -c key {key}"))?;
+    let mut path = Vec::new();
+    let mut current = &parsed;
+    while let Some(table) = current.as_table() {
+        if table.len() != 1 {
+            bail!("Invalid Codex -c key {key}");
+        }
+        let (segment, next) = table.iter().next().unwrap();
+        path.push(segment.clone());
+        current = next;
+    }
+    Ok(path)
+}
+
+fn toml_literal(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => serde_json::to_string(s).unwrap(),
+        toml::Value::Integer(n) => n.to_string(),
+        toml::Value::Float(n) => n.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        toml::Value::Datetime(d) => d.to_string(),
+        toml::Value::Array(a) => format!(
+            "[{}]",
+            a.iter().map(toml_literal).collect::<Vec<_>>().join(", ")
+        ),
+        toml::Value::Table(t) => format!(
+            "{{ {} }}",
+            t.iter()
+                .map(|(k, v)| format!(
+                    "{} = {}",
+                    serde_json::to_string(k).unwrap(),
+                    toml_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn set_override_path(root: &mut toml::Value, path: &[&str], value: toml::Value) -> AnyResult<()> {
+    if path.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let Some(table) = root.as_table_mut() else {
+        bail!("Codex -c hooks parent is not a table");
+    };
+    if path.len() == 1 {
+        table.insert(path[0].to_string(), value);
+        return Ok(());
+    }
+    let child = table
+        .entry(path[0].to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    set_override_path(child, &path[1..], value)
+}
+
+fn merged_per_run_hooks(ctx: &LaunchCtx) -> AnyResult<(Vec<String>, toml::Value)> {
+    let mut kept = Vec::new();
+    let mut hooks = toml::Value::Table(Default::default());
+    let end = ctx
+        .args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(ctx.args.len());
+    let mut i = 0;
+    while i < ctx.args.len() {
+        if i >= end {
+            kept.extend_from_slice(&ctx.args[i..]);
+            break;
+        }
+        let (raw, consumed) = if ctx.args[i] == "-c" || ctx.args[i] == "--config" {
+            if i + 1 >= end {
+                bail!("Codex -c is missing its value");
+            }
+            (Some(ctx.args[i + 1].as_str()), 2)
+        } else if let Some(raw) = ctx.args[i]
+            .strip_prefix("-c=")
+            .or_else(|| ctx.args[i].strip_prefix("--config="))
+        {
+            (Some(raw), 1)
+        } else {
+            (None, 1)
+        };
+        if let Some(raw) = raw {
+            let key = raw.split_once('=').map(|(key, _)| key.trim());
+            if key == Some("hooks") || key.is_some_and(|key| key.starts_with("hooks.")) {
+                let (key, value) = parse_override(raw)?;
+                let path = override_key_path(&key)?;
+                if path.first().map(String::as_str) != Some("hooks") {
+                    bail!("Invalid Codex -c hooks key {key}");
+                }
+                set_override_path(
+                    &mut hooks,
+                    &path[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+                    value,
+                )?;
+            } else {
+                kept.extend_from_slice(&ctx.args[i..i + consumed]);
+            }
+        } else {
+            kept.push(ctx.args[i].clone());
+        }
+        i += consumed;
+    }
+    let expected = build_expected_hook_json();
+    let table = hooks
+        .as_table_mut()
+        .context("Codex -c hooks must be a TOML table")?;
+    for (event, group) in expected["hooks"].as_object().unwrap() {
+        let entry = table
+            .entry(event.clone())
+            .or_insert_with(|| toml::Value::Array(Vec::new()));
+        let Some(array) = entry.as_array_mut() else {
+            bail!("Codex -c hooks.{event} must be an array");
+        };
+        let hcom_group: toml::Value =
+            toml::from_str(&format!("value = {}", json_to_toml_literal(group)))?;
+        array.extend(hcom_group["value"].as_array().unwrap().iter().cloned());
+    }
+    Ok((kept, hooks))
+}
+
+fn json_to_toml_literal(value: &Value) -> String {
+    match value {
+        Value::String(s) => serde_json::to_string(s).unwrap(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(a) => format!(
+            "[{}]",
+            a.iter()
+                .map(json_to_toml_literal)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Object(t) => format!(
+            "{{ {} }}",
+            t.iter()
+                .map(|(k, v)| format!(
+                    "{} = {}",
+                    serde_json::to_string(k).unwrap(),
+                    json_to_toml_literal(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Null => "\"\"".to_string(),
+    }
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> AnyResult<RuntimeInjection> {
+    let (mut args, mut hooks) = merged_per_run_hooks(ctx)?;
+    let caller_state = hooks.as_table_mut().unwrap().remove("state");
+    let mut state = match std::fs::read_to_string(codex_config_path_at(&per_run_home(ctx))) {
+        Ok(content) => {
+            let config: toml::Value =
+                toml::from_str(&content).context("Invalid Codex config.toml")?;
+            config
+                .get("hooks")
+                .and_then(|h| h.get("state"))
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .unwrap_or_default()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(error).context("Cannot read Codex config.toml"),
+    };
+    if let Some(caller_state) = caller_state {
+        state.extend(
+            caller_state
+                .as_table()
+                .context("Codex -c hooks.state must be a table")?
+                .clone(),
+        );
+    }
+    let declarations: Vec<String> = hooks
+        .as_table()
+        .unwrap()
+        .iter()
+        .map(|(event, value)| format!("hooks.{event}={}", toml_literal(value)))
+        .collect();
+    let declaration_bytes = serde_json::to_vec(&declarations)?;
+    let version = codex_cli_version_output_for_hook_trust()
+        .map_err(anyhow::Error::msg)
+        .context("Cannot check Codex version for hook trust")?;
+    let cache_key = runtime::content_digest(&[
+        ("version", version.as_bytes()),
+        ("declarations", &declaration_bytes),
+    ]);
+    let cache = runtime::integrations_dir()
+        .join("codex")
+        .join("cache")
+        .join(format!("{cache_key}.json"));
+    let entries: Vec<CodexHookTrustEntry> = if cache.exists() {
+        serde_json::from_slice(&std::fs::read(&cache)?)
+            .with_context(|| format!("Invalid Codex trust cache {}", cache.display()))?
+    } else {
+        let mut preflight = vec!["-c".to_string(), "features.hooks=true".to_string()];
+        for declaration in &declarations {
+            preflight.extend(["-c".to_string(), declaration.clone()]);
+        }
+        let entries =
+            fetch_codex_hook_list_with_overrides(&ctx.cwd, &per_run_home(ctx), &preflight)
+                .map_err(anyhow::Error::msg)
+                .context("Codex hooks/list preflight failed")?;
+        let expected: HashSet<String> = CODEX_HOOK_COMMANDS
+            .iter()
+            .map(|(_, suffix, _)| build_codex_hook_command(suffix))
+            .collect();
+        let owned: Vec<CodexHookTrustEntry> = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.source.as_deref() == Some("sessionFlags")
+                    && entry
+                        .command
+                        .as_ref()
+                        .is_some_and(|command| expected.contains(command))
+            })
+            .map(|entry| {
+                Ok(CodexHookTrustEntry {
+                    key: entry.key.context("Codex hcom session hook lacks key")?,
+                    command: entry.command.unwrap(),
+                    current_hash: entry
+                        .current_hash
+                        .context("Codex hcom session hook lacks currentHash")?,
+                })
+            })
+            .collect::<AnyResult<_>>()?;
+        if owned.len() != CODEX_HOOK_COMMANDS.len() {
+            bail!(
+                "Codex hooks/list found {} of {} hcom session hooks",
+                owned.len(),
+                CODEX_HOOK_COMMANDS.len()
+            );
+        }
+        std::fs::create_dir_all(cache.parent().unwrap())?;
+        paths::atomic_write_io(&cache, &serde_json::to_string(&owned)?)?;
+        owned
+    };
+    for entry in entries {
+        let mut trust = toml::map::Map::new();
+        trust.insert(
+            "trusted_hash".to_string(),
+            toml::Value::String(entry.current_hash),
+        );
+        state.insert(entry.key, toml::Value::Table(trust));
+    }
+    let mut injection = vec!["-c".to_string(), "features.hooks=true".to_string()];
+    for declaration in declarations {
+        injection.extend(["-c".to_string(), declaration]);
+    }
+    injection.extend([
+        "-c".to_string(),
+        format!("hooks.state={}", toml_literal(&toml::Value::Table(state))),
+    ]);
+    runtime::insert_before_separator(&mut args, injection);
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
+}
+
+fn ensure_per_run_permissions(ctx: &LaunchCtx) -> AnyResult<()> {
+    let home = per_run_home(ctx);
+    let ok = if ctx.auto_approve {
+        setup_codex_execpolicy_at(&home)
+    } else {
+        remove_codex_execpolicy_at(&home)
+    };
+    if !ok {
+        bail!(
+            "Cannot sync {}",
+            codex_rules_path_at(&home).join("hcom.rules").display()
+        );
+    }
+    Ok(())
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
+    let home = per_run_home(ctx);
+    cleanup_codex_hooks_in_dir(&home)
+}
+
+fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
+    let hooks_path = codex_hooks_path_at(home);
+    if hooks_path.exists() {
+        let source = std::fs::read_to_string(&hooks_path)
+            .with_context(|| format!("Cannot read {}", hooks_path.display()))?;
+        let mut hooks: Value = serde_json::from_str(&source)
+            .with_context(|| format!("Malformed {}", hooks_path.display()))?;
+        let old = hooks.clone();
+        remove_hcom_hooks_from_json(&mut hooks);
+        remove_legacy_hcom_cmd_hooks_from_json(&mut hooks);
+        if hooks != old {
+            paths::atomic_write_io(&hooks_path, &serde_json::to_string_pretty(&hooks)?)
+                .with_context(|| format!("Cannot update {}", hooks_path.display()))?;
+        }
+    }
+    let config_path = codex_config_path_at(home);
+    if config_path.exists() {
+        let source = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Cannot read {}", config_path.display()))?;
+        let mut config: toml::Value = toml::from_str(&source)
+            .with_context(|| format!("Malformed {}", config_path.display()))?;
+        let old = config.clone();
+        if let Some(hooks) = config.get_mut("hooks").and_then(toml::Value::as_table_mut) {
+            let events: toml::map::Map<String, toml::Value> = hooks
+                .iter()
+                .filter(|(key, _)| CODEX_ALL_HOOK_EVENTS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let mut as_json = serde_json::json!({"hooks": events});
+            remove_hcom_hooks_from_json(&mut as_json);
+            remove_legacy_hcom_cmd_hooks_from_json(&mut as_json);
+            for event in CODEX_ALL_HOOK_EVENTS {
+                hooks.remove(*event);
+            }
+            if let Some(cleaned) = as_json.get("hooks") {
+                let events: toml::map::Map<String, toml::Value> =
+                    serde_json::from_value(cleaned.clone())?;
+                hooks.extend(events);
+            }
+            if let Some(state) = hooks.get_mut("state").and_then(toml::Value::as_table_mut) {
+                state.retain(|key, _| !hook_state_key_belongs_to_hcom_hooks_json(key, &hooks_path));
+            }
+        }
+        if config != old {
+            paths::atomic_write_io(&config_path, &toml::to_string_pretty(&config)?)
+                .with_context(|| format!("Cannot update {}", config_path.display()))?;
+        }
+    }
+    let metadata = home.join(HCOM_HOOK_TRUST_METADATA_FILE);
+    if metadata.exists() {
+        std::fs::remove_file(&metadata)
+            .with_context(|| format!("Cannot remove {}", metadata.display()))?;
+    }
+    Ok(())
+}
 const HCOM_TOOL_NAMES: &[&str] = &[
     "claude",
     "gemini",
@@ -100,7 +466,7 @@ const CODEX_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_APP_SERVER_STDERR_LIMIT: usize = 8192;
 type CodexHookHandler = fn(&HcomDb, &HcomContext, &HookPayload) -> HookResult;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CodexHookTrustEntry {
     key: String,
     command: String,
@@ -1186,9 +1552,17 @@ fn test_hook_list_from_hooks_json(hooks_path: &Path) -> Result<Vec<CodexHookList
 }
 
 fn fetch_codex_hook_list(cwd: &Path, codex_home: &Path) -> Result<Vec<CodexHookListEntry>, String> {
+    fetch_codex_hook_list_with_overrides(cwd, codex_home, &[])
+}
+
+fn fetch_codex_hook_list_with_overrides(
+    cwd: &Path,
+    codex_home: &Path,
+    overrides: &[String],
+) -> Result<Vec<CodexHookListEntry>, String> {
     #[cfg(test)]
     {
-        let _ = cwd;
+        let _ = (cwd, overrides);
         if let Ok(value) = std::env::var("HCOM_TEST_CODEX_HOOKS_LIST_JSON") {
             if value == "__fail__" {
                 return Err("test hook list failure".to_string());
@@ -1202,6 +1576,7 @@ fn fetch_codex_hook_list(cwd: &Path, codex_home: &Path) -> Result<Vec<CodexHookL
     #[cfg(not(test))]
     {
         let mut child = crate::terminal::executable_command("codex")
+            .args(overrides)
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
@@ -2735,6 +3110,7 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
         ok &= std::fs::remove_file(&metadata_path).is_ok();
     }
 
+    ok &= cleanup_codex_hooks_in_dir(base).is_ok();
     ok
 }
 
@@ -2770,6 +3146,123 @@ mod tests {
     use super::*;
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};
     use serial_test::serial;
+
+    fn per_run_ctx(args: &[&str], home: &Path) -> LaunchCtx {
+        LaunchCtx {
+            tool: crate::tool::Tool::Codex,
+            env: HashMap::from([(
+                "CODEX_HOME".to_string(),
+                home.to_string_lossy().into_owned(),
+            )]),
+            cwd: home.to_path_buf(),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            auto_approve: false,
+        }
+    }
+
+    #[test]
+    fn per_run_merges_caller_hooks_in_flag_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = per_run_ctx(
+            &[
+                "-c",
+                "hooks={SessionStart=[{hooks=[{type='command',command='first'}]}]}",
+                "-c",
+                "hooks.SessionStart=[{hooks=[{type='command',command='second'}]}]",
+            ],
+            dir.path(),
+        );
+        let (_, hooks) = merged_per_run_hooks(&first).unwrap();
+        let groups = hooks["SessionStart"].as_array().unwrap();
+        assert_eq!(groups[0]["hooks"][0]["command"].as_str(), Some("second"));
+        assert_eq!(
+            groups[1]["hooks"][0]["command"].as_str(),
+            Some(build_codex_hook_command("codex-sessionstart").as_str())
+        );
+
+        let reversed = per_run_ctx(
+            &[
+                "-c",
+                "hooks.SessionStart=[{hooks=[{type='command',command='first'}]}]",
+                "-c",
+                "hooks={SessionStart=[{hooks=[{type='command',command='second'}]}]}",
+            ],
+            dir.path(),
+        );
+        let (_, hooks) = merged_per_run_hooks(&reversed).unwrap();
+        assert_eq!(
+            hooks["SessionStart"][0]["hooks"][0]["command"].as_str(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn per_run_rejects_malformed_caller_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = per_run_ctx(&["-c", "hooks.SessionStart=[oops"], dir.path());
+        assert!(merged_per_run_hooks(&ctx).is_err());
+    }
+
+    #[test]
+    fn per_run_keeps_other_overrides_and_quoted_state_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = per_run_ctx(
+            &[
+                "-c",
+                "model=gpt-5",
+                "-c",
+                "hooks.state.\"config.toml:stop:0:0\"={trusted_hash='old'}",
+            ],
+            dir.path(),
+        );
+        let (kept, hooks) = merged_per_run_hooks(&ctx).unwrap();
+        assert_eq!(kept, vec!["-c", "model=gpt-5"]);
+        assert_eq!(
+            hooks["state"]["config.toml:stop:0:0"]["trusted_hash"].as_str(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn per_run_cleanup_preserves_foreign_hooks_and_rejects_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(cleanup_codex_hooks_in_dir(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+        let mut hooks = build_expected_hook_json();
+        hooks["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "hooks": [{"type":"command","command":"user-stop"}]
+            }));
+        std::fs::write(&path, serde_json::to_string(&hooks).unwrap()).unwrap();
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let cleaned: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            cleaned["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "user-stop"
+        );
+    }
+
+    #[test]
+    fn per_run_cleanup_keeps_foreign_trust_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let hcom_key = format!("{}:stop:0:0", dir.path().join("hooks.json").display());
+        std::fs::write(&path, format!(
+            "[hooks.state]\n'foreign:stop:0:0' = {{ trusted_hash = 'keep' }}\n'{}' = {{ trusted_hash = 'remove' }}\n",
+            hcom_key
+        )).unwrap();
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        let config: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            config["hooks"]["state"]["foreign:stop:0:0"]["trusted_hash"].as_str(),
+            Some("keep")
+        );
+        assert!(config["hooks"]["state"].get(&hcom_key).is_none());
+    }
 
     #[test]
     fn test_hook_payload_factory_uses_native_fields() {
