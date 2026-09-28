@@ -489,21 +489,31 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
     }
 }
 
+/// hcom wrote `notify` as its command prefix (`hcom`, `uvx hcom`, or an hcom
+/// executable path) followed by a separate `codex-notify` argument, as an
+/// array or one string. Match that shape, not substrings of a user's path.
 fn is_hcom_legacy_notify(item: &Item) -> bool {
-    match item {
-        Item::Value(v) => {
-            if let Some(s) = v.as_str() {
-                return s.contains("hcom") && s.contains("codex-notify");
-            }
-            if let Some(arr) = v.as_array() {
-                let values: Vec<&str> = arr.iter().filter_map(|entry| entry.as_str()).collect();
-                return values.iter().any(|s| s.contains("hcom"))
-                    && values.iter().any(|s| s.contains("codex-notify"));
-            }
-            false
-        }
-        _ => false,
-    }
+    let Some(value) = item.as_value() else {
+        return false;
+    };
+    let tokens: Vec<&str> = if let Some(s) = value.as_str() {
+        s.split_whitespace().collect()
+    } else if let Some(arr) = value.as_array() {
+        arr.iter().filter_map(|entry| entry.as_str()).collect()
+    } else {
+        return false;
+    };
+    let Some(notify_at) = tokens.iter().position(|t| *t == "codex-notify") else {
+        return false;
+    };
+    tokens[..notify_at].iter().any(|token| {
+        let name = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        let stem = name
+            .strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".py"))
+            .unwrap_or(name);
+        stem.eq_ignore_ascii_case("hcom")
+    })
 }
 
 /// `(event_label, group, handler)`: a handler's place in hooks.json, in the
@@ -1640,6 +1650,13 @@ mod tests {
             ),
             ("notify = \"some-other-notify-tool\"\n", false),
             ("notify = \"other-tool codex-notify\"\n", false),
+            ("notify = [\"uvx\", \"hcom\", \"codex-notify\"]\n", true),
+            ("notify = [\"C:/dev/hcom.exe\", \"codex-notify\"]\n", true),
+            (
+                "notify = [\"/home/alice/hcom-tools/codex-notify.sh\"]\n",
+                false,
+            ),
+            ("notify = [\"my-hcom-wrapper\", \"codex-notify\"]\n", false),
         ] {
             std::fs::write(&config_path, format!("model = 'gpt-5'\n{notify}")).unwrap();
             cleanup_codex_hooks_in_dir(dir.path()).unwrap();
