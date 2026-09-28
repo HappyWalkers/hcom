@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::bootstrap;
@@ -15,6 +16,7 @@ use crate::shared::context::HcomContext;
 
 use super::common;
 use super::common::finalize_session;
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
     argv.iter()
@@ -341,6 +343,13 @@ pub fn dispatch_pi_hook(hook_name: &str, argv: &[String]) -> (i32, String) {
 pub const PLUGIN_SOURCE: &str = include_str!("../pi_plugin/hcom.ts");
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
+pub static PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &["-e", "--extension"],
+};
+
 fn current_home_dir() -> std::path::PathBuf {
     std::env::var("HOME")
         .map(std::path::PathBuf::from)
@@ -366,33 +375,50 @@ pub fn get_pi_plugin_path() -> std::path::PathBuf {
     pi_plugin_dir().join(PLUGIN_FILENAME)
 }
 
-fn plugin_matches_source(path: &std::path::Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content == PLUGIN_SOURCE,
-        Err(_) => false,
+fn resolve_ctx_path(ctx: &LaunchCtx, value: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        ctx.cwd.join(path)
     }
 }
 
-pub fn verify_pi_plugin_installed() -> bool {
-    plugin_matches_source(&get_pi_plugin_path())
+fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
+    let agent_dir = ctx
+        .var("PI_CODING_AGENT_DIR")
+        .map(|value| resolve_ctx_path(ctx, value))
+        .unwrap_or_else(|| {
+            ctx.var("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(dirs::home_dir)
+                .unwrap_or_default()
+                .join(".pi")
+                .join("agent")
+        });
+    agent_dir.join("extensions").join(PLUGIN_FILENAME)
 }
 
-pub fn install_pi_plugin() -> std::io::Result<bool> {
-    let target_dir = pi_plugin_dir();
-    let target = target_dir.join(PLUGIN_FILENAME);
-    std::fs::create_dir_all(&target_dir)?;
-    if target.is_symlink() || target.exists() {
-        std::fs::remove_file(&target)?;
-    }
-    std::fs::write(&target, PLUGIN_SOURCE)?;
-    Ok(true)
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let path = runtime::publish_file("pi", PLUGIN_FILENAME, PLUGIN_SOURCE.as_bytes())
+        .context("Cannot publish Pi runtime extension")?;
+    let mut args = ctx.args.clone();
+    runtime::insert_before_separator(
+        &mut args,
+        ["-e".to_string(), path.to_string_lossy().into_owned()],
+    );
+    Ok(RuntimeInjection {
+        args,
+        env: Vec::new(),
+    })
 }
 
-pub fn ensure_pi_plugin_installed() -> bool {
-    if verify_pi_plugin_installed() {
-        return true;
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    let path = effective_plugin_path(ctx);
+    if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
+        std::fs::remove_file(&path).with_context(|| format!("Cannot remove {}", path.display()))?;
     }
-    install_pi_plugin().unwrap_or(false)
+    Ok(())
 }
 
 /// True when `path` holds an hcom Pi plugin: the current source or any earlier
@@ -636,5 +662,58 @@ mod tests {
         assert!(!is_hcom_owned(&dir.path().join("missing.ts")).unwrap());
         // Something unreadable in the way is an error, not "not ours".
         assert!(is_hcom_owned(dir.path()).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn per_run_injection_uses_runtime_extension_before_separator() {
+        let (_dir, hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::Pi,
+            env: [("HOME".to_string(), home.to_string_lossy().into_owned())]
+                .into_iter()
+                .collect(),
+            cwd: home,
+            args: vec!["--model".into(), "x".into(), "--".into(), "prompt".into()],
+            auto_approve: false,
+        };
+        let injection = (PER_RUN.prepare)(&ctx).unwrap();
+        assert_eq!(&injection.args[..2], &["--model", "x"]);
+        assert_eq!(injection.args[2], "-e");
+        let path = std::path::Path::new(&injection.args[3]);
+        assert!(path.starts_with(hcom.join("integrations").join("pi")));
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("hcom.ts"));
+        assert_eq!(&injection.args[4..], &["--", "prompt"]);
+    }
+
+    #[test]
+    fn per_run_cleanup_uses_launch_env_and_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let cwd = dir.path().join("work");
+        let plugin = cwd
+            .join("relative-agent")
+            .join("extensions")
+            .join("hcom.ts");
+        std::fs::create_dir_all(plugin.parent().unwrap()).unwrap();
+        std::fs::write(&plugin, PLUGIN_SOURCE).unwrap();
+
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::Pi,
+            env: [
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                (
+                    "PI_CODING_AGENT_DIR".to_string(),
+                    "relative-agent".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cwd,
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        (PER_RUN.cleanup_legacy)(&ctx).unwrap();
+        assert!(!plugin.exists());
     }
 }

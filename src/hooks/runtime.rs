@@ -109,14 +109,11 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
         Tool::Copilot => Some(&crate::hooks::copilot::PER_RUN),
         Tool::Cursor => Some(&crate::hooks::cursor::PER_RUN),
-        Tool::Pi
-        | Tool::Omp
-        | Tool::OpenCode
-        | Tool::Kilo
-        | Tool::Gemini
-        | Tool::Kimi
-        | Tool::Antigravity
-        | Tool::Adhoc => None,
+        Tool::Pi => Some(&crate::hooks::pi::PER_RUN),
+        Tool::Omp => Some(&crate::hooks::omp::PER_RUN),
+        Tool::OpenCode => Some(&crate::hooks::opencode::OPENCODE_PER_RUN),
+        Tool::Kilo => Some(&crate::hooks::opencode::KILO_PER_RUN),
+        Tool::Gemini | Tool::Kimi | Tool::Antigravity | Tool::Adhoc => None,
     }
 }
 

@@ -15,11 +15,10 @@
 //! startup, so they run as a plain unlaunched session.
 //!
 //! Supported: any cross-tool child, and same-tool Codex and Gemini children.
-//! Other same-tool children (OpenCode, Kilo, Pi, Omp, Kimi, Cursor, Antigravity,
-//! Copilot) are NOT detected; their hooks still act as the parent. Left to the
-//! per-run hook isolation refactor rather than further marker guesses or
-//! process-ancestry checks. Same-tool Claude children were already safe: Claude
-//! hooks bind by session.
+//! Pi, Omp, OpenCode, and Kilo use per-run hooks, so plain same-tool children do
+//! not load hcom. Kimi and Antigravity still lack same-tool detection. Same-tool
+//! Claude children were already safe because Claude hooks bind by session;
+//! Cursor and Copilot use per-run integrations too.
 
 use std::collections::HashMap;
 

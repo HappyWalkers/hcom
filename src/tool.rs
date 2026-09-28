@@ -91,16 +91,14 @@ impl Tool {
                 crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
                     && crate::hooks::codex::codex_current_feature_enabled()
             }
-            Tool::OpenCode => crate::hooks::opencode::verify_opencode_plugin_installed(),
-            Tool::Kilo => crate::hooks::opencode::verify_kilo_plugin_installed(),
+            Tool::OpenCode | Tool::Kilo => true,
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
             Tool::Cursor => true,
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
             Tool::Copilot => true,
-            Tool::Pi => crate::hooks::pi::verify_pi_plugin_installed(),
-            Tool::Omp => crate::hooks::omp::verify_omp_plugin_installed(),
+            Tool::Pi | Tool::Omp => true,
             Tool::Adhoc => false,
         }
     }
@@ -115,16 +113,7 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Codex => crate::hooks::codex::try_setup_codex_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::OpenCode => match crate::hooks::opencode::install_opencode_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
-            Tool::Kilo => match crate::hooks::opencode::install_kilo_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
+            Tool::OpenCode | Tool::Kilo => Ok(()),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -133,16 +122,7 @@ impl Tool {
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Copilot => Ok(()),
-            Tool::Pi => match crate::hooks::pi::install_pi_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
-            Tool::Omp => match crate::hooks::omp::install_omp_plugin() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(String::new()),
-                Err(e) => Err(e.to_string()),
-            },
+            Tool::Pi | Tool::Omp => Ok(()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }

@@ -2,6 +2,7 @@
 
 use std::time::Instant;
 
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::bootstrap;
@@ -15,6 +16,7 @@ use crate::shared::context::HcomContext;
 
 use super::common;
 use super::common::finalize_session;
+use super::runtime::{self, LaunchCtx, PerRunAdapter, RuntimeInjection};
 
 /// Extract `--flag value` from argv. Returns None if not found.
 fn parse_flag(argv: &[String], flag: &str) -> Option<String> {
@@ -551,6 +553,266 @@ pub const PLUGIN_SOURCE: &str = include_str!("../opencode_plugin/hcom.ts");
 
 const PLUGIN_FILENAME: &str = "hcom.ts";
 
+pub static OPENCODE_PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &[],
+};
+
+pub static KILO_PER_RUN: PerRunAdapter = PerRunAdapter {
+    prepare: prepare_per_run,
+    cleanup_legacy: cleanup_legacy_per_run,
+    ensure_permissions: None,
+    managed_value_flags: &[],
+};
+
+fn family_runtime(ctx: &LaunchCtx) -> (&'static str, &'static str) {
+    match ctx.tool {
+        crate::tool::Tool::OpenCode => ("opencode", "OPENCODE_CONFIG_CONTENT"),
+        crate::tool::Tool::Kilo => ("kilo", "KILO_CONFIG_CONTENT"),
+        _ => unreachable!("OpenCode runtime adapter used for {}", ctx.tool.as_str()),
+    }
+}
+
+fn jsonc_to_json(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut stripped = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_string {
+            stripped.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            stripped.push(byte);
+            i += 1;
+            continue;
+        }
+        if byte == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                stripped.push(b'\n');
+                i += 1;
+            }
+            continue;
+        }
+        if byte == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut closed = false;
+            while i + 1 < bytes.len() {
+                if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    i += 2;
+                    closed = true;
+                    break;
+                }
+                if bytes[i] == b'\n' {
+                    stripped.push(b'\n');
+                }
+                i += 1;
+            }
+            if !closed {
+                bail!("unterminated block comment");
+            }
+            continue;
+        }
+        stripped.push(byte);
+        i += 1;
+    }
+
+    let mut out = Vec::with_capacity(stripped.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < stripped.len() {
+        let byte = stripped[i];
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            out.push(byte);
+            i += 1;
+            continue;
+        }
+        if byte == b',' {
+            let mut next = i + 1;
+            while next < stripped.len() && stripped[next].is_ascii_whitespace() {
+                next += 1;
+            }
+            if next < stripped.len() && matches!(stripped[next], b'}' | b']') {
+                i += 1;
+                continue;
+            }
+        }
+        out.push(byte);
+        i += 1;
+    }
+    String::from_utf8(out).context("JSONC input was not valid UTF-8")
+}
+
+fn parse_caller_config(ctx: &LaunchCtx, env_var: &str) -> Result<Value> {
+    let Some(raw) = ctx.var(env_var) else {
+        return Ok(serde_json::json!({}));
+    };
+    let parsed = jsonc_to_json(raw)
+        .and_then(|json| serde_json::from_str::<Value>(&json).context("invalid JSON/JSONC"));
+    let mut value = match parsed {
+        Ok(value) => value,
+        Err(error) if ctx.tool == crate::tool::Tool::Kilo => {
+            let message = format!("Ignoring invalid KILO_CONFIG_CONTENT: {error:#}");
+            crate::log::log_warn("launcher", "kilo.config_content_invalid", &message);
+            eprintln!("Warning: {message}");
+            serde_json::json!({})
+        }
+        Err(error) => return Err(error).with_context(|| format!("Invalid {env_var}")),
+    };
+    if !value.is_object() {
+        if ctx.tool == crate::tool::Tool::Kilo {
+            let message = "Ignoring invalid KILO_CONFIG_CONTENT: root must be an object";
+            crate::log::log_warn("launcher", "kilo.config_content_invalid", message);
+            eprintln!("Warning: {message}");
+            value = serde_json::json!({});
+        } else {
+            bail!("{env_var} must contain a JSON object");
+        }
+    }
+    Ok(value)
+}
+
+fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
+    let (app, env_var) = family_runtime(ctx);
+    let path = runtime::publish_file(app, PLUGIN_FILENAME, PLUGIN_SOURCE.as_bytes())
+        .with_context(|| format!("Cannot publish {app} runtime plugin"))?;
+    let plugin_url = runtime::file_url(&path);
+    let mut config = parse_caller_config(ctx, env_var)?;
+    let object = config
+        .as_object_mut()
+        .expect("caller config object validated");
+    let plugins = object
+        .entry("plugin")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .with_context(|| format!("{env_var}.plugin must be an array"))?;
+    if !plugins
+        .iter()
+        .any(|value| value.as_str() == Some(&plugin_url))
+    {
+        plugins.push(Value::String(plugin_url));
+    }
+    Ok(RuntimeInjection {
+        args: ctx.args.clone(),
+        env: vec![(env_var.to_string(), serde_json::to_string(&config)?)],
+    })
+}
+
+fn resolve_ctx_path(ctx: &LaunchCtx, value: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        ctx.cwd.join(path)
+    }
+}
+
+fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
+    let (app, config_dir_env, disable_project_env, project_names): (&str, &str, &str, &[&str]) =
+        match ctx.tool {
+            crate::tool::Tool::OpenCode => (
+                "opencode",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_DISABLE_PROJECT_CONFIG",
+                &[".opencode"],
+            ),
+            crate::tool::Tool::Kilo => (
+                "kilo",
+                "KILO_CONFIG_DIR",
+                "KILO_DISABLE_PROJECT_CONFIG",
+                &[".kilocode", ".kilo"],
+            ),
+            _ => unreachable!("OpenCode discovery used for {}", ctx.tool.as_str()),
+        };
+    let home = ctx
+        .var("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let config_home = ctx
+        .var("XDG_CONFIG_HOME")
+        .map(|value| resolve_ctx_path(ctx, value))
+        .unwrap_or_else(|| home.join(".config"));
+
+    let mut roots = vec![config_home.join(app)];
+    if let Some(custom) = ctx.var(config_dir_env) {
+        roots.push(resolve_ctx_path(ctx, custom));
+    }
+
+    for name in project_names {
+        roots.push(home.join(name));
+    }
+
+    let project_disabled = matches!(
+        ctx.var(disable_project_env)
+            .map(|value| value.to_ascii_lowercase()),
+        Some(value) if value == "true" || value == "1"
+    );
+    if !project_disabled {
+        for ancestor in ctx.cwd.ancestors() {
+            for name in project_names {
+                roots.push(ancestor.join(name));
+            }
+            if ancestor.join(".git").exists() {
+                break;
+            }
+        }
+    }
+
+    let mut deduped = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !deduped.contains(&root) {
+            deduped.push(root);
+        }
+    }
+    deduped
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    for root in discovery_roots(ctx) {
+        for subdir in ["plugin", "plugins"] {
+            let path = root.join(subdir).join(PLUGIN_FILENAME);
+            if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("Cannot remove {}", path.display()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn current_home_dir() -> std::path::PathBuf {
     crate::runtime_env::user_home().unwrap_or_default()
 }
@@ -592,90 +854,6 @@ pub fn get_opencode_plugin_path() -> std::path::PathBuf {
 
 pub fn get_kilo_plugin_path() -> std::path::PathBuf {
     plugin_dir_for_app("kilo").join(PLUGIN_FILENAME)
-}
-
-/// Scan all directories where hcom.ts plugin might exist.
-///
-/// Checks both plugin/ and plugins/ under the XDG global location and the
-/// project-local tool_config_root() location when applicable.
-fn scan_plugin_dirs(app: &str) -> Vec<std::path::PathBuf> {
-    let mut candidates = Vec::new();
-    let xdg_base = std::path::PathBuf::from(xdg_config_home()).join(app);
-    candidates.push(xdg_base.join("plugin"));
-    candidates.push(xdg_base.join("plugins"));
-
-    let config_dir_env = if app == "kilo" {
-        "KILO_CONFIG_DIR"
-    } else {
-        "OPENCODE_CONFIG_DIR"
-    };
-    if let Ok(custom_dir) = std::env::var(config_dir_env) {
-        let custom_base = std::path::PathBuf::from(custom_dir);
-        candidates.push(custom_base.join("plugin"));
-        candidates.push(custom_base.join("plugins"));
-    }
-
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root != home {
-        let tool_base = tool_root.join(format!(".{app}"));
-        candidates.push(tool_base.join("plugin"));
-        candidates.push(tool_base.join("plugins"));
-    }
-
-    let mut deduped = Vec::new();
-    for dir in candidates.into_iter().filter(|d| d.exists()) {
-        if !deduped.contains(&dir) {
-            deduped.push(dir);
-        }
-    }
-    deduped
-}
-
-/// Check if hcom.ts plugin is installed in any plugin directory for an app.
-fn verify_plugin_installed(app: &str) -> bool {
-    if plugin_matches_source(&plugin_dir_for_app(app).join(PLUGIN_FILENAME)) {
-        return true;
-    }
-    scan_plugin_dirs(app)
-        .iter()
-        .map(|d| d.join(PLUGIN_FILENAME))
-        .any(|path| plugin_matches_source(&path))
-}
-
-pub fn verify_opencode_plugin_installed() -> bool {
-    verify_plugin_installed("opencode")
-}
-
-pub fn verify_kilo_plugin_installed() -> bool {
-    verify_plugin_installed("kilo")
-}
-
-/// Install the hcom.ts plugin to the canonical plugin directory.
-///
-/// Creates the canonical app plugin dir if needed.
-/// Writes the embedded plugin source directly (no file copy needed).
-fn install_plugin(app: &str) -> std::io::Result<bool> {
-    let target_dir = plugin_dir_for_app(app);
-    let target = target_dir.join(PLUGIN_FILENAME);
-
-    std::fs::create_dir_all(&target_dir)?;
-
-    // Remove stale symlinks before writing
-    if target.is_symlink() || target.exists() {
-        std::fs::remove_file(&target)?;
-    }
-
-    std::fs::write(&target, PLUGIN_SOURCE)?;
-    Ok(true)
-}
-
-pub fn install_opencode_plugin() -> std::io::Result<bool> {
-    install_plugin("opencode")
-}
-
-pub fn install_kilo_plugin() -> std::io::Result<bool> {
-    install_plugin("kilo")
 }
 
 /// Remove hcom.ts from ALL plugin directories for an app.
@@ -749,23 +927,6 @@ pub fn remove_opencode_plugin() -> std::io::Result<()> {
 
 pub fn remove_kilo_plugin() -> std::io::Result<()> {
     remove_plugin("kilo")
-}
-
-fn plugin_matches_source(path: &std::path::Path) -> bool {
-    match std::fs::read_to_string(path) {
-        Ok(content) => content == PLUGIN_SOURCE,
-        Err(_) => false,
-    }
-}
-
-/// Ensure the hcom.ts plugin is installed and up to date.
-///
-/// Used by the launcher for auto-install on first launch.
-pub fn ensure_plugin_installed(app: &str) -> std::io::Result<bool> {
-    if verify_plugin_installed(app) {
-        return Ok(true);
-    }
-    install_plugin(app)
 }
 
 #[cfg(test)]
@@ -924,6 +1085,125 @@ mod tests {
     #[test]
     fn test_plugin_source_contains_entrypoint() {
         assert!(PLUGIN_SOURCE.contains("HcomPlugin"));
+        assert!(PLUGIN_SOURCE.contains("HCOM_PLUGIN_HOST_PID"));
+        assert!(PLUGIN_SOURCE.contains("if (!claimPluginHost()) return {}"));
+        assert!(PLUGIN_SOURCE.contains("if (!claimPluginHost()) return async () => {}"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_per_run_config_merges_jsonc_plugins_in_order() {
+        let (_dir, hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::OpenCode,
+            env: [
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                (
+                    "OPENCODE_CONFIG_CONTENT".to_string(),
+                    r#"{
+                      // caller plugin order must survive
+                      "plugin": ["first", "second",],
+                      "theme": "dark",
+                    }"#
+                    .to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cwd: home,
+            args: vec!["--session".into(), "abc".into()],
+            auto_approve: false,
+        };
+        let injection = (OPENCODE_PER_RUN.prepare)(&ctx).unwrap();
+        assert_eq!(injection.args, ctx.args);
+        let (_, raw) = injection
+            .env
+            .iter()
+            .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(config["theme"], "dark");
+        let plugins = config["plugin"].as_array().unwrap();
+        assert_eq!(plugins[0], "first");
+        assert_eq!(plugins[1], "second");
+        let runtime = plugins[2].as_str().unwrap();
+        assert!(runtime.starts_with("file://"));
+        assert!(runtime.contains("/integrations/opencode/"));
+        assert!(runtime.ends_with("/hcom.ts"));
+        assert!(
+            std::path::Path::new(runtime.strip_prefix("file://").unwrap_or(runtime))
+                .starts_with(hcom.join("integrations").join("opencode"))
+        );
+    }
+
+    #[test]
+    fn test_per_run_opencode_rejects_invalid_config_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::OpenCode,
+            env: [(
+                "OPENCODE_CONFIG_CONTENT".to_string(),
+                "{ broken".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            cwd: dir.path().to_path_buf(),
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        let err = parse_caller_config(&ctx, "OPENCODE_CONFIG_CONTENT").unwrap_err();
+        assert!(err.to_string().contains("OPENCODE_CONFIG_CONTENT"));
+    }
+
+    #[test]
+    fn test_per_run_cleanup_removes_effective_discovery_roots_only_when_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let project = dir.path().join("repo");
+        let cwd = project.join("nested");
+        let custom = dir.path().join("custom");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let owned_paths = [
+            xdg.join("opencode").join("plugin").join("hcom.ts"),
+            home.join(".opencode").join("plugins").join("hcom.ts"),
+            project.join(".opencode").join("plugin").join("hcom.ts"),
+            custom.join("plugins").join("hcom.ts"),
+        ];
+        for path in &owned_paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, PLUGIN_SOURCE).unwrap();
+        }
+        let user = cwd.join(".opencode").join("plugins").join("hcom.ts");
+        std::fs::create_dir_all(user.parent().unwrap()).unwrap();
+        std::fs::write(&user, "export const Mine = async () => ({})").unwrap();
+
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::OpenCode,
+            env: [
+                ("HOME".to_string(), home.to_string_lossy().into_owned()),
+                (
+                    "XDG_CONFIG_HOME".to_string(),
+                    xdg.to_string_lossy().into_owned(),
+                ),
+                (
+                    "OPENCODE_CONFIG_DIR".to_string(),
+                    custom.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cwd,
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        (OPENCODE_PER_RUN.cleanup_legacy)(&ctx).unwrap();
+        for path in owned_paths {
+            assert!(!path.exists(), "{} should be removed", path.display());
+        }
+        assert!(user.exists(), "user plugin must survive");
     }
 
     #[test]
@@ -998,35 +1278,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_verify_plugin_installed_rejects_stale_canonical_plugin() {
-        let dir = tempfile::tempdir().unwrap();
-        let saved_home = std::env::var("HOME").ok();
-        let saved_hcom = std::env::var("HCOM_DIR").ok();
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-            std::env::set_var("HCOM_DIR", dir.path().join(".hcom"));
-        }
-
-        let plugin_path = get_opencode_plugin_path();
-        std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
-        std::fs::write(&plugin_path, "// stale plugin").unwrap();
-
-        assert!(!verify_opencode_plugin_installed());
-
-        if let Some(home) = saved_home {
-            unsafe { std::env::set_var("HOME", home) };
-        } else {
-            unsafe { std::env::remove_var("HOME") };
-        }
-        if let Some(hcom) = saved_hcom {
-            unsafe { std::env::set_var("HCOM_DIR", hcom) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
-    }
-
-    #[test]
-    #[serial]
     fn test_project_local_plugin_path_uses_hcom_dir_parent() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
@@ -1048,7 +1299,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_verify_and_remove_support_opencode_config_dir() {
+    fn test_remove_supports_opencode_config_dir() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -1066,14 +1317,13 @@ mod tests {
         let plugin_path = custom.join("plugins").join("hcom.ts");
         std::fs::write(&plugin_path, PLUGIN_SOURCE).unwrap();
 
-        assert!(verify_opencode_plugin_installed());
         remove_opencode_plugin().unwrap();
         assert!(!plugin_path.exists());
     }
 
     #[test]
     #[serial]
-    fn test_verify_and_remove_support_kilo_config_dir() {
+    fn test_remove_supports_kilo_config_dir() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -1091,7 +1341,6 @@ mod tests {
         let plugin_path = custom.join("plugins").join("hcom.ts");
         std::fs::write(&plugin_path, PLUGIN_SOURCE).unwrap();
 
-        assert!(verify_kilo_plugin_installed());
         remove_kilo_plugin().unwrap();
         assert!(!plugin_path.exists());
     }
