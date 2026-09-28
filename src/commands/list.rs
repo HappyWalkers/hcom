@@ -40,11 +40,13 @@ fn tool_label(db: &HcomDb, data: &InstanceRow) -> String {
 }
 
 /// Binding summary for verbose/detail views: "hooks, process", "hooks", ...
-fn bindings_display(db: &HcomDb, name: &str) -> &'static str {
-    match (
-        db.has_session_binding(name),
-        db.has_process_binding_for_instance(name),
-    ) {
+/// An ad-hoc row's session binding only keys its identity (no hooks run).
+fn bindings_display(db: &HcomDb, data: &InstanceRow) -> &'static str {
+    let session = db.has_session_binding(&data.name);
+    if data.tool == "adhoc" {
+        return if session { "session" } else { "none" };
+    }
+    match (session, db.has_process_binding_for_instance(&data.name)) {
         (true, true) => "hooks, process",
         (true, false) => "hooks",
         (false, true) => "process",
@@ -525,7 +527,7 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
 
             // Binding status
-            println!("    bindings:     {}", bindings_display(db, &data.name));
+            println!("    bindings:     {}", bindings_display(db, data));
 
             let transcript = if data.transcript_path.is_empty() {
                 "(none)".to_string()
@@ -676,7 +678,7 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
     }
 
     // Bindings
-    println!("  Bindings:    {}", bindings_display(db, &data.name));
+    println!("  Bindings:    {}", bindings_display(db, data));
 
     if let Some(pid) = data.pid {
         println!("  PID:         {pid}");
@@ -1015,8 +1017,10 @@ mod tests {
         assert_eq!(label(&db, "remo"), "CLAUDE");
         assert_eq!(label(&db, "adho"), "AD-HOC");
 
-        assert_eq!(bindings_display(&db, "full"), "hooks, process");
-        assert_eq!(bindings_display(&db, "pend"), "process");
-        assert_eq!(bindings_display(&db, "subx"), "none");
+        let bindings = |name| bindings_display(&db, &db.get_instance_full(name).unwrap().unwrap());
+        assert_eq!(bindings("full"), "hooks, process");
+        assert_eq!(bindings("pend"), "process");
+        assert_eq!(bindings("subx"), "none");
+        assert_eq!(bindings("adho"), "session");
     }
 }

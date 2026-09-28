@@ -946,16 +946,6 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    // Guard: Block sends from vanilla Claude before opt-in
-    if matches!(sender_identity.kind, SenderKind::Instance)
-        && sender_identity.instance_data.is_none()
-        && std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok()
-    {
-        eprintln!("Error: Cannot send without identity.");
-        eprintln!("Run 'hcom start' first, then use 'hcom send'.");
-        return 1;
-    }
-
     // Self-delivery is always filtered out, so an all-self target list would
     // otherwise "succeed" with no recipients.
     if !effective_targets.is_empty()

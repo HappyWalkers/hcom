@@ -2234,7 +2234,7 @@ mod tests {
     #[serial]
     fn new_row_honors_configured_hcom_timeout() {
         // Regression test for issue #71: a brand-new instance row (the path
-        // used by vanilla `hcom start`, launched, and resumed sessions) must
+        // used by adhoc `hcom start`, launched, and resumed sessions) must
         // carry the effective HCOM_TIMEOUT rather than silently falling back
         // to the old always-86400 schema default.
         let _env = EnvVarGuard::set("HCOM_TIMEOUT", "30");

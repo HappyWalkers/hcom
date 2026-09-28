@@ -132,13 +132,7 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     let ctx = HcomContext::from_os();
     let mut payload = HookPayload::from_claude(raw);
 
-    // Keep ordinary nonparticipants completely silent. The sole exception is
-    // a visible hcom attempt from a child: let it reach routing so it receives
-    // the actionable "start hcom in the parent first" denial even with an
-    // otherwise empty database.
-    if !(common::hook_gate_check(&ctx, &db)
-        || (hook_type == HOOK_PRE && child_visibly_invokes_hcom(&payload)))
-    {
+    if !common::hook_gate_check(&ctx, &db) {
         return 0;
     }
 
@@ -896,16 +890,10 @@ fn handle_sessionstart(
         return (0, serde_json::to_string(&output).unwrap_or_default());
     }
 
-    // Vanilla instance - show hint.
+    // Per-run hooks only load in hcom launches, so both are always present;
+    // stay silent rather than guess if a payload arrives without them.
     if process_id.is_none() || session_id.is_empty() {
-        let hcom_cmd = crate::runtime_env::build_hcom_command();
-        let output = serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": format!("[hcom available - run '{} start' to participate]", hcom_cmd),
-            }
-        });
-        return (0, serde_json::to_string(&output).unwrap_or_default());
+        return (0, String::new());
     }
 
     // Resolve the selected owner and log vocabulary first; the mutation and
@@ -1102,41 +1090,27 @@ fn handle_compact_recovery(
     session_id: &str,
     process_id: Option<&str>,
 ) -> Option<Value> {
+    let process_id = process_id?;
     let instance_name = db
         .get_session_binding(session_id)
         .ok()
         .flatten()
-        .or_else(|| {
-            process_id.and_then(|pid| instance_binding::resolve_process_binding(db, Some(pid)))
-        })?;
+        .or_else(|| instance_binding::resolve_process_binding(db, Some(process_id)))?;
 
-    let bootstrap = if process_id.is_some() {
-        // hcom-launched: inject full bootstrap
-        let inst = db.get_instance_full(&instance_name).ok()??;
-        let tag = inst.tag.as_deref().unwrap_or("");
-        bootstrap::get_bootstrap(
-            db,
-            &ctx.hcom_dir,
-            &instance_name,
-            "claude",
-            ctx.is_background,
-            ctx.is_launched,
-            &ctx.notes,
-            tag,
-            false,
-            ctx.background_name.as_deref(),
-        )
-    } else {
-        // Vanilla: need rebind
-        let mut updates = serde_json::Map::new();
-        updates.insert("name_announced".into(), serde_json::json!(false));
-        instances::update_instance_position(db, &instance_name, &updates);
-        format!(
-            "[HCOM RECOVERY] You were participating in hcom as '{}'. \
-             Run this command now to continue: hcom start --as {}",
-            instance_name, instance_name
-        )
-    };
+    let inst = db.get_instance_full(&instance_name).ok()??;
+    let tag = inst.tag.as_deref().unwrap_or("");
+    let bootstrap = bootstrap::get_bootstrap(
+        db,
+        &ctx.hcom_dir,
+        &instance_name,
+        "claude",
+        ctx.is_background,
+        ctx.is_launched,
+        &ctx.notes,
+        tag,
+        false,
+        ctx.background_name.as_deref(),
+    );
 
     Some(serde_json::json!({
         "hookSpecificOutput": {
@@ -1654,7 +1628,7 @@ fn handle_stop_failure(db: &HcomDb, payload: &HookPayload, instance_name: &str) 
     (0, String::new())
 }
 
-/// Parent PostToolUse: bootstrap, messages, vanilla binding.
+/// Parent PostToolUse: bootstrap, messages.
 fn handle_posttooluse(
     db: &HcomDb,
     ctx: &HcomContext,

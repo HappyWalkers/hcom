@@ -382,7 +382,7 @@ pub struct PollResult {
 
 /// Stop hook polling loop — NOT used by main PTY path.
 ///
-/// Runs for: headless instances, vanilla tool instances, subagent polling.
+/// Runs for: headless instances and subagent polling.
 /// Main PTY path bypasses this (HCOM_PTY_MODE=1, PTY wrapper handles injection).
 ///
 /// Uses select() on a TCP socket for efficient wake-on-message delivery.

@@ -2,7 +2,7 @@
 //!
 //! Runs inside an already-running tool session rather than launching a new one.
 //! Used for adhoc/manual setup, identity rebinding, and orphan recovery:
-//! - Bare start: detect vanilla tool or create adhoc instance
+//! - Bare start: bind a launched session late, or create an adhoc instance
 //! - `--name <agent-id>`: register a subagent (a router-level global flag, not
 //!   parsed by `StartArgs` — resolved in `run()` via `flags.name`)
 //! - `--orphan`: recover orphaned PTY process
@@ -392,7 +392,7 @@ fn start_rebind(
         session_id = current_data.session_id.filter(|s| !s.is_empty());
     }
     if session_id.is_none() {
-        session_id = resolve_vanilla_session_id(ctx);
+        session_id = resolve_launched_session_id(ctx);
     }
     // A direct per-run tool (plain `claude`/`codex`) has no hooks but still
     // exposes its native session id; bare start binds its adhoc identity to
@@ -667,17 +667,14 @@ fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
         .cloned()
 }
 
-/// Resolve a native session id exposed to shell commands by a direct tool run.
-///
-/// A per-run tool run directly (no hcom process binding) never carries hcom
-/// hooks, so its session has nothing to bind to: it joins as adhoc, and no
-/// global hooks are installed on its behalf. `hcom <tool>` sessions keep their
-/// native id (it's how a launched session binds late).
-fn resolve_vanilla_session_id(ctx: &HcomContext) -> Option<String> {
-    if ctx.process_id.is_none() && crate::hooks::runtime::is_per_run(ctx.tool) {
-        return None;
-    }
-    resolve_native_session_id(ctx)
+/// Native session id of an `hcom <tool>` launch (how a launched session binds
+/// late). A direct run has no hcom hooks, so its id never identifies a hooked
+/// session: it can only key an adhoc identity (see `start_bare`).
+fn resolve_launched_session_id(ctx: &HcomContext) -> Option<String> {
+    ctx.process_id
+        .is_some()
+        .then(|| resolve_native_session_id(ctx))
+        .flatten()
 }
 
 fn resolve_native_session_id(ctx: &HcomContext) -> Option<String> {
@@ -699,7 +696,7 @@ fn start_bare(
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
 
-    let vanilla_session_id = resolve_vanilla_session_id(ctx);
+    let launched_session_id = resolve_launched_session_id(ctx);
     // A direct per-run tool has no hooks, but its native ID can still make a
     // repeated manual `hcom start` return the same adhoc identity.
     let adhoc_session_id = (!ctx.is_launched
@@ -707,8 +704,8 @@ fn start_bare(
         && crate::hooks::runtime::is_per_run(ctx.tool))
     .then(|| resolve_native_session_id(ctx))
     .flatten();
-    let session_id = vanilla_session_id.as_ref().or(adhoc_session_id.as_ref());
-    let tool = if ctx.process_id.is_some() || vanilla_session_id.is_some() {
+    let session_id = launched_session_id.as_ref().or(adhoc_session_id.as_ref());
+    let tool = if ctx.process_id.is_some() {
         ctx.tool.as_str()
     } else {
         "adhoc"
@@ -721,7 +718,7 @@ fn start_bare(
         // Only hcom writes session bindings, so a row keyed by this session's
         // own id is trusted identity evidence. Heal bindings created by older
         // versions before returning the existing row.
-        if vanilla_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
+        if launched_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
             db.mark_claude_session_validated(session_id, &bound_name)?;
         }
         println!("hcom already started for {bound_name}");
@@ -743,7 +740,7 @@ fn start_bare(
         // Launched but its session not bound yet (SessionStart pending or
         // failed): connect it here instead of leaving it unregistered.
         if owner.session_id.as_deref().is_none_or(str::is_empty)
-            && let Some(ref session_id) = vanilla_session_id
+            && let Some(ref session_id) = launched_session_id
             && let Some(bound) =
                 instance_binding::bind_session_to_process(db, session_id, ctx.process_id.as_deref())
         {
@@ -811,7 +808,7 @@ fn start_bare(
 
     if let Some(session_id) = session_id {
         db.set_session_binding(session_id, &name)?;
-        if vanilla_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
+        if launched_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
             db.mark_claude_session_validated(session_id, &name)?;
         }
     }
@@ -1030,7 +1027,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
-            assert_eq!(resolve_vanilla_session_id(&ctx).as_deref(), Some(expected));
+            assert_eq!(resolve_launched_session_id(&ctx).as_deref(), Some(expected));
         }
     }
 
