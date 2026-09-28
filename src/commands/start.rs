@@ -392,10 +392,22 @@ fn start_rebind(
         session_id = current_data.session_id.filter(|s| !s.is_empty());
     }
     if session_id.is_none() {
-        // Direct Claude and Codex sessions have no hcom process binding. Their
-        // native ids are definitive and are also what their hooks report.
         session_id = resolve_vanilla_session_id(ctx);
     }
+    // A direct per-run tool (plain `claude`/`codex`) has no hooks but still
+    // exposes its native session id; bare start binds its adhoc identity to
+    // it, so rebind must use it too or the old identity stays bound.
+    let adhoc_session = session_id.is_none()
+        && ctx.process_id.is_none()
+        && crate::hooks::runtime::is_per_run(ctx.tool);
+    if adhoc_session {
+        session_id = resolve_native_session_id(ctx);
+    }
+    let tool = if !adhoc_session && (ctx.process_id.is_some() || session_id.is_some()) {
+        ctx.tool.as_str()
+    } else {
+        "adhoc"
+    };
     let current_name = if !explicit_current_name.is_empty() {
         explicit_current_name.to_string()
     } else if let Some(ref sid) = session_id {
@@ -407,7 +419,7 @@ fn start_rebind(
 
     let target_meta = load_rebind_target_metadata(db, &target_name).ok();
     if let Some(ref meta) = target_meta {
-        ensure_rebind_compatible(&target_name, meta, ctx)?;
+        ensure_rebind_compatible(&target_name, meta, ctx, tool)?;
     }
 
     // Preserve last_event_id from target (cursor preservation)
@@ -444,11 +456,6 @@ fn start_rebind(
     }
 
     // Create fresh instance with the target name.
-    let tool = if ctx.process_id.is_some() || session_id.is_some() {
-        ctx.tool.as_str()
-    } else {
-        "adhoc"
-    };
     let cwd_override = ctx.cwd.to_string_lossy().to_string();
     instance_binding::initialize_instance_in_position_file(
         db,
@@ -495,7 +502,8 @@ fn start_rebind(
     if let Some(ref sid) = session_id {
         if let Err(e) = db.set_session_binding(sid, &target_name) {
             eprintln!("[hcom] warn: set_session_binding failed for {target_name}: {e}");
-        } else if ctx.tool == crate::tool::Tool::Claude
+        } else if !adhoc_session
+            && ctx.tool == crate::tool::Tool::Claude
             && let Err(e) = db.mark_claude_session_validated(sid, &target_name)
         {
             // The cache still names the identity being replaced, and it is keyed
@@ -564,13 +572,17 @@ struct RebindTargetMetadata {
     last_event_id: i64,
 }
 
+/// `row_tool` is the tool the reclaimed row will have: `adhoc` for a direct
+/// per-run tool, which may reclaim either its own earlier adhoc identity or one
+/// from an `hcom <tool>` launch.
 fn ensure_rebind_compatible(
     target_name: &str,
     meta: &RebindTargetMetadata,
     ctx: &HcomContext,
+    row_tool: &str,
 ) -> Result<()> {
     let current_tool = ctx.tool.as_str();
-    if !meta.tool.is_empty() && meta.tool != current_tool {
+    if !meta.tool.is_empty() && meta.tool != current_tool && meta.tool != row_tool {
         bail!(
             "Refusing to reclaim '{target_name}': latest identity used tool '{}' but current session is '{}'",
             meta.tool,
@@ -1367,16 +1379,51 @@ mod tests {
             assert_eq!(exit_code, 0);
 
             let inst = db.get_instance_full("nova").unwrap().unwrap();
-            // A direct (per-run) Claude has no hooks: the reclaim is adhoc
-            // whether or not Claude exposed its session id.
+            // A direct (per-run) Claude has no hooks: the reclaim is adhoc,
+            // bound to Claude's session id when it exposed one.
             assert_eq!(inst.tool, "adhoc");
-            assert_eq!(inst.session_id, None);
+            assert_eq!(inst.session_id.as_deref(), session_id);
             assert_eq!(
                 inst.directory,
                 "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
             );
             assert_eq!(inst.last_event_id, 77);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_plain_claude_rebind_moves_session_binding_to_target() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let ctx = make_claude_ctx(
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-plain")),
+            "/tmp/project",
+        );
+
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let first = db.get_session_binding("sess-plain").unwrap().unwrap();
+
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(
+            db.get_session_binding("sess-plain").unwrap().as_deref(),
+            Some("nova")
+        );
+        assert!(db.get_instance_full(&first).unwrap().is_none());
+        let nova = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(nova.tool, "adhoc");
+        assert_eq!(
+            db.get_validated_claude_session_owner("sess-plain").unwrap(),
+            None,
+            "an adhoc identity must not enter Claude's hook validation cache"
+        );
+
+        // A later bare start returns the rebound identity, and the adhoc
+        // identity can be reclaimed again from the same plain Claude.
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
+        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(db.iter_instances_full().unwrap().len(), 1);
     }
 
     #[test]

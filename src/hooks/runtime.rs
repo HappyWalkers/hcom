@@ -68,6 +68,12 @@ impl LaunchCtx {
         };
         value.filter(|v| !v.is_empty())
     }
+
+    /// Non-empty path env value; a relative one is resolved against the
+    /// launch cwd, which is where the tool itself resolves it.
+    pub fn path_var(&self, key: &str) -> Option<PathBuf> {
+        self.var(key).map(|value| self.cwd.join(value))
+    }
 }
 
 /// What a per-run launch adds.
@@ -298,7 +304,9 @@ fn is_runtime_path_under(root: &Path, value: &str) -> bool {
         Some(rest) => PathBuf::from(url_path_to_native(rest)),
         None => PathBuf::from(value),
     };
-    if path.starts_with(root) {
+    // `<root>/../user.ts` starts with `<root>` component-wise; resolve `..`
+    // lexically first so a user path is never taken for hcom's.
+    if lexically_normalized(&path).starts_with(lexically_normalized(root)) {
         return true;
     }
     // Symlinked HCOM_DIR (e.g. /tmp vs /private/tmp): compare canonical forms.
@@ -306,6 +314,23 @@ fn is_runtime_path_under(root: &Path, value: &str) -> bool {
         (Ok(root), Ok(path)) => path.starts_with(root),
         _ => false,
     }
+}
+
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// `file://` URL for an absolute path. Percent-encodes everything outside the
@@ -527,6 +552,16 @@ mod tests {
             "/home/u/.pi/agent/extensions/hcom.ts"
         ));
         assert!(!is_runtime_path_under(&integrations, "./my-plugin"));
+        let escaped = integrations
+            .join("opencode")
+            .join("..")
+            .join("..")
+            .join("user.ts");
+        assert!(!is_runtime_path_under(
+            &integrations,
+            &escaped.to_string_lossy()
+        ));
+        assert!(!is_runtime_path_under(&integrations, &file_url(&escaped)));
     }
 
     #[test]

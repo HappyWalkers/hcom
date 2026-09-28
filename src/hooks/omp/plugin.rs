@@ -37,15 +37,6 @@ fn active_profile(ctx: &LaunchCtx) -> Option<String> {
     (!normalized.is_empty() && normalized != "default").then(|| normalized.to_string())
 }
 
-fn resolve_ctx_path(ctx: &LaunchCtx, value: &str) -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        ctx.cwd.join(path)
-    }
-}
-
 fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
     let home = ctx
         .var("HOME")
@@ -61,8 +52,7 @@ fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
             .join(name)
             .join("agent"),
         None => ctx
-            .var("PI_CODING_AGENT_DIR")
-            .map(|value| resolve_ctx_path(ctx, value))
+            .path_var("PI_CODING_AGENT_DIR")
             .unwrap_or_else(|| home.join(config_name).join("agent")),
     };
     agent_dir.join("extensions").join(PLUGIN_FILENAME)

@@ -376,27 +376,15 @@ pub fn get_pi_plugin_path() -> std::path::PathBuf {
     pi_plugin_dir().join(PLUGIN_FILENAME)
 }
 
-fn resolve_ctx_path(ctx: &LaunchCtx, value: &str) -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        ctx.cwd.join(path)
-    }
-}
-
 fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
-    let agent_dir = ctx
-        .var("PI_CODING_AGENT_DIR")
-        .map(|value| resolve_ctx_path(ctx, value))
-        .unwrap_or_else(|| {
-            ctx.var("HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(dirs::home_dir)
-                .unwrap_or_default()
-                .join(".pi")
-                .join("agent")
-        });
+    let agent_dir = ctx.path_var("PI_CODING_AGENT_DIR").unwrap_or_else(|| {
+        ctx.var("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_default()
+            .join(".pi")
+            .join("agent")
+    });
     agent_dir.join("extensions").join(PLUGIN_FILENAME)
 }
 

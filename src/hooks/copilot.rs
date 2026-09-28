@@ -117,8 +117,7 @@ fn tool_config_root_for_ctx(ctx: &LaunchCtx) -> PathBuf {
 }
 
 fn copilot_hooks_path_for_ctx(ctx: &LaunchCtx) -> PathBuf {
-    ctx.var("COPILOT_HOME")
-        .map(PathBuf::from)
+    ctx.path_var("COPILOT_HOME")
         .unwrap_or_else(|| tool_config_root_for_ctx(ctx).join(".copilot"))
         .join("hooks")
         .join("hcom.json")
@@ -323,8 +322,9 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
     remove_hooks_at(&copilot_hooks_path_for_ctx(ctx))
 }
 
-/// Strip hcom's entries from a legacy `hooks/hcom.json`. The file is hcom's by
-/// name, so it is deleted once only `version` and empty `hooks` remain.
+/// Strip hcom's entries from a legacy `hooks/hcom.json`. When that removed
+/// something and only `version` and empty `hooks` remain, the file is deleted;
+/// a file hcom had no entries in is never touched.
 fn remove_hooks_at(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -332,6 +332,9 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
     let mut value = Value::Object(read_json_object(path)?);
     let before = value.clone();
     remove_hcom_hooks(&mut value);
+    if value == before {
+        return Ok(());
+    }
     let only_hcom = value.as_object().is_some_and(|root| {
         root.iter().all(|(key, v)| match key.as_str() {
             "version" => true,
@@ -341,16 +344,27 @@ fn remove_hooks_at(path: &Path) -> Result<()> {
     });
     if only_hcom {
         std::fs::remove_file(path).with_context(|| format!("Cannot remove {}", path.display()))?;
-    } else if value != before {
+    } else {
         write_json(path, &value)?;
     }
     Ok(())
 }
 
+/// Clean every path the old installer could have used; one failure doesn't
+/// stop the others.
 pub fn remove_copilot_hooks() -> bool {
-    copilot_hooks_cleanup_paths()
-        .iter()
-        .all(|path| remove_hooks_at(path).is_ok())
+    let mut ok = true;
+    for path in copilot_hooks_cleanup_paths() {
+        if let Err(error) = remove_hooks_at(&path) {
+            log::log_warn(
+                "copilot",
+                "copilot.hooks_cleanup_failed",
+                &format!("{error:#}"),
+            );
+            ok = false;
+        }
+    }
+    ok
 }
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
@@ -767,6 +781,16 @@ mod tests {
         ctx.cwd = workspace;
         cleanup_legacy_per_run(&ctx).unwrap();
         assert!(!hooks_path.exists());
+    }
+
+    #[test]
+    fn remove_leaves_file_without_hcom_entries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hcom.json");
+        let source = r#"{"version":1,"hooks":{}}"#;
+        std::fs::write(&path, source).unwrap();
+        remove_hooks_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
     }
 
     #[test]

@@ -731,15 +731,6 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
-fn resolve_ctx_path(ctx: &LaunchCtx, value: &str) -> std::path::PathBuf {
-    let path = std::path::PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        ctx.cwd.join(path)
-    }
-}
-
 fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
     let (app, config_dir_env, disable_project_env, project_names): (&str, &str, &str, &[&str]) =
         match ctx.tool {
@@ -763,13 +754,12 @@ fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
         .or_else(dirs::home_dir)
         .unwrap_or_default();
     let config_home = ctx
-        .var("XDG_CONFIG_HOME")
-        .map(|value| resolve_ctx_path(ctx, value))
+        .path_var("XDG_CONFIG_HOME")
         .unwrap_or_else(|| home.join(".config"));
 
     let mut roots = vec![config_home.join(app)];
-    if let Some(custom) = ctx.var(config_dir_env) {
-        roots.push(resolve_ctx_path(ctx, custom));
+    if let Some(custom) = ctx.path_var(config_dir_env) {
+        roots.push(custom);
     }
 
     for name in project_names {

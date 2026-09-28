@@ -58,8 +58,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 };
 
 fn per_run_home(ctx: &LaunchCtx) -> PathBuf {
-    ctx.var("CODEX_HOME")
-        .map(PathBuf::from)
+    ctx.path_var("CODEX_HOME")
         .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".codex"))
 }
 

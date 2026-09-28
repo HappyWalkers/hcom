@@ -2690,8 +2690,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 };
 
 fn effective_settings_path(ctx: &LaunchCtx) -> PathBuf {
-    ctx.var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
+    ctx.path_var("CLAUDE_CONFIG_DIR")
         .unwrap_or_else(|| paths::get_project_root().join(".claude"))
         .join("settings.json")
 }
@@ -3216,6 +3215,29 @@ mod tests {
             "from-file"
         );
         assert_eq!(args, ["--", "--settings=prompt-text"]);
+    }
+
+    #[test]
+    fn per_run_cleanup_resolves_relative_config_dir_from_launch_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rel-claude").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({"env": {"HCOM": "hcom"}}).to_string(),
+        )
+        .unwrap();
+        let ctx = super::LaunchCtx {
+            tool: crate::tool::Tool::Claude,
+            env: [("CLAUDE_CONFIG_DIR".to_string(), "rel-claude".to_string())].into(),
+            cwd: dir.path().to_path_buf(),
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        super::cleanup_legacy_per_run(&ctx).unwrap();
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(settings["env"].get("HCOM").is_none());
     }
 
     #[test]
