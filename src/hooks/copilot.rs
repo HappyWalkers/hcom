@@ -127,10 +127,6 @@ pub fn get_copilot_hooks_path() -> PathBuf {
     copilot_config_dir().join("hooks").join("hcom.json")
 }
 
-pub fn get_copilot_settings_path() -> PathBuf {
-    copilot_config_dir().join("settings.json")
-}
-
 fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if path.is_absolute() && !paths.contains(&path) {
         paths.push(path);

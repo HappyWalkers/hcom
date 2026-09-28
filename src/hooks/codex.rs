@@ -890,7 +890,8 @@ fn codex_config_dir() -> PathBuf {
 }
 
 /// Get path to Codex config.toml.
-pub fn get_codex_config_path() -> PathBuf {
+#[cfg(test)]
+fn get_codex_config_path() -> PathBuf {
     codex_config_path_at(&codex_config_dir())
 }
 
@@ -1358,11 +1359,6 @@ fn build_codex_rules() -> String {
     rules.join("\n") + "\n"
 }
 
-/// Set up Codex execpolicy rules for auto-approval.
-pub fn setup_codex_execpolicy() -> bool {
-    setup_codex_execpolicy_at(&codex_config_dir())
-}
-
 fn setup_codex_execpolicy_at(codex_home: &Path) -> bool {
     let rules_dir = codex_rules_path_at(codex_home);
     let rules_file = rules_dir.join("hcom.rules");
@@ -1376,11 +1372,6 @@ fn setup_codex_execpolicy_at(codex_home: &Path) -> bool {
 
     let _ = std::fs::create_dir_all(&rules_dir);
     paths::atomic_write(&rules_file, &rule_content)
-}
-
-/// Remove hcom execpolicy rule.
-pub fn remove_codex_execpolicy() -> bool {
-    remove_codex_execpolicy_at(&codex_config_dir())
 }
 
 fn remove_codex_execpolicy_at(codex_home: &Path) -> bool {

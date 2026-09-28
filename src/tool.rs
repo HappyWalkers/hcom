@@ -77,21 +77,22 @@ impl Tool {
     // in `launcher::ensure_hooks_installed`; per-run tools report through
     // `hooks::runtime::plan`.
 
-    /// Verify hooks are installed for this tool. `include_permissions` controls
-    /// whether the auto-approve permission block is also checked.
+    /// Verify a persistent tool's global hook install. `include_permissions`
+    /// controls whether the auto-approve permission block is also checked.
+    /// Per-run tools (`hooks::runtime::is_per_run`) have no install; callers
+    /// must branch on that first.
     pub fn verify_hooks_installed(&self, include_permissions: bool) -> bool {
         match self {
             Tool::Gemini => {
                 crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
             }
-            // Per-run tools: every hcom launch loads hooks; nothing to install.
             Tool::Claude
             | Tool::Codex
             | Tool::Copilot
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => true,
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
@@ -103,20 +104,20 @@ impl Tool {
         }
     }
 
-    /// Try to install hooks for this tool. Returns `Err(message)` on failure.
+    /// Install a persistent tool's global hooks. Returns `Err(message)` on
+    /// failure. Per-run tools have nothing to install (see above).
     /// `Tool::Adhoc` always errors — adhoc has no hook surface.
     pub fn try_setup_hooks(&self, include_permissions: bool) -> Result<(), String> {
         match self {
             Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            // Per-run tools (`hooks::runtime`) have nothing to install.
             Tool::Claude
             | Tool::Codex
             | Tool::Copilot
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => Ok(()),
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -157,25 +158,35 @@ impl Tool {
         }
     }
 
-    /// Filesystem path the hook integration writes to (settings/config file or
-    /// plugin location). Empty for `Tool::Adhoc`.
+    /// Filesystem path a persistent tool's global install writes to (settings
+    /// file or plugin location). Empty for `Tool::Adhoc`. Per-run tools have
+    /// none (see above).
     pub fn hooks_settings_path(&self) -> String {
         let path_buf = match self {
-            Tool::Claude => crate::hooks::claude::get_claude_settings_path(),
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => per_run_has_no_install(*self),
             Tool::Gemini => crate::hooks::gemini::get_gemini_settings_path(),
-            Tool::Codex => crate::hooks::codex::get_codex_config_path(),
-            Tool::OpenCode => crate::hooks::opencode::get_opencode_plugin_path(),
-            Tool::Kilo => crate::hooks::opencode::get_kilo_plugin_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
             Tool::Kimi => crate::hooks::kimi::get_kimi_settings_path(),
-            Tool::Copilot => crate::hooks::copilot::get_copilot_hooks_path(),
-            Tool::Pi => crate::hooks::pi::get_pi_plugin_path(),
-            Tool::Omp => crate::hooks::omp::get_omp_plugin_path(),
             Tool::Adhoc => return String::new(),
         };
         path_buf.to_string_lossy().to_string()
     }
+}
+
+/// Per-run tools load hooks per launch (`hooks::runtime`) and have no global
+/// install to verify, set up or locate; callers branch on `is_per_run` first.
+fn per_run_has_no_install(tool: Tool) -> ! {
+    unreachable!(
+        "{} uses per-run hooks and has no persistent install",
+        tool.as_str()
+    )
 }
 
 impl FromStr for Tool {

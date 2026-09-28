@@ -834,16 +834,19 @@ fn plugin_dir_for_app(app: &str) -> std::path::PathBuf {
     }
 }
 
-pub fn get_opencode_plugin_dir() -> std::path::PathBuf {
+#[cfg(test)]
+fn get_opencode_plugin_dir() -> std::path::PathBuf {
     plugin_dir_for_app("opencode")
 }
 
 /// Get the canonical install path for the hcom.ts plugin.
-pub fn get_opencode_plugin_path() -> std::path::PathBuf {
+#[cfg(test)]
+fn get_opencode_plugin_path() -> std::path::PathBuf {
     get_opencode_plugin_dir().join(PLUGIN_FILENAME)
 }
 
-pub fn get_kilo_plugin_path() -> std::path::PathBuf {
+#[cfg(test)]
+fn get_kilo_plugin_path() -> std::path::PathBuf {
     plugin_dir_for_app("kilo").join(PLUGIN_FILENAME)
 }
 
