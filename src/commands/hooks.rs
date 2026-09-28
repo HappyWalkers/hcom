@@ -267,28 +267,6 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
 
     let first = argv[0].as_str();
 
-    if first == "--help" || first == "-h" {
-        let options = valid_hook_options();
-        println!(
-            "hcom hooks - Manage tool hooks for hcom integration\n\n\
-             Hooks enable automatic message delivery and status tracking. Without hooks,\n\
-             you can still use hcom in ad-hoc mode (run hcom start in any ai tool).\n\n\
-             Per-run tools load hcom's hooks only in sessions launched with `hcom <tool>`.\n\
-             There is nothing to add for them; remove clears installs left by older hcom.\n\n\
-             Usage:\n  \
-             hcom hooks                  Show hook status for all tools\n  \
-             hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add persistent hooks ({options})\n  \
-             hcom hooks remove [tool]    Remove hooks ({options})\n\n\
-             Examples:\n  \
-             hcom hooks add gemini       Add Gemini hooks\n  \
-             hcom hooks add              Auto-detect tool or add all\n  \
-             hcom hooks remove all       Remove all hooks\n\n\
-             Restart a persistent tool after adding its hooks."
-        );
-        return 0;
-    }
-
     let sub_argv = argv[1..].to_vec();
 
     match first {

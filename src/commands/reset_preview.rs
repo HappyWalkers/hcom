@@ -82,7 +82,7 @@ fn render_hooks_preview() -> String {
     let actions = hook_preview_lines();
     format!(
         "\n== RESET HOOKS PREVIEW ==\n\
-         This will remove hcom hooks from tool configs.\n\n\
+         This will remove persistent hcom hooks and legacy installs left by older hcom.\n\n\
          Actions:\n{actions}\n\n\
          Persistent hooks can be reinstalled with: hcom hooks add\n\
          Per-run tools load hooks automatically on their next hcom launch.\n\n\
@@ -95,7 +95,7 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
     let hcom_cmd = "hcom";
     format!(
         "\n== RESET ALL PREVIEW ==\n\
-         This will stop all instances, archive the database, remove hooks, and reset config.\n\n\
+         This will stop all instances, archive the database, remove hooks and legacy installs, and reset config.\n\n\
          Current state:\n  \
          \u{2022} {instance_count} local instance{plural}: {names_display}\n  \
          \u{2022} {event_count} events in database\n\n\
@@ -103,7 +103,7 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
          1. Stop all {instance_count} local instances (kills processes, logs snapshots)\n  \
          2. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
          3. Delete database (hcom.db)\n  \
-         4. Remove hooks from {hook_labels} configs\n  \
+         4. Remove hooks and legacy installs ({hook_labels})\n  \
          5. Archive and delete config.toml + env\n  \
          6. Clear device identity (new UUID on next relay)\n\n\
          Add --go flag and run again to proceed:\n  \

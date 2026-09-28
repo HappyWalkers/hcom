@@ -270,15 +270,21 @@ pub fn publish_dir_at(
         return Ok(target);
     }
     std::fs::create_dir_all(&tool_dir)?;
+    // Merged caller config (e.g. Claude `--settings` with an `env` block) can
+    // hold secrets. Owner-only root and tool dirs also cover digests written
+    // before files were private.
+    make_private_dir(root)?;
+    make_private_dir(&tool_dir)?;
     let staging = tempfile::Builder::new()
         .prefix(".staging-")
         .tempdir_in(&tool_dir)?;
+    make_private_dir(staging.path())?;
     for (name, content) in files {
         let path = staging.path().join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, content)?;
+        write_private_file(&path, content)?;
     }
     match std::fs::rename(staging.path(), &target) {
         Ok(()) => Ok(target),
@@ -286,6 +292,26 @@ pub fn publish_dir_at(
         Err(_) if target.is_dir() => Ok(target),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(unix)]
+fn make_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn make_private_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn write_private_file(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)?.write_all(content)
 }
 
 /// Publish a single file and return its path.
@@ -482,6 +508,20 @@ mod tests {
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_artifacts_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let integrations = root.path().join("integrations");
+        let dir = publish_dir_at(&integrations, "claude", &[("a/settings.json", b"{}")]).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&integrations), 0o700);
+        assert_eq!(mode(&integrations.join("claude")), 0o700);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("a/settings.json")), 0o600);
     }
 
     #[test]
