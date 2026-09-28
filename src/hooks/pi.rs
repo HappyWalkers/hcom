@@ -395,9 +395,20 @@ pub fn ensure_pi_plugin_installed() -> bool {
     install_pi_plugin().unwrap_or(false)
 }
 
+/// True when `path` holds an hcom Pi plugin: the current source or any earlier
+/// version (all carry the `hcom-bootstrap` message type).
+pub fn is_hcom_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content == PLUGIN_SOURCE || content.contains("customType: \"hcom-bootstrap\"")
+        })
+        .unwrap_or(false)
+}
+
+/// Remove hcom's plugin file. A user file with the same name is left alone.
 pub fn remove_pi_plugin() -> std::io::Result<()> {
     let path = get_pi_plugin_path();
-    if path.exists() {
+    if is_hcom_owned(&path) {
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -610,5 +621,20 @@ mod tests {
         assert_eq!(rebound.directory, temp.path().to_string_lossy());
 
         cleanup(path);
+    }
+
+    #[test]
+    fn test_is_hcom_owned_matches_hcom_plugins_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("current.ts");
+        let older = dir.path().join("older.ts");
+        let user = dir.path().join("user.ts");
+        std::fs::write(&current, PLUGIN_SOURCE).unwrap();
+        std::fs::write(&older, "sendMessage({ customType: \"hcom-bootstrap\" })").unwrap();
+        std::fs::write(&user, "export default function mine() {}").unwrap();
+        assert!(is_hcom_owned(&current));
+        assert!(is_hcom_owned(&older));
+        assert!(!is_hcom_owned(&user));
+        assert!(!is_hcom_owned(&dir.path().join("missing.ts")));
     }
 }

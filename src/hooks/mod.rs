@@ -12,6 +12,7 @@ pub mod gemini;
 pub mod kimi;
 pub mod opencode;
 pub mod pi;
+pub mod runtime;
 pub mod utils;
 
 use serde_json::Value;

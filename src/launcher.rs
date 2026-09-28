@@ -429,6 +429,9 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
         strip.insert((*v).to_string());
     }
     strip.insert("HCOM_LAUNCHED_PRESET".to_string());
+    // A new plugin host must claim ownership itself; an inherited marker would
+    // make hcom's OpenCode/Kilo plugin stay inert in the process hcom launched.
+    strip.insert(crate::hooks::runtime::PLUGIN_HOST_PID_ENV.to_string());
 
     strip
 }
@@ -1878,12 +1881,46 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
-    // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(
-        &normalized,
-        hcom_config.auto_approve,
-        codex_home.as_ref().map(|(path, _)| path.as_path()),
-    )?;
+    // Hooks: per-run tools get a fresh injection built from the effective env,
+    // cwd and args (applied to args after the persisted snapshot below);
+    // persistent tools must have their global install (strict: refuse to launch
+    // without hooks).
+    let runtime_injection = match crate::hooks::runtime::adapter(normalized.tool()) {
+        Some(adapter) => {
+            // Replayed args (resume/fork) may carry hcom-injected values from a
+            // previous launch; drop them so the injection is rebuilt, not doubled.
+            crate::hooks::runtime::strip_managed_flag_values(
+                &mut params.args,
+                adapter.managed_value_flags,
+            );
+            if let Some(persisted) = params.persisted_args.as_mut() {
+                crate::hooks::runtime::strip_managed_flag_values(
+                    persisted,
+                    adapter.managed_value_flags,
+                );
+            }
+            let ctx = crate::hooks::runtime::LaunchCtx {
+                tool: normalized.tool(),
+                env: base_env.clone(),
+                cwd: canonical_dir.clone(),
+                args: params.args.clone(),
+                auto_approve: hcom_config.auto_approve,
+            };
+            let injection = crate::hooks::runtime::plan(adapter, &ctx)?;
+            for (key, value) in &injection.env {
+                insert_effective_env(&mut base_env, key.clone(), value.clone(), cfg!(windows));
+            }
+            Some(injection)
+        }
+        None => {
+            ensure_hooks_installed(
+                &normalized,
+                hcom_config.auto_approve,
+                codex_home.as_ref().map(|(path, _)| path.as_path()),
+            )?;
+            None
+        }
+    };
 
     // Tag resolution
     let effective_tag = if let Some(ref tag) = params.tag {
@@ -1959,6 +1996,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     // Injected after the snapshot so the internal plugin path is never persisted;
     // resume re-injects the current path via the same call.
     inject_omp_extension_args(&normalized, &mut params.args);
+
+    // Same for per-run hook injection: `injection.args` is the complete argv
+    // (caller args + hcom's merged flags), built from `params.args` above.
+    // Every instance of `hcom N <tool>` shares it; it holds no per-instance state.
+    if let Some(injection) = runtime_injection {
+        params.args = injection.args;
+    }
 
     // Resolved here, before any trust injection, and threaded to
     // preprocess_codex_args below. Codex's hook-trust bypass is invocation-wide,

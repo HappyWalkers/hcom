@@ -2701,10 +2701,20 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
     let mut ok = true;
 
     if hooks_path.exists() {
-        match std::fs::read_to_string(&hooks_path) {
-            Ok(content) => {
-                let mut json = serde_json::from_str::<Value>(&content)
-                    .unwrap_or_else(|_| serde_json::json!({ "hooks": {} }));
+        match std::fs::read_to_string(&hooks_path)
+            .map(|content| serde_json::from_str::<Value>(&content))
+        {
+            // A file that doesn't parse is the user's to fix; rewriting it
+            // would destroy whatever else it holds. Report it as a failure.
+            Ok(Err(_)) => {
+                crate::log::log_warn(
+                    "codex",
+                    "codex.hooks_json_malformed",
+                    &format!("left malformed {} untouched", hooks_path.display()),
+                );
+                ok = false;
+            }
+            Ok(Ok(mut json)) => {
                 remove_hcom_hooks_from_json(&mut json);
                 if json.get("hooks").is_none() && json.as_object().is_some_and(|o| o.is_empty()) {
                     ok &= std::fs::remove_file(&hooks_path).is_ok();
@@ -3468,6 +3478,25 @@ mod tests {
 
         assert!(remove_codex_hooks());
         assert!(!rules_file.exists(), "execpolicy rules should be removed");
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_codex_leaves_malformed_hooks_json_untouched() {
+        let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
+        assert!(setup_codex_hooks(true));
+        let base = get_codex_rules_path().parent().unwrap().to_path_buf();
+        let hooks_path = base.join("hooks.json");
+        let malformed = "{ \"hooks\": { oops";
+        std::fs::write(&hooks_path, malformed).unwrap();
+        let rules_file = get_codex_rules_path().join("hcom.rules");
+
+        assert!(
+            !remove_codex_hooks_from_dir(&base),
+            "malformed file is a failure"
+        );
+        assert_eq!(std::fs::read_to_string(&hooks_path).unwrap(), malformed);
+        assert!(!rules_file.exists(), "other hcom files are still removed");
     }
 
     #[test]

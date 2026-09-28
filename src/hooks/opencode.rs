@@ -722,11 +722,27 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
     }
 
     for p in paths {
-        if p.exists() {
+        if is_hcom_owned(&p) {
             std::fs::remove_file(&p)?;
         }
     }
     Ok(())
+}
+
+/// Marker line in `src/opencode_plugin/hcom.ts` identifying hcom's plugin.
+pub const PLUGIN_MARKER: &str = "// hcom-managed-plugin";
+
+/// True when `path` holds an hcom OpenCode/Kilo plugin: the current source, the
+/// marker, or a pre-marker version (every one exports `HcomPlugin` and reads
+/// `HCOM_DIR`). A user's own `hcom.ts` is not matched.
+pub fn is_hcom_owned(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|content| {
+            content == PLUGIN_SOURCE
+                || content.contains(PLUGIN_MARKER)
+                || (content.contains("HcomPlugin") && content.contains("HCOM_DIR"))
+        })
+        .unwrap_or(false)
 }
 
 pub fn remove_opencode_plugin() -> std::io::Result<()> {
@@ -1080,6 +1096,44 @@ mod tests {
         assert!(verify_kilo_plugin_installed());
         remove_kilo_plugin().unwrap();
         assert!(!plugin_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_remove_plugin_deletes_only_hcom_owned_files() {
+        let _guard = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
+        let custom = dir.path().join("custom-opencode");
+        std::fs::create_dir_all(home.join(".hcom")).unwrap();
+        std::fs::create_dir_all(xdg.join("opencode").join("plugins")).unwrap();
+        std::fs::create_dir_all(custom.join("plugin")).unwrap();
+        std::fs::create_dir_all(custom.join("plugins")).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::set_var("OPENCODE_CONFIG_DIR", &custom);
+        }
+
+        let user_file = xdg.join("opencode").join("plugins").join("hcom.ts");
+        std::fs::write(&user_file, "export const Mine = async () => ({})").unwrap();
+        // Pre-marker hcom version.
+        let legacy = custom.join("plugin").join("hcom.ts");
+        std::fs::write(
+            &legacy,
+            "const HCOM_DIR = process.env.HCOM_DIR\nexport const HcomPlugin = async () => ({})",
+        )
+        .unwrap();
+        let marked = custom.join("plugins").join("hcom.ts");
+        std::fs::write(&marked, format!("{PLUGIN_MARKER}\nold body")).unwrap();
+
+        assert!(PLUGIN_SOURCE.starts_with(PLUGIN_MARKER));
+        remove_opencode_plugin().unwrap();
+        assert!(user_file.exists(), "user's own hcom.ts must survive");
+        assert!(!legacy.exists());
+        assert!(!marked.exists());
     }
 
     // ── Transcript path ──
