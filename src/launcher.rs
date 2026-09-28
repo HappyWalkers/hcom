@@ -649,7 +649,23 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             }
             Ok(())
         }
-        LaunchTool::Cursor => unreachable!("Cursor uses per-run hooks"),
+        LaunchTool::Cursor => {
+            if crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions) {
+                return Ok(());
+            }
+            if let Err(e) = crate::hooks::cursor::try_setup_cursor_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[("hooks_path", crate::hooks::cursor::get_cursor_hooks_path())],
+                );
+                bail!(
+                    "Failed to setup Cursor hooks: {e}\n\
+                     Run: hcom hooks add cursor\n\
+                     {diag}"
+                );
+            }
+            Ok(())
+        }
         LaunchTool::Kimi => {
             if crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions) {
                 return Ok(());

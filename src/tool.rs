@@ -95,7 +95,9 @@ impl Tool {
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
-            Tool::Cursor => true,
+            Tool::Cursor => {
+                crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
+            }
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
             Tool::Copilot => true,
             Tool::Pi | Tool::Omp => true,
@@ -118,7 +120,8 @@ impl Tool {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
             }
-            Tool::Cursor => Ok(()),
+            Tool::Cursor => crate::hooks::cursor::try_setup_cursor_hooks(include_permissions)
+                .map_err(|e| e.to_string()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
             Tool::Copilot => Ok(()),

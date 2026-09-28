@@ -108,12 +108,13 @@ pub fn adapter(tool: Tool) -> Option<&'static PerRunAdapter> {
         Tool::Claude => Some(&crate::hooks::claude::PER_RUN),
         Tool::Codex => Some(&crate::hooks::codex::PER_RUN),
         Tool::Copilot => Some(&crate::hooks::copilot::PER_RUN),
-        Tool::Cursor => Some(&crate::hooks::cursor::PER_RUN),
         Tool::Pi => Some(&crate::hooks::pi::PER_RUN),
         Tool::Omp => Some(&crate::hooks::omp::PER_RUN),
         Tool::OpenCode => Some(&crate::hooks::opencode::OPENCODE_PER_RUN),
         Tool::Kilo => Some(&crate::hooks::opencode::KILO_PER_RUN),
-        Tool::Gemini | Tool::Kimi | Tool::Antigravity | Tool::Adhoc => None,
+        // Cursor stays persistent: cursor-agent loads --plugin-dir hooks
+        // asynchronously and beforeSubmitPrompt/stop often never fire from them.
+        Tool::Cursor | Tool::Gemini | Tool::Kimi | Tool::Antigravity | Tool::Adhoc => None,
     }
 }
 
