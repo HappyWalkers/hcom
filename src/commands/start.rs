@@ -698,11 +698,6 @@ fn start_bare(
         .map(|name| identity::resolve_display_name(db, name).unwrap_or_else(|| name.to_string()));
     let explicit_name = explicit_name.as_deref();
 
-    // Skip vanilla detection if --name is provided with an existing instance
-    let has_valid_identity = explicit_name
-        .and_then(|n| db.get_instance_full(n).ok().flatten())
-        .is_some();
-
     let vanilla_session_id = resolve_vanilla_session_id(ctx);
     // A direct per-run tool has no hooks, but its native ID can still make a
     // repeated manual `hcom start` return the same adhoc identity.
@@ -712,39 +707,6 @@ fn start_bare(
     .then(|| resolve_native_session_id(ctx))
     .flatten();
     let session_id = vanilla_session_id.as_ref().or(adhoc_session_id.as_ref());
-    // Only native session identity supports hooks in a manually started tool.
-    // Other manual starts use ordinary adhoc participation.
-    if !has_valid_identity && !ctx.is_launched && vanilla_session_id.is_some() {
-        let vanilla_tool = ctx.tool;
-        if !vanilla_tool.hooks().is_empty() && !vanilla_tool.verify_hooks_installed(false) {
-            println!("Installing {} hooks...", vanilla_tool.as_str());
-            let include_perms = crate::config::load_config_snapshot().core.auto_approve;
-            match vanilla_tool.try_setup_hooks(include_perms) {
-                Ok(()) => {
-                    println!(
-                        "\nRestart {} to enable automatic message delivery.",
-                        vanilla_tool.spec().label
-                    );
-                    println!("Then run: hcom start");
-                }
-                Err(error) if error.is_empty() => {
-                    eprintln!(
-                        "Failed to install hooks. Run: hcom hooks add {}",
-                        vanilla_tool.as_str()
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Failed to install {} hooks: {error}\nRun: hcom hooks add {}",
-                        vanilla_tool.as_str(),
-                        vanilla_tool.as_str()
-                    );
-                }
-            }
-            return Ok(1);
-        }
-    }
-
     let tool = if ctx.process_id.is_some() || vanilla_session_id.is_some() {
         ctx.tool.as_str()
     } else {

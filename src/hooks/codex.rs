@@ -899,11 +899,6 @@ pub fn get_codex_hooks_path() -> PathBuf {
     codex_hooks_path_at(&codex_config_dir())
 }
 
-/// Get path to Codex execpolicy rules directory.
-pub fn get_codex_rules_path() -> PathBuf {
-    codex_rules_path_at(&codex_config_dir())
-}
-
 fn codex_config_path_at(codex_home: &Path) -> PathBuf {
     codex_home.join("config.toml")
 }

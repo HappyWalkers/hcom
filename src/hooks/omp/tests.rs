@@ -840,3 +840,18 @@ fn remove_and_cleanup_cover_project_local_legacy_install() {
     remove_omp_plugin().unwrap();
     assert!(!legacy.exists());
 }
+
+#[test]
+fn strip_leaves_prompt_text_after_separator() {
+    with_isolated_omp_env(|_| {
+        let mut args: Vec<String> = vec![
+            "-e".into(),
+            "/old/extensions/hcom.ts".into(),
+            "--".into(),
+            "-e".into(),
+            "/old/extensions/hcom.ts".into(),
+        ];
+        strip_managed_extension_args(&mut args);
+        assert_eq!(args, vec!["--", "-e", "/old/extensions/hcom.ts"]);
+    });
+}

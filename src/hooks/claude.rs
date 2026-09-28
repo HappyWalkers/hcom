@@ -2833,12 +2833,6 @@ pub fn get_claude_settings_path() -> PathBuf {
     claude_config_dir().join("settings.json")
 }
 
-/// Load and parse Claude settings.json. Returns None on error or missing file.
-pub fn load_claude_settings(settings_path: &Path) -> Option<Value> {
-    let content = std::fs::read_to_string(settings_path).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
 /// Build a hook command that silently exits 0 when hcom is not installed.
 ///
 /// Claude already executes hook commands through a shell, so this command keeps

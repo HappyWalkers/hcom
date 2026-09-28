@@ -139,8 +139,13 @@ pub fn strip_managed_extension_args(args: &mut Vec<String>) {
     let mut i = 0;
     while i < args.len() {
         let tok = args[i].as_str();
+        // Everything after `--` is prompt text, not flags.
+        if tok == "--" {
+            out.extend_from_slice(&args[i..]);
+            break;
+        }
         // Two-token forms: `-e PATH` / `--extension PATH`.
-        if (tok == "-e" || tok == "--extension") && i + 1 < args.len() {
+        if (tok == "-e" || tok == "--extension") && i + 1 < args.len() && args[i + 1] != "--" {
             if is_managed(&args[i + 1]) {
                 i += 2;
                 continue;
