@@ -87,10 +87,7 @@ impl Tool {
             Tool::Gemini => {
                 crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
             }
-            Tool::Codex => {
-                crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                    && crate::hooks::codex::codex_current_feature_enabled()
-            }
+            Tool::Codex => true,
             Tool::OpenCode | Tool::Kilo => true,
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
@@ -113,8 +110,7 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Codex => crate::hooks::codex::try_setup_codex_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
+            Tool::Codex => Ok(()),
             Tool::OpenCode | Tool::Kilo => Ok(()),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
