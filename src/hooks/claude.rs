@@ -132,7 +132,10 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     let ctx = HcomContext::from_os();
     let mut payload = HookPayload::from_claude(raw);
 
-    if !common::hook_gate_check(&ctx, &db) {
+    // Per-run hooks only load in hcom launches, which always set
+    // HCOM_PROCESS_ID. Anything else (a leftover global hook, a manual run) is
+    // not an hcom participant: stay silent.
+    if ctx.process_id.is_none() {
         return 0;
     }
 
@@ -841,7 +844,7 @@ fn handle_sessionstart(
     let transcript_path = transcript_path.unwrap_or("");
     let evidence = match common::load_claude_identity_evidence(
         db,
-        Some(process_id),
+        process_id,
         session_id,
         transcript_path,
         |evidence| {
@@ -4474,8 +4477,15 @@ mod tests {
     // through the global `Config`; without isolation that would touch the
     // real `~/.hcom` of whatever machine runs the test.
 
+    /// Hook context of an hcom-launched Claude (per-run hooks always carry
+    /// HCOM_PROCESS_ID). The process is unbound, so identity comes from the
+    /// session binding each test sets up.
     fn make_ctx() -> HcomContext {
-        HcomContext::from_env(&std::collections::HashMap::new(), PathBuf::from("/tmp"))
+        let env = std::collections::HashMap::from([(
+            "HCOM_PROCESS_ID".to_string(),
+            "process-test".to_string(),
+        )]);
+        HcomContext::from_env(&env, PathBuf::from("/tmp"))
     }
 
     fn make_isolated_test_db() -> (tempfile::TempDir, EnvGuard, HcomDb) {
