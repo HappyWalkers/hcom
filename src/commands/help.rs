@@ -191,13 +191,13 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched, automatic delivery",
     ),
     (
         "",
-        "[CLAUDE*]                             hcom-launched, hooks not bound yet",
+        "[CLAUDE*]   hooks or process not bound (starting up, or lost); see: list <name>",
     ),
-    ("", "[AD-HOC]                              manual polling"),
+    ("", "[AD-HOC]    no hooks, checks messages manually"),
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
