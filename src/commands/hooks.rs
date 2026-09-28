@@ -278,13 +278,13 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
              Usage:\n  \
              hcom hooks                  Show hook status for all tools\n  \
              hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks ({options})\n  \
+             hcom hooks add [tool]       Add persistent hooks ({options})\n  \
              hcom hooks remove [tool]    Remove hooks ({options})\n\n\
              Examples:\n  \
-             hcom hooks add claude       Add Claude Code hooks only\n  \
+             hcom hooks add gemini       Add Gemini hooks\n  \
              hcom hooks add              Auto-detect tool or add all\n  \
              hcom hooks remove all       Remove all hooks\n\n\
-             After adding, restart the tool to activate hooks."
+             Restart a persistent tool after adding its hooks."
         );
         return 0;
     }

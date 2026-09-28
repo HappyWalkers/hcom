@@ -107,7 +107,7 @@ Hooks record activity to a local SQLite database and deliver messages from it.
 agent → hooks → db → hooks → other agent
 ```
 
-Hooks go into config dirs under `~/` (or `HCOM_DIR`) on first run. If you aren't using hcom, the hooks do nothing.
+Hooks only load when the tool is launched with `hcom` in front. Normal usage is unaffected.
 
 Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
