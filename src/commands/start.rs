@@ -545,7 +545,7 @@ fn start_rebind(
         &target_name,
         tool,
         false,
-        false,
+        ctx.is_launched,
         &ctx.notes,
         &hcom_config.tag,
         relay::is_relay_enabled(&hcom_config),

@@ -387,13 +387,14 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
         }
     }
 
+    // The metadata only names extra stale keys, and hcom deletes it below, so
+    // an unparseable one is treated as empty rather than blocking the launch.
     let mut recorded_keys = HashSet::new();
     match std::fs::read_to_string(&metadata_path) {
         Ok(source) => {
-            let metadata: DocumentMut = source
-                .parse()
-                .with_context(|| format!("Malformed {}", metadata_path.display()))?;
-            if let Some(state) = metadata.get("state").and_then(Item::as_table_like) {
+            if let Ok(metadata) = source.parse::<DocumentMut>()
+                && let Some(state) = metadata.get("state").and_then(Item::as_table_like)
+            {
                 recorded_keys.extend(state.iter().map(|(key, _)| key.to_string()));
             }
         }
@@ -1587,6 +1588,15 @@ mod tests {
             cleaned["hooks"]["Stop"][0]["hooks"][0]["command"],
             "user-stop"
         );
+    }
+
+    #[test]
+    fn per_run_cleanup_discards_malformed_trust_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata_path = dir.path().join(HCOM_HOOK_TRUST_METADATA_FILE);
+        std::fs::write(&metadata_path, "[broken").unwrap();
+        cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+        assert!(!metadata_path.exists());
     }
 
     #[test]
