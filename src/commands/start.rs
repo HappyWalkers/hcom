@@ -664,6 +664,10 @@ fn resolve_vanilla_session_id(ctx: &HcomContext) -> Option<String> {
     if ctx.process_id.is_none() && crate::hooks::runtime::is_per_run(ctx.tool) {
         return None;
     }
+    resolve_native_session_id(ctx)
+}
+
+fn resolve_native_session_id(ctx: &HcomContext) -> Option<String> {
     match ctx.tool {
         crate::tool::Tool::Claude => resolve_claude_session_id(&ctx.raw_env),
         crate::tool::Tool::Codex => ctx.codex_thread_id.clone(),
@@ -688,6 +692,14 @@ fn start_bare(
         .is_some();
 
     let vanilla_session_id = resolve_vanilla_session_id(ctx);
+    // A direct per-run tool has no hooks, but its native ID can still make a
+    // repeated manual `hcom start` return the same adhoc identity.
+    let adhoc_session_id = (!ctx.is_launched
+        && ctx.process_id.is_none()
+        && crate::hooks::runtime::is_per_run(ctx.tool))
+    .then(|| resolve_native_session_id(ctx))
+    .flatten();
+    let session_id = vanilla_session_id.as_ref().or(adhoc_session_id.as_ref());
     // Only native session identity supports hooks in a manually started tool.
     // Other manual starts use ordinary adhoc participation.
     if !has_valid_identity && !ctx.is_launched && vanilla_session_id.is_some() {
@@ -728,13 +740,13 @@ fn start_bare(
     };
 
     if explicit_name.is_none()
-        && let Some(ref session_id) = vanilla_session_id
+        && let Some(session_id) = session_id
         && let Some(bound_name) = db.get_session_binding(session_id)?
     {
         // Only hcom writes session bindings, so a row keyed by this session's
         // own id is trusted identity evidence. Heal bindings created by older
         // versions before returning the existing row.
-        if ctx.tool == crate::tool::Tool::Claude {
+        if vanilla_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
             db.mark_claude_session_validated(session_id, &bound_name)?;
         }
         println!("hcom already started for {bound_name}");
@@ -808,7 +820,7 @@ fn start_bare(
     instance_binding::initialize_instance_in_position_file(
         db,
         &name,
-        vanilla_session_id.as_deref(),
+        session_id.map(String::as_str),
         None, // parent_session_id
         None, // parent_name
         None, // agent_id
@@ -822,9 +834,9 @@ fn start_bare(
         None,  // cwd_override
     );
 
-    if let Some(ref session_id) = vanilla_session_id {
+    if let Some(session_id) = session_id {
         db.set_session_binding(session_id, &name)?;
-        if ctx.tool == crate::tool::Tool::Claude {
+        if vanilla_session_id.is_some() && ctx.tool == crate::tool::Tool::Claude {
             db.mark_claude_session_validated(session_id, &name)?;
         }
     }
@@ -1072,19 +1084,39 @@ mod tests {
         let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
 
-        // Claude is per-run: a direct `claude` run has no hcom hooks, so its
-        // native session id is not bound and no global hooks are installed.
+        // Claude is per-run: a direct `claude` run joins as adhoc without
+        // installing hooks, and its native ID deduplicates manual starts.
         let ctx = make_claude_ctx(
             Some(("CLAUDE_CODE_SESSION_ID", "sess-plain")),
             "/tmp/project",
         );
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
 
-        assert_eq!(db.get_session_binding("sess-plain").unwrap(), None);
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let rows = db.iter_instances_full().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tool, "adhoc");
+        assert_eq!(rows[0].session_id.as_deref(), Some("sess-plain"));
+        assert_eq!(
+            db.get_session_binding("sess-plain").unwrap(),
+            Some(rows[0].name.clone())
+        );
         assert!(!home.join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn test_plain_codex_start_reuses_adhoc_identity() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = HcomDb::open().unwrap();
+        let env = HashMap::from([("CODEX_THREAD_ID".to_string(), "thread-plain".to_string())]);
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
+        let rows = db.iter_instances_full().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "adhoc");
+        assert_eq!(rows[0].session_id.as_deref(), Some("thread-plain"));
     }
 
     #[test]
@@ -1169,26 +1201,6 @@ mod tests {
             Some("luna")
         );
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
-    }
-
-    #[test]
-    #[serial]
-    fn test_plain_codex_start_joins_adhoc_without_installing_hooks() {
-        let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = HcomDb::open().unwrap();
-
-        let env = HashMap::from([
-            ("CODEX_SANDBOX".to_string(), "1".to_string()),
-            ("CODEX_SESSION_ID".to_string(), "sess-plain".to_string()),
-        ]);
-        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp/project"));
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-
-        assert_eq!(db.get_session_binding("sess-plain").unwrap(), None);
-        let rows = db.iter_instances_full().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tool, "adhoc");
-        assert!(!home.join(".codex").join("hooks.json").exists());
     }
 
     #[test]
