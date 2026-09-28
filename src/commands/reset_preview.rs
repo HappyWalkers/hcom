@@ -1,4 +1,6 @@
 use crate::db::HcomDb;
+use crate::paths::{ARCHIVE_DIR, hcom_path};
+use crate::shared::platform::shorten_path;
 
 use super::reset::ResetTarget;
 
@@ -101,12 +103,12 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
          \u{2022} {event_count} events in database\n\n\
          Actions:\n  \
          1. Stop all {instance_count} local instances (kills processes, logs snapshots)\n  \
-         2. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
+         2. Archive database to {archive}/session-<timestamp>/\n  \
          3. Delete database (hcom.db)\n  \
          4. Remove hooks and legacy installs ({hook_labels})\n  \
          5. Archive and delete config.toml + env\n  \
          6. Clear device identity (new UUID on next relay)\n  \
-         7. Delete per-run hook files (~/.hcom/integrations/)\n\n\
+         7. Delete per-run hook files ({integrations}/)\n\n\
          Add --go flag and run again to proceed:\n  \
          {hcom_cmd} --go reset all\n",
         instance_count = state.instance_count,
@@ -114,6 +116,8 @@ fn render_reset_all_preview(state: &ResetPreviewState) -> String {
         names_display = state.names_display,
         event_count = state.event_count,
         hook_labels = hook_tool_labels("/"),
+        archive = archive_display(),
+        integrations = shorten_path(&crate::hooks::runtime::integrations_dir().to_string_lossy()),
     )
 }
 
@@ -126,7 +130,7 @@ fn render_reset_preview(state: &ResetPreviewState) -> String {
          \u{2022} {instance_count} instance{plural}: {names_display}\n  \
          \u{2022} {event_count} events in database\n\n\
          Actions:\n  \
-         1. Archive database to ~/.hcom/archive/session-<timestamp>/\n  \
+         1. Archive database to {archive}/session-<timestamp>/\n  \
          2. Delete database (hcom.db, hcom.db-wal, hcom.db-shm)\n  \
          3. Log reset event to fresh database\n  \
          4. Sync with relay (push reset, pull fresh state)\n\n\
@@ -138,7 +142,12 @@ fn render_reset_preview(state: &ResetPreviewState) -> String {
         plural = state.plural,
         names_display = state.names_display,
         event_count = state.event_count,
+        archive = archive_display(),
     )
+}
+
+fn archive_display() -> String {
+    shorten_path(&hcom_path(&[ARCHIVE_DIR]).to_string_lossy())
 }
 
 /// Print reset preview for AI tools (shows what will be destroyed).

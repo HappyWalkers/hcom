@@ -344,7 +344,8 @@ fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
 }
 
 /// Remove a legacy install: hcom's handlers in hooks.json, the config.toml
-/// `hooks.state` entries that trusted them, and the trust metadata file.
+/// `hooks.state` entries that trusted them, a pre-hooks `codex-notify`
+/// callback, and the trust metadata file.
 /// hcom never declared hooks in config.toml, so its hook tables are left alone.
 /// State keys are removed only when they named an hcom handler position or are
 /// recorded in the metadata; a user's own hooks in the same file keep their trust.
@@ -451,6 +452,11 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
                 }
                 changed = !stale.is_empty() || !renames.is_empty();
             }
+            // Pre-hooks hcom installed a `codex-notify` callback; leave unrelated notify alone.
+            if config.get("notify").is_some_and(is_hcom_legacy_notify) {
+                config.remove("notify");
+                changed = true;
+            }
             if changed {
                 paths::atomic_write_io(&config_path, &config.to_string())
                     .with_context(|| LegacyFile::write(&config_path, fix_config.clone()))?;
@@ -480,6 +486,23 @@ fn cleanup_codex_hooks_in_dir(home: &Path) -> AnyResult<()> {
             })
         }
         _ => Ok(()),
+    }
+}
+
+fn is_hcom_legacy_notify(item: &Item) -> bool {
+    match item {
+        Item::Value(v) => {
+            if let Some(s) = v.as_str() {
+                return s.contains("hcom") && s.contains("codex-notify");
+            }
+            if let Some(arr) = v.as_array() {
+                let values: Vec<&str> = arr.iter().filter_map(|entry| entry.as_str()).collect();
+                return values.iter().any(|s| s.contains("hcom"))
+                    && values.iter().any(|s| s.contains("codex-notify"));
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -1600,6 +1623,30 @@ mod tests {
             cleaned["hooks"]["Stop"][0]["hooks"][0]["command"],
             "user-stop"
         );
+    }
+
+    #[test]
+    fn per_run_cleanup_removes_only_hcom_legacy_notify() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        for (notify, removed) in [
+            (
+                "notify = \"hcom internal codex-notify --name luna\"\n",
+                true,
+            ),
+            (
+                "notify = [\"hcom\", \"internal\", \"codex-notify\"]\n",
+                true,
+            ),
+            ("notify = \"some-other-notify-tool\"\n", false),
+            ("notify = \"other-tool codex-notify\"\n", false),
+        ] {
+            std::fs::write(&config_path, format!("model = 'gpt-5'\n{notify}")).unwrap();
+            cleanup_codex_hooks_in_dir(dir.path()).unwrap();
+            let source = std::fs::read_to_string(&config_path).unwrap();
+            assert_eq!(!source.contains("notify"), removed, "{notify}: {source}");
+            assert!(source.contains("model = 'gpt-5'"), "{source}");
+        }
     }
 
     #[test]

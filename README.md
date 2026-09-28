@@ -107,7 +107,7 @@ Hooks record activity to a local SQLite database and deliver messages from it.
 agent → hooks → db → hooks → other agent
 ```
 
-Hooks only load when the tool is launched with `hcom` in front. Normal usage is unaffected.
+Hooks activate only when an agent is launched with `hcom` in front. Normal usage is unaffected.
 
 Any other AI tool without hooks can join by running `hcom start`. Any process can wake agents with `hcom send`.
 
