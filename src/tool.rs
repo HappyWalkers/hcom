@@ -73,22 +73,25 @@ impl Tool {
     // helpers so new tools only need a hooks module + a spec + a match arm,
     // not a fresh parallel block per dispatch site.
     //
-    // Setup/installation error detail (codex hook-trust fallback, claude
-    // diagnostic context, etc.) intentionally stays in `launcher::ensure_hooks_installed`
-    // — those error shapes vary per tool and aren't suitable for a uniform trait.
+    // Setup/installation error detail for persistent tools intentionally stays
+    // in `launcher::ensure_hooks_installed`; per-run tools report through
+    // `hooks::runtime::plan`.
 
     /// Verify hooks are installed for this tool. `include_permissions` controls
     /// whether the auto-approve permission block is also checked.
     pub fn verify_hooks_installed(&self, include_permissions: bool) -> bool {
         match self {
-            Tool::Claude => {
-                crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
-            }
             Tool::Gemini => {
                 crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions)
             }
-            Tool::Codex => true,
-            Tool::OpenCode | Tool::Kilo => true,
+            // Per-run tools: every hcom launch loads hooks; nothing to install.
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => true,
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
@@ -96,8 +99,6 @@ impl Tool {
                 crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions)
             }
             Tool::Kimi => crate::hooks::kimi::verify_kimi_hooks_installed(include_permissions),
-            Tool::Copilot => true,
-            Tool::Pi | Tool::Omp => true,
             Tool::Adhoc => false,
         }
     }
@@ -106,12 +107,16 @@ impl Tool {
     /// `Tool::Adhoc` always errors — adhoc has no hook surface.
     pub fn try_setup_hooks(&self, include_permissions: bool) -> Result<(), String> {
         match self {
-            Tool::Claude => crate::hooks::claude::try_setup_claude_hooks(include_permissions)
-                .map_err(|e| e.to_string()),
             Tool::Gemini => crate::hooks::gemini::try_setup_gemini_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Codex => Ok(()),
-            Tool::OpenCode | Tool::Kilo => Ok(()),
+            // Per-run tools (`hooks::runtime`) have nothing to install.
+            Tool::Claude
+            | Tool::Codex
+            | Tool::Copilot
+            | Tool::Pi
+            | Tool::Omp
+            | Tool::OpenCode
+            | Tool::Kilo => Ok(()),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -120,8 +125,6 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Kimi => crate::hooks::kimi::try_setup_kimi_hooks(include_permissions)
                 .map_err(|e| e.to_string()),
-            Tool::Copilot => Ok(()),
-            Tool::Pi | Tool::Omp => Ok(()),
             Tool::Adhoc => Err("Adhoc has no hooks to install".to_string()),
         }
     }
@@ -149,7 +152,7 @@ impl Tool {
                 .map_err(|e| e.to_string()),
             Tool::Omp => crate::hooks::omp::remove_omp_plugin()
                 .map(|_| true)
-                .map_err(|e| e.to_string()),
+                .map_err(|e| format!("{e:#}")),
             Tool::Adhoc => Ok(false),
         }
     }

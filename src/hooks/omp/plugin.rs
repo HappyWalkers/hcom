@@ -10,6 +10,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
     managed_value_flags: &["-e", "--extension"],
+    strip_legacy_args: Some(strip_managed_extension_args),
 };
 
 pub fn get_omp_plugin_path() -> std::path::PathBuf {
@@ -81,12 +82,28 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
-fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let path = effective_plugin_path(ctx);
-    if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
-        std::fs::remove_file(&path).with_context(|| format!("Cannot remove {}", path.display()))?;
+/// Under a project-local HCOM_DIR the old installer wrote to
+/// `<tool root>/.omp/extensions/` instead of the agent dir.
+fn project_local_legacy_path() -> Option<std::path::PathBuf> {
+    let root = crate::runtime_env::tool_config_root();
+    let home = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default());
+    (root != home).then(|| root.join(".omp").join("extensions").join(PLUGIN_FILENAME))
+}
+
+fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {
+    for path in paths {
+        if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Cannot remove {}", path.display()))?;
+        }
     }
     Ok(())
+}
+
+fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
+    remove_owned(std::iter::once(effective_plugin_path(ctx)).chain(project_local_legacy_path()))
 }
 
 /// Remove hcom's managed OMP extension injection (`-e <hcom.ts>` /
@@ -164,10 +181,6 @@ pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
     })
 }
 
-pub fn remove_omp_plugin() -> std::io::Result<()> {
-    let path = get_omp_plugin_path();
-    if is_hcom_owned(&path)? {
-        std::fs::remove_file(&path)?;
-    }
-    Ok(())
+pub fn remove_omp_plugin() -> Result<()> {
+    remove_owned(std::iter::once(get_omp_plugin_path()).chain(project_local_legacy_path()))
 }

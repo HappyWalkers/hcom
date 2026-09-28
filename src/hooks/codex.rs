@@ -54,6 +54,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: Some(ensure_per_run_permissions),
     managed_value_flags: &[],
+    strip_legacy_args: None,
 };
 
 fn per_run_home(ctx: &LaunchCtx) -> PathBuf {

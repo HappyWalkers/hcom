@@ -60,6 +60,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
     managed_value_flags: &["--plugin-dir"],
+    strip_legacy_args: None,
 };
 
 const COPILOT_PLUGIN_MANIFEST: &[u8] =

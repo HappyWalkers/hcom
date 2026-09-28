@@ -1717,15 +1717,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         Some(adapter) => {
             // Replayed args (resume/fork) may carry hcom-injected values from a
             // previous launch; drop them so the injection is rebuilt, not doubled.
-            crate::hooks::runtime::strip_managed_flag_values(
-                &mut params.args,
-                adapter.managed_value_flags,
-            );
+            crate::hooks::runtime::strip_replayed_args(adapter, &mut params.args);
             if let Some(persisted) = params.persisted_args.as_mut() {
-                crate::hooks::runtime::strip_managed_flag_values(
-                    persisted,
-                    adapter.managed_value_flags,
-                );
+                crate::hooks::runtime::strip_replayed_args(adapter, persisted);
             }
             let ctx = crate::hooks::runtime::LaunchCtx {
                 tool: normalized.tool(),

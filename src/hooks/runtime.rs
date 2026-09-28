@@ -100,6 +100,10 @@ pub struct PerRunAdapter {
     /// `--settings`, …). Replayed args drop values that are hcom runtime
     /// artifacts ([`is_hcom_runtime_path`]) before the injection is rebuilt.
     pub managed_value_flags: &'static [&'static str],
+    /// Extra replay cleanup for values older hcom versions injected outside
+    /// `<HCOM_DIR>/integrations/` (e.g. OMP's `-e ~/.omp/agent/extensions/hcom.ts`).
+    /// Legacy cleanup deletes those files, so replaying them would fail startup.
+    pub strip_legacy_args: Option<fn(&mut Vec<String>)>,
 }
 
 /// The per-run adapter for `tool`, or `None` for tools on the persistent path.
@@ -432,9 +436,13 @@ pub fn take_flag_values(args: &mut Vec<String>, flags: &[&str]) -> Vec<String> {
     remove_flag_values(args, flags, |_| true)
 }
 
-/// Drop occurrences of `flags` whose value is an hcom runtime artifact.
-pub fn strip_managed_flag_values(args: &mut Vec<String>, flags: &[&str]) {
-    strip_flag_values_where(args, flags, is_hcom_runtime_path);
+/// Drop hcom-injected values (runtime artifacts, and legacy managed paths the
+/// adapter recognises) from replayed args so the injection is rebuilt, not doubled.
+pub fn strip_replayed_args(adapter: &PerRunAdapter, args: &mut Vec<String>) {
+    strip_flag_values_where(args, adapter.managed_value_flags, is_hcom_runtime_path);
+    if let Some(strip_legacy) = adapter.strip_legacy_args {
+        strip_legacy(args);
+    }
 }
 
 fn strip_flag_values_where(args: &mut Vec<String>, flags: &[&str], managed: impl Fn(&str) -> bool) {
@@ -625,6 +633,7 @@ mod tests {
             cleanup_legacy: cleanup,
             ensure_permissions: Some(permissions),
             managed_value_flags: &[],
+            strip_legacy_args: None,
         };
         let mut ctx = LaunchCtx::ambient(Tool::Claude, false);
         ctx.args = sv(&["--", "hi"]);
@@ -665,6 +674,7 @@ mod tests {
             cleanup_legacy: cleanup,
             ensure_permissions: Some(permissions),
             managed_value_flags: &[],
+            strip_legacy_args: None,
         };
         let err = format!("{:#}", plan(&adapter, &ctx).unwrap_err());
         assert!(err.contains("bad caller --settings"), "{err}");
@@ -675,6 +685,7 @@ mod tests {
             cleanup_legacy: bad_cleanup,
             ensure_permissions: Some(permissions),
             managed_value_flags: &[],
+            strip_legacy_args: None,
         };
         let err = format!("{:#}", plan(&adapter, &ctx).unwrap_err());
         assert!(err.contains("hcom hooks remove codex"), "{err}");

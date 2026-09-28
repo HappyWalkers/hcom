@@ -15,10 +15,11 @@
 //! startup, so they run as a plain unlaunched session.
 //!
 //! Supported: any cross-tool child, and same-tool Codex and Gemini children.
-//! Pi, Omp, OpenCode, and Kilo use per-run hooks, so plain same-tool children do
-//! not load hcom. Kimi and Antigravity still lack same-tool detection. Same-tool
-//! Claude children were already safe because Claude hooks bind by session;
-//! Cursor and Copilot use per-run integrations too.
+//! Per-run tools (Claude, Codex, Copilot, Pi, Omp, OpenCode, Kilo; see
+//! `hooks::runtime`) load hcom only through launch args or env, so a plain
+//! same-tool child doesn't load hcom at all (OpenCode's inherited env var is
+//! made inert by the plugin's owner-PID guard). Persistent Cursor, Kimi and
+//! Antigravity still lack same-tool detection.
 
 use std::collections::HashMap;
 

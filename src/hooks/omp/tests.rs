@@ -802,3 +802,41 @@ fn remove_preserves_non_hcom_file() {
         assert!(path.exists(), "non-hcom file must not be removed");
     });
 }
+
+#[test]
+fn replayed_legacy_extension_arg_is_stripped_before_injection() {
+    with_isolated_omp_env(|_| {
+        // Older hcom baked `-e ~/.omp/agent/extensions/hcom.ts` into stored
+        // args; legacy cleanup deletes that file, so replaying it would fail.
+        let mut args: Vec<String> = vec![
+            "-e".into(),
+            "/old/home/.omp/agent/extensions/hcom.ts".into(),
+            "-e".into(),
+            "/home/u/mine.ts".into(),
+        ];
+        crate::hooks::runtime::strip_replayed_args(&PER_RUN, &mut args);
+        assert_eq!(args, vec!["-e".to_string(), "/home/u/mine.ts".to_string()]);
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn remove_and_cleanup_cover_project_local_legacy_install() {
+    let (_dir, _hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    let project = home.join("project");
+    unsafe {
+        std::env::remove_var("PI_CODING_AGENT_DIR");
+        std::env::set_var("HCOM_DIR", project.join(".hcom"));
+    }
+    let legacy = project.join(".omp").join("extensions").join("hcom.ts");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, PLUGIN_SOURCE).unwrap();
+
+    let ctx = crate::hooks::runtime::LaunchCtx::ambient(crate::tool::Tool::Omp, false);
+    (PER_RUN.cleanup_legacy)(&ctx).unwrap();
+    assert!(!legacy.exists());
+
+    std::fs::write(&legacy, PLUGIN_SOURCE).unwrap();
+    remove_omp_plugin().unwrap();
+    assert!(!legacy.exists());
+}

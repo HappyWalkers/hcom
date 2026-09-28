@@ -348,6 +348,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
     managed_value_flags: &["-e", "--extension"],
+    strip_legacy_args: None,
 };
 
 fn current_home_dir() -> std::path::PathBuf {
@@ -413,10 +414,19 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
+/// Legacy installs went to the launch's agent dir, or to `<tool root>/.pi/`
+/// under a project-local HCOM_DIR ([`get_pi_plugin_path`]); check both.
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let path = effective_plugin_path(ctx);
-    if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
-        std::fs::remove_file(&path).with_context(|| format!("Cannot remove {}", path.display()))?;
+    let mut paths = vec![effective_plugin_path(ctx)];
+    let installer_path = get_pi_plugin_path();
+    if !paths.contains(&installer_path) {
+        paths.push(installer_path);
+    }
+    for path in paths {
+        if is_hcom_owned(&path).with_context(|| format!("Cannot inspect {}", path.display()))? {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("Cannot remove {}", path.display()))?;
+        }
     }
     Ok(())
 }

@@ -558,6 +558,7 @@ pub static OPENCODE_PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
     managed_value_flags: &[],
+    strip_legacy_args: None,
 };
 
 pub static KILO_PER_RUN: PerRunAdapter = PerRunAdapter {
@@ -565,6 +566,7 @@ pub static KILO_PER_RUN: PerRunAdapter = PerRunAdapter {
     cleanup_legacy: cleanup_legacy_per_run,
     ensure_permissions: None,
     managed_value_flags: &[],
+    strip_legacy_args: None,
 };
 
 fn family_runtime(ctx: &LaunchCtx) -> (&'static str, &'static str) {
@@ -718,12 +720,11 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .with_context(|| format!("{env_var}.plugin must be an array"))?;
-    if !plugins
-        .iter()
-        .any(|value| value.as_str() == Some(&plugin_url))
-    {
-        plugins.push(Value::String(plugin_url));
-    }
+    // An inherited value (e.g. `hcom opencode` run from an hcom agent's shell)
+    // can carry another hcom version's plugin; two copies in one process would
+    // both claim the host, so keep only the current one.
+    plugins.retain(|value| !value.as_str().is_some_and(runtime::is_hcom_runtime_path));
+    plugins.push(Value::String(plugin_url));
     Ok(RuntimeInjection {
         args: ctx.args.clone(),
         env: vec![(env_var.to_string(), serde_json::to_string(&config)?)],
@@ -1134,6 +1135,38 @@ mod tests {
             std::path::Path::new(runtime.strip_prefix("file://").unwrap_or(runtime))
                 .starts_with(hcom.join("integrations").join("opencode"))
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_per_run_config_replaces_inherited_hcom_plugin() {
+        let (_dir, hcom, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let stale = runtime::file_url(
+            &hcom
+                .join("integrations")
+                .join("opencode")
+                .join("0ld")
+                .join("hcom.ts"),
+        );
+        let ctx = LaunchCtx {
+            tool: crate::tool::Tool::Kilo,
+            env: [(
+                "KILO_CONFIG_CONTENT".to_string(),
+                serde_json::json!({"plugin": ["mine", stale]}).to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            cwd: home,
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        let injection = (KILO_PER_RUN.prepare)(&ctx).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&injection.env[0].1).unwrap();
+        let plugins = config["plugin"].as_array().unwrap();
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0], "mine");
+        assert_ne!(plugins[1].as_str(), Some(stale.as_str()));
+        assert!(plugins[1].as_str().unwrap().contains("/integrations/kilo/"));
     }
 
     #[test]

@@ -70,16 +70,13 @@ pub fn preprocess_opencode_args(
     if let Some(ref model) = model {
         validate_model_arg(model)?;
     }
-    let remote = chosen_server(&args).is_some_and(|server| server[0] != STANDALONE_FLAG);
-    if remote && (agent.is_some() || model.is_some()) {
-        bail!("--agent/--model cannot reach a server chosen with --server on OpenCode 2");
-    }
+    reject_foreign_server(&args)?;
     for (key, value) in [(AGENT_ENV, agent), (MODEL_ENV, model)] {
         if let Some(value) = value {
             env.insert(key.to_string(), value);
         }
     }
-    let server = chosen_server(&args).unwrap_or_else(|| vec![STANDALONE_FLAG.to_string()]);
+    let server = [STANDALONE_FLAG.to_string()];
     let args = fork_session_server_side(&args, |id| fork_session(id, &server, cwd))?;
     Ok(add_standalone(&args))
 }
@@ -143,6 +140,18 @@ fn chosen_server(args: &[String]) -> Option<Vec<String>> {
             None
         }
     })
+}
+
+/// hcom's plugin comes from this launch's env (per-run), which only a server
+/// hcom starts itself can see, so `--server <url>` would run without hooks.
+fn reject_foreign_server(args: &[String]) -> Result<()> {
+    if chosen_server(args).is_some_and(|server| server[0] != STANDALONE_FLAG) {
+        bail!(
+            "--server is not supported with hcom on OpenCode 2: an existing server never \
+             loads hcom's plugin. Drop --server; hcom runs a private --standalone server."
+        );
+    }
+    Ok(())
 }
 
 /// Leaves the args alone when the user already chose a server.
@@ -291,6 +300,14 @@ mod tests {
             add_standalone(&strings(&["--model", "a/b"])),
             ["--standalone", "--model", "a/b"]
         );
+    }
+
+    #[test]
+    fn test_reject_foreign_server() {
+        assert!(reject_foreign_server(&strings(&["--server", "http://x"])).is_err());
+        assert!(reject_foreign_server(&strings(&["--server=http://x"])).is_err());
+        assert!(reject_foreign_server(&strings(&["--standalone"])).is_ok());
+        assert!(reject_foreign_server(&strings(&["--model", "a/b"])).is_ok());
     }
 
     #[test]
