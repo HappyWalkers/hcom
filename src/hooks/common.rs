@@ -844,7 +844,10 @@ pub(crate) fn load_claude_identity_evidence(
 
 /// Initialize instance context from hook data via binding lookup.
 ///
-/// Structured session/transcript identity wins over a conflicting process
+/// Hooks only run in hcom-launched Claude processes, but one process can
+/// switch sessions (`/resume`, `/clear`, `/branch`, `--fork-session`) while
+/// its process binding still names the previous generation's owner. So
+/// structured session/transcript identity wins over a conflicting process
 /// binding. Transcript scanning stays off the common hot path: it runs only
 /// when the session is unbound or its binding has not yet been validated.
 ///

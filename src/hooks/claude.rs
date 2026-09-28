@@ -816,11 +816,32 @@ fn handle_sessionstart(
     raw: &Value,
 ) -> (i32, String) {
     let source = raw.get("source").and_then(Value::as_str).unwrap_or("");
-    let process_id = ctx.process_id.as_deref();
+    // Per-run hooks only load in hcom launches, so both are always present;
+    // stay silent rather than guess if a payload arrives without them.
+    let Some(process_id) = ctx.process_id.as_deref() else {
+        return (0, String::new());
+    };
+    if session_id.is_empty() {
+        return (0, String::new());
+    }
+
+    // Compaction keeps the session and process, so the existing binding is
+    // enough: re-inject the bootstrap without loading lineage evidence.
+    if source == "compact"
+        && let Some(output) = handle_compact_recovery(db, ctx, session_id, process_id)
+    {
+        log::log_info(
+            "hooks",
+            "sessionstart.compact_recovery",
+            &format!("session_id={session_id} process_id={process_id}"),
+        );
+        return (0, serde_json::to_string(&output).unwrap_or_default());
+    }
+
     let transcript_path = transcript_path.unwrap_or("");
     let evidence = match common::load_claude_identity_evidence(
         db,
-        process_id,
+        Some(process_id),
         session_id,
         transcript_path,
         |evidence| {
@@ -882,20 +903,6 @@ fn handle_sessionstart(
         ),
     );
 
-    // Compaction recovery: re-inject bootstrap.
-    if source == "compact"
-        && !session_id.is_empty()
-        && let Some(output) = handle_compact_recovery(db, ctx, session_id, process_id)
-    {
-        return (0, serde_json::to_string(&output).unwrap_or_default());
-    }
-
-    // Per-run hooks only load in hcom launches, so both are always present;
-    // stay silent rather than guess if a payload arrives without them.
-    if process_id.is_none() || session_id.is_empty() {
-        return (0, String::new());
-    }
-
     // Resolve the selected owner and log vocabulary first; the mutation and
     // bootstrap workflow below is intentionally shared by cache and lineage.
     let selected_owner = if let Some(owner) = evidence.validated_session_owner.as_deref() {
@@ -920,7 +927,7 @@ fn handle_sessionstart(
                         session_id,
                         source,
                         transcript_path,
-                        process_id.unwrap_or_default(),
+                        process_id,
                         evidence.process_owner,
                         evidence.session_owner,
                         owners,
@@ -939,7 +946,7 @@ fn handle_sessionstart(
                         session_id,
                         source,
                         transcript_path,
-                        process_id.unwrap_or_default(),
+                        process_id,
                         evidence.process_owner,
                         evidence.process_session_id,
                         fresh_process_placeholder,
@@ -953,7 +960,6 @@ fn handle_sessionstart(
         None
     };
 
-    let process_id = process_id.unwrap();
     if let Some((owner, bind_failed_event, selected_event)) = selected_owner {
         if let Err(error) = bind_lineage_owner(
             db,
@@ -1088,9 +1094,8 @@ fn handle_compact_recovery(
     db: &HcomDb,
     ctx: &HcomContext,
     session_id: &str,
-    process_id: Option<&str>,
+    process_id: &str,
 ) -> Option<Value> {
-    let process_id = process_id?;
     let instance_name = db
         .get_session_binding(session_id)
         .ok()
@@ -3305,6 +3310,49 @@ mod tests {
         assert!(should_scan_sessionstart_lineage(
             false, "startup", true, false, false,
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn compact_reinjects_bootstrap_and_unlaunched_sessionstart_is_silent() {
+        crate::config::Config::init();
+        let (_dir, hcom_dir, _test_home, _guard) = isolated_test_env();
+        let db = HcomDb::open_raw(&hcom_dir.join("test.db")).unwrap();
+        db.init_db().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO instances
+                 (name, session_id, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nora', 'sess-nora', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        bind_validated_session(&db, "sess-nora", "nora");
+        db.set_process_binding("process-nora", "sess-nora", "nora")
+            .unwrap();
+        let raw = serde_json::json!({"source": "compact", "session_id": "sess-nora"});
+
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "HCOM_DIR".to_string(),
+            hcom_dir.to_string_lossy().to_string(),
+        );
+        let unlaunched = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        assert_eq!(
+            handle_sessionstart(&db, &unlaunched, "sess-nora", None, &raw),
+            (0, String::new())
+        );
+
+        env.insert("HCOM_PROCESS_ID".to_string(), "process-nora".to_string());
+        env.insert("HCOM_LAUNCHED".to_string(), "1".to_string());
+        let ctx = HcomContext::from_env(&env, PathBuf::from("/tmp"));
+        let (code, out) = handle_sessionstart(&db, &ctx, "sess-nora", None, &raw);
+        assert_eq!(code, 0);
+        let out: Value = serde_json::from_str(&out).unwrap();
+        let context = out["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("nora"), "got: {context}");
     }
 
     #[test]
