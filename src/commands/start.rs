@@ -655,7 +655,15 @@ fn resolve_claude_session_id(env: &HashMap<String, String>) -> Option<String> {
 }
 
 /// Resolve a native session id exposed to shell commands by a direct tool run.
+///
+/// A per-run tool run directly (no hcom process binding) never carries hcom
+/// hooks, so its session has nothing to bind to: it joins as adhoc, and no
+/// global hooks are installed on its behalf. `hcom <tool>` sessions keep their
+/// native id (it's how a launched session binds late).
 fn resolve_vanilla_session_id(ctx: &HcomContext) -> Option<String> {
+    if ctx.process_id.is_none() && crate::hooks::runtime::is_per_run(ctx.tool) {
+        return None;
+    }
     match ctx.tool {
         crate::tool::Tool::Claude => resolve_claude_session_id(&ctx.raw_env),
         crate::tool::Tool::Codex => ctx.codex_thread_id.clone(),
@@ -1058,47 +1066,23 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_vanilla_claude_start_reuses_claude_code_session_id() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+    fn test_plain_claude_start_joins_adhoc_without_installing_hooks() {
+        let (_dir, hcom_dir, home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
 
-        // Claude's own session id is sufficient; no SessionStart env-file
-        // round trip is required.
+        // Claude is per-run: a direct `claude` run has no hcom hooks, so its
+        // native session id is not bound and no global hooks are installed.
         let ctx = make_claude_ctx(
-            Some(("CLAUDE_CODE_SESSION_ID", "sess-claude-env")),
+            Some(("CLAUDE_CODE_SESSION_ID", "sess-plain")),
             "/tmp/project",
         );
-
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-        let name = db
-            .get_session_binding("sess-claude-env")
-            .unwrap()
-            .expect("CLAUDE_CODE_SESSION_ID must bind identity");
-        assert_eq!(
-            db.get_validated_claude_session_owner("sess-claude-env")
-                .unwrap()
-                .as_deref(),
-            Some(name.as_str()),
-            "hooks must trust the binding the CLI just created"
-        );
 
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-        assert_eq!(
-            db.get_session_binding("sess-claude-env")
-                .unwrap()
-                .as_deref(),
-            Some(name.as_str()),
-            "repeat start must return the first identity, not mint a second"
-        );
-        let claude_rows: Vec<String> = db
-            .iter_instances_full()
-            .unwrap()
-            .into_iter()
-            .filter(|row| row.tool == "claude")
-            .map(|row| row.name)
-            .collect();
-        assert_eq!(claude_rows, vec![name], "exactly one identity per session");
+        assert_eq!(db.get_session_binding("sess-plain").unwrap(), None);
+        let rows = db.iter_instances_full().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tool, "adhoc");
+        assert!(!home.join(".claude").join("settings.json").exists());
     }
 
     #[test]
@@ -1229,46 +1213,6 @@ mod tests {
                 .unwrap(),
             None,
             "repeated Codex start must not populate Claude's validation cache"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn test_vanilla_claude_rebind_binds_session_and_drops_old_identity() {
-        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
-        let db = HcomDb::open().unwrap();
-        assert!(crate::hooks::claude::setup_claude_hooks(false));
-
-        let ctx = make_claude_ctx(
-            Some(("CLAUDE_CODE_SESSION_ID", "sess-rebind")),
-            "/tmp/project",
-        );
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-        let first = db.get_session_binding("sess-rebind").unwrap().unwrap();
-
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
-        assert_eq!(
-            db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
-            "a reclaimed name must own the session that reclaimed it"
-        );
-        assert!(
-            db.get_instance_full(&first).unwrap().is_none(),
-            "the identity being replaced must not be left behind"
-        );
-        assert_eq!(
-            db.get_validated_claude_session_owner("sess-rebind")
-                .unwrap()
-                .as_deref(),
-            Some("nova"),
-            "hooks must resolve the reclaimed name, not reject the session"
-        );
-
-        assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
-        assert_eq!(
-            db.get_session_binding("sess-rebind").unwrap().as_deref(),
-            Some("nova"),
-            "a start after the rebind returns the reclaimed identity"
         );
     }
 
@@ -1436,15 +1380,10 @@ mod tests {
             assert_eq!(exit_code, 0);
 
             let inst = db.get_instance_full("nova").unwrap().unwrap();
-            assert_eq!(
-                inst.tool,
-                if session_id.is_some() {
-                    "claude"
-                } else {
-                    "adhoc"
-                }
-            );
-            assert_eq!(inst.session_id.as_deref(), session_id);
+            // A direct (per-run) Claude has no hooks: the reclaim is adhoc
+            // whether or not Claude exposed its session id.
+            assert_eq!(inst.tool, "adhoc");
+            assert_eq!(inst.session_id, None);
             assert_eq!(
                 inst.directory,
                 "/tmp/dasha-code/.worktrees/layer1-basic-conversation-fixes"
