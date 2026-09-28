@@ -352,6 +352,7 @@ fn prepare_resume_plan_from_source(
             } else {
                 load_stopped_snapshot(db, name)?
             };
+            let tool = resolve_adhoc_resume_tool(name, tool, &sid, fork)?;
             (tool, sid, largs, tag, bg, leid, snap, name.to_string())
         }
         ResumeSource::Disk {
@@ -774,6 +775,26 @@ fn should_preview_resume(
     tool_args: &[String],
 ) -> bool {
     !tool_args.is_empty() || *launch_flags != crate::commands::launch::HcomLaunchFlags::default()
+}
+
+/// A direct Claude/Codex run that joined with `hcom start` is stored as
+/// `adhoc` but keeps its native session id. Resolve the owning tool from the
+/// transcript on disk so resume/fork relaunches that session under hcom (with
+/// hooks) under the same name.
+fn resolve_adhoc_resume_tool(name: &str, tool: String, sid: &str, fork: bool) -> Result<String> {
+    if tool != "adhoc" {
+        return Ok(tool);
+    }
+    let op = if fork { "fork" } else { "resume" };
+    if sid.is_empty() {
+        bail!("'{name}' joined ad-hoc with no native session, so there is nothing to {op}");
+    }
+    match find_session_on_disk(sid) {
+        Some((tool, _)) => Ok(tool),
+        None => bail!(
+            "'{name}' joined ad-hoc from session {sid}, but no transcript for it was found, so hcom cannot tell which tool to {op}"
+        ),
+    }
 }
 
 fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
@@ -3304,6 +3325,34 @@ mod tests {
             None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
         }
         out
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn adhoc_resume_resolves_tool_from_native_session() {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let projects = cfg_dir.path().join("projects/proj");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("sid-plain.jsonl"), "{}\n").unwrap();
+
+        with_claude_config_dir(cfg_dir.path(), || {
+            assert_eq!(
+                resolve_adhoc_resume_tool("vibe", "adhoc".into(), "sid-plain", false).unwrap(),
+                "claude"
+            );
+            let err = resolve_adhoc_resume_tool("vibe", "adhoc".into(), "sid-gone", true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no transcript"), "got: {err}");
+        });
+        let err = resolve_adhoc_resume_tool("vibe", "adhoc".into(), "", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no native session"), "got: {err}");
+        assert_eq!(
+            resolve_adhoc_resume_tool("vibe", "codex".into(), "", false).unwrap(),
+            "codex"
+        );
     }
 
     #[test]

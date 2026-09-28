@@ -191,13 +191,13 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [OMP] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched, automatic delivery",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [omp] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
+        "[CLAUDE*]   hooks or process not bound (starting up, or lost); see: list <name>",
     ),
-    ("", "[AD-HOC]                              manual polling"),
+    ("", "[AD-HOC]    no hooks, checks messages manually"),
 ];
 
 const SEND_HELP: &[HelpEntry] = &[
@@ -618,20 +618,36 @@ const UPDATE_HELP: &[HelpEntry] = &[
 ];
 
 const HOOKS_HELP: &[HelpEntry] = &[
-    ("hooks", "Show hook status"),
+    ("hooks", "Show how each tool loads hcom's hooks"),
     ("hooks status", "Same as above"),
-    ("hooks add [tool]", "Add hooks ({hook_tools} | all)"),
-    ("hooks remove [tool]", "Remove hooks ({hook_tools} | all)"),
+    (
+        "hooks add [tool]",
+        "Install persistent hooks ({persistent_tools} | all)",
+    ),
+    (
+        "hooks remove [tool]",
+        "Remove hooks and legacy installs ({hook_tools} | all)",
+    ),
+    ("", ""),
+    ("", "Per-run: {per_run_tools}"),
+    (
+        "",
+        "  Hooks load only in sessions launched with `hcom <tool>`. Nothing to",
+    ),
+    (
+        "",
+        "  install; remove clears installs left by older hcom versions.",
+    ),
+    ("", "Persistent: {persistent_list}"),
+    (
+        "",
+        "  Hooks live in the tool's config. add installs them; restart the tool.",
+    ),
     ("", ""),
     (
         "",
-        "Hooks enable automatic message delivery and status tracking.",
+        "Without hooks, run `hcom start` inside any AI tool (manual delivery).",
     ),
-    (
-        "",
-        "Without hooks, use ad-hoc mode (run hcom start inside any AI tool).",
-    ),
-    ("", "Restart the tool after adding hooks to activate."),
     (
         "",
         "Remove cleans both global (~/) and HCOM_DIR-local if set.",
@@ -1076,12 +1092,23 @@ pub fn get_command_help(name: &str) -> String {
     // Hook help is derived from released hook-bearing integrations.
     if name == "hooks" {
         lines.extend(format_entries(HOOKS_HELP));
-        let tools = crate::commands::hooks::hook_tools()
-            .into_iter()
-            .map(|tool| tool.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        return lines.join("\n").replace("{hook_tools}", &tools);
+        let tools = crate::commands::hooks::hook_tools();
+        let names = |per_run: Option<bool>, sep: &str| {
+            tools
+                .iter()
+                .filter(|tool| {
+                    per_run.is_none_or(|p| crate::hooks::runtime::is_per_run(**tool) == p)
+                })
+                .map(|tool| tool.as_str())
+                .collect::<Vec<_>>()
+                .join(sep)
+        };
+        return lines
+            .join("\n")
+            .replace("{hook_tools}", &names(None, " | "))
+            .replace("{persistent_tools}", &names(Some(false), " | "))
+            .replace("{persistent_list}", &names(Some(false), ", "))
+            .replace("{per_run_tools}", &names(Some(true), ", "));
     }
 
     // Config is special: has dynamic config files hint

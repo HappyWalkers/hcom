@@ -1,3 +1,4 @@
+// hcom-managed-plugin: installed by hcom; removed automatically. Do not add this line to your own plugins.
 import type { Plugin, PluginInput } from "@opencode-ai/plugin"
 import type { Event } from "@opencode-ai/sdk"
 import { appendFileSync } from "fs"
@@ -5,6 +6,14 @@ import { homedir } from "os"
 
 const HCOM_DIR = process.env.HCOM_DIR || `${homedir()}/.hcom`
 const LOG_PATH = `${HCOM_DIR}/.tmp/logs/hcom.log`
+
+function claimPluginHost(): boolean {
+  const owner = process.env.HCOM_PLUGIN_HOST_PID
+  const current = String(process.pid)
+  if (owner && owner !== current) return false
+  process.env.HCOM_PLUGIN_HOST_PID = current
+  return true
+}
 
 type PromptModel = {
   providerID: string
@@ -106,6 +115,8 @@ function log(
 }
 
 export const HcomPlugin: Plugin = async ({ client, $ }) => {
+  if (!claimPluginHost()) return {}
+
   let hcomChecked = false
   let hcomAvailable = false
   let instanceName: string | null = null      // IDEN-03: bound instance name
@@ -709,6 +720,8 @@ function parseLaunchModel(raw: string | undefined): V2Model | undefined {
 }
 
 async function setupOpenCode2(ctx: V2Context) {
+  if (!claimPluginHost()) return async () => {}
+
   const statusBySession: Record<string, { type: string }> = {}
   const client = {
     session: {

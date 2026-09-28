@@ -45,8 +45,8 @@ pub struct HooksSpec {
     /// should resolve those names to the owner, not the borrowing tool.
     ///
     /// Antigravity borrows Gemini hook names and is identified out-of-band by
-    /// `ANTIGRAVITY_AGENT`, so `Tool::Antigravity.owns_hook("gemini-*")` must
-    /// stay false even though this spec lists Gemini's hook names.
+    /// `ANTIGRAVITY_AGENT`, so `Tool::from_hook_name("gemini-*")` must resolve
+    /// to Gemini even though this spec lists Gemini's hook names.
     pub shared_hooks_with: Option<Tool>,
     pub invocation: HookInvocation,
 }
@@ -1449,14 +1449,18 @@ mod tests {
 
     #[test]
     fn drift_released_tools_have_hook_dispatch() {
-        // Every released hook-bearing tool must round-trip through Tool's
-        // hook-ops adapter: settings_path resolves to a non-empty path and
-        // verify_hooks_installed() can be called without panicking.
+        // Every released hook-bearing tool is either per-run (it has a
+        // runtime adapter) or persistent, in which case it must round-trip
+        // through Tool's install ops: settings_path resolves to a non-empty
+        // path and verify_hooks_installed() can be called without panicking.
         // Borrowed-hooks specs (Antigravity → Gemini) are checked via their
         // owning Tool — Antigravity has its own hook module but borrows the
         // hook command names.
         for spec in ALL {
             if !spec.released || spec.hooks.names.is_empty() {
+                continue;
+            }
+            if crate::hooks::runtime::is_per_run(spec.tool) {
                 continue;
             }
             let path = spec.tool.hooks_settings_path();

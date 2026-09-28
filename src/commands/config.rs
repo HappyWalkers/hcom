@@ -1391,13 +1391,12 @@ Usage:
 
         "HCOM_TIMEOUT" => Some(
             "\
-HCOM_TIMEOUT - Advanced: idle timeout for headless/vanilla Claude (seconds)
+HCOM_TIMEOUT - Advanced: idle timeout for headless Claude (seconds)
 
 Default: 86400 (24 hours)
 
 This setting only applies to:
   - Headless Claude: hcom N claude -p
-  - Vanilla Claude: claude + hcom start
 
 Does NOT apply to:
   - Interactive PTY mode: hcom N claude (main path)
