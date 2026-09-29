@@ -1354,6 +1354,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_plain_claude_rebind_moves_session_binding_to_target() {
+        // Targets are longer than generated names (4-letter CVCV), so the
+        // bare start's random identity can never collide with them.
         let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let db = HcomDb::open().unwrap();
         let ctx = make_claude_ctx(
@@ -1364,14 +1366,14 @@ mod tests {
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         let first = db.get_session_binding("sess-plain").unwrap().unwrap();
 
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
         assert_eq!(
             db.get_session_binding("sess-plain").unwrap().as_deref(),
-            Some("nova")
+            Some("rebound")
         );
         assert!(db.get_instance_full(&first).unwrap().is_none());
-        let nova = db.get_instance_full("nova").unwrap().unwrap();
-        assert_eq!(nova.tool, "adhoc");
+        let rebound = db.get_instance_full("rebound").unwrap().unwrap();
+        assert_eq!(rebound.tool, "adhoc");
         assert_eq!(
             db.get_validated_claude_session_owner("sess-plain").unwrap(),
             None,
@@ -1380,19 +1382,25 @@ mod tests {
 
         // `--name` resolving the session through the current row keeps the
         // target adhoc too.
-        assert_eq!(start_rebind(&db, "vega", &ctx, Some("nova")).unwrap(), 0);
-        assert_eq!(db.get_instance_full("vega").unwrap().unwrap().tool, "adhoc");
+        assert_eq!(
+            start_rebind(&db, "renamed", &ctx, Some("rebound")).unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_instance_full("renamed").unwrap().unwrap().tool,
+            "adhoc"
+        );
         assert_eq!(
             db.get_validated_claude_session_owner("sess-plain").unwrap(),
             None
         );
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
 
         // A later bare start returns the rebound identity, and the adhoc
         // identity can be reclaimed again from the same plain Claude.
         assert_eq!(start_bare(&db, &hcom_dir, &ctx, None).unwrap(), 0);
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
-        assert_eq!(start_rebind(&db, "nova", &ctx, None).unwrap(), 0);
+        assert_eq!(start_rebind(&db, "rebound", &ctx, None).unwrap(), 0);
         assert_eq!(db.iter_instances_full().unwrap().len(), 1);
     }
 
