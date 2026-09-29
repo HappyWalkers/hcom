@@ -320,7 +320,16 @@ fn diagnostics_for(ctx: &DiagContext) -> String {
 impl Hcom {
     /// Build a fixture whose every writable path is below one temporary root.
     pub fn new() -> Self {
-        let root = tempfile::tempdir().expect("create temp dir");
+        // CI points HCOM_TEST_KEEP_DIR at a known path so a failed test's
+        // preserved root (see Drop) can be uploaded as an artifact; passing
+        // tests still clean up, leaving only failures behind.
+        let root = match std::env::var_os("HCOM_TEST_KEEP_DIR") {
+            Some(dir) => {
+                fs::create_dir_all(&dir).expect("create HCOM_TEST_KEEP_DIR");
+                tempfile::tempdir_in(dir).expect("create temp dir")
+            }
+            None => tempfile::tempdir().expect("create temp dir"),
+        };
         let home = root.path().join("home");
         let hcom_dir = root.path().join("hcom-state");
         let codex_home = root.path().join("codex-home");

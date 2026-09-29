@@ -319,6 +319,9 @@ impl ToolCase for ClaudeCase {
             ("DISABLE_PROMPT_CACHING", "1"),
             ("ENABLE_TOOL_SEARCH", "false"),
             ("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "1"),
+            // Debug log lands in claude-home/debug/, inside the preserved
+            // failure dir, so a stalled tool call can be traced afterwards.
+            ("DEBUG", "1"),
         ]);
     }
 
