@@ -317,13 +317,10 @@ const COPILOT_HOOKS: &[&str] = &[
 
 // ── Help examples / extra-env tables ────────────────────────────────────
 
-const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
-    ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
-    (
-        "hcom claude --model fable|opus|sonnet|haiku",
-        "Use a specific model",
-    ),
-];
+const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom claude --model fable|opus|sonnet|haiku",
+    "Flags forwarded to claude",
+)];
 const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
     "HCOM_SUBAGENT_TIMEOUT",
     "Seconds subagents keep-alive after task",
@@ -354,16 +351,17 @@ const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
     ),
 ];
 
-const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[];
+const OPENCODE_HELP_EXAMPLES: &[HelpEntry] =
+    &[("hcom opencode --agent plan", "Flags forwarded to opencode")];
 
 const KILO_HELP_EXAMPLES: &[HelpEntry] = &[(
     "hcom kilo --model kilo/kilo-auto/free",
-    "Use Kilo's free auto model",
+    "Flags forwarded to kilo",
 )];
 
-const PI_HELP_EXAMPLES: &[HelpEntry] = &[];
+const PI_HELP_EXAMPLES: &[HelpEntry] = &[("hcom pi --thinking high", "Flags forwarded to pi")];
 
-const OMP_HELP_EXAMPLES: &[HelpEntry] = &[];
+const OMP_HELP_EXAMPLES: &[HelpEntry] = &[("hcom omp --thinking high", "Flags forwarded to omp")];
 
 const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
     ("hcom antigravity", "Long-form alias"),
@@ -377,6 +375,10 @@ const CURSOR_HELP_EXAMPLES: &[HelpEntry] = &[
         "hcom cursor-agent --force",
         "Allow commands unless explicitly denied",
     ),
+    (
+        "hcom cursor-agent --plan",
+        "Flags forwarded to cursor-agent",
+    ),
 ];
 
 const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -385,6 +387,7 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
         "Auto-run routine actions; risky ones still ask",
     ),
     ("hcom kimi --auto", "Never ask for approval"),
+    ("hcom kimi --plan", "Flags forwarded to kimi"),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[

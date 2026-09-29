@@ -267,6 +267,11 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
 
     let first = argv[0].as_str();
 
+    if first == "--help" || first == "-h" {
+        crate::commands::help::print_command_help("hooks");
+        return 0;
+    }
+
     let sub_argv = argv[1..].to_vec();
 
     match first {

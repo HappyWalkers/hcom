@@ -1289,7 +1289,7 @@ fn show_all_config(db: &HcomDb, ctx: Option<&CommandContext>, json_mode: bool) -
         }
         println!(
             "{}",
-            serde_json::to_string_pretty(&Value::Object(result)).unwrap_or_default()
+            serde_json::to_string(&Value::Object(result)).unwrap_or_default()
         );
     } else {
         println!("hcom configuration ({})\n", config_path().display());

@@ -443,10 +443,6 @@ fn prepare_resume_plan_from_source(
 
     let mut merged_args = merged_cli_args.clone();
 
-    if launch_flags.headless && tool != "claude" && tool != "kimi" {
-        bail!("--headless is only supported for Claude and Kimi resume/fork launches");
-    }
-
     let launch_tool = crate::launcher::LaunchTool::from_str(&tool)?;
     let is_headless =
         launch_flags.headless || is_background_from_args(&launch_tool, &merged_args) || background;
@@ -3111,6 +3107,31 @@ mod tests {
             ..Default::default()
         };
         assert!(should_preview_resume(&flags, &[]));
+    }
+
+    #[test]
+    fn test_headless_fork_allowed_for_non_claude_tools() {
+        // Every tool runs headless via the PTY runner, so `hcom f <x> --headless`
+        // must not be gated to Claude.
+        let db = test_db();
+        for (name, tool) in [("luna", "codex"), ("nova", "opencode"), ("pira", "pi")] {
+            let mut data = serde_json::Map::new();
+            data.insert("session_id".into(), json!(format!("{tool}-session")));
+            data.insert("tool".into(), json!(tool));
+            data.insert("status".into(), json!("listening"));
+            data.insert("created_at".into(), json!(1.0));
+            db.save_instance_named(name, &data).unwrap();
+
+            let plan = prepare_resume_plan(
+                &db,
+                name,
+                true,
+                &s(&["--headless"]),
+                &GlobalFlags::default(),
+            )
+            .unwrap_or_else(|e| panic!("{tool} headless fork rejected: {e}"));
+            assert!(plan.launch.background, "{tool} fork should be headless");
+        }
     }
 
     #[test]

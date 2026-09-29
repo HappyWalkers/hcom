@@ -390,16 +390,7 @@ pub fn cmd_term(db: &HcomDb, args: &TermArgs, _ctx: Option<&CommandContext>) -> 
     let sub = argv.first().map(|s| s.as_str());
 
     if sub == Some("--help") || sub == Some("-h") {
-        println!(
-            "hcom term - Terminal admin: screen query, text injection, debug logging\n\n\
-             Usage:\n  \
-             hcom term                  Query all PTY screens\n  \
-             hcom term <name>           Query specific instance screen\n  \
-             hcom term <name> --json    JSON output\n  \
-             hcom term <name> --clean   Plain text, no header or line numbers\n  \
-             hcom term inject <name> [text] [--enter]   Inject text/enter\n  \
-             hcom term debug on|off|logs                 PTY debug logging"
-        );
+        crate::commands::help::print_command_help("term");
         return 0;
     }
 

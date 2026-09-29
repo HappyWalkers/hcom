@@ -916,7 +916,7 @@ fn cmd_transcript_timeline(db: &HcomDb, args: &TranscriptTimelineArgs) -> i32 {
     if json_mode {
         println!(
             "{}",
-            serde_json::to_string_pretty(&all_entries).unwrap_or_default()
+            serde_json::to_string(&all_entries).unwrap_or_default()
         );
         return 0;
     }
@@ -1173,7 +1173,7 @@ pub fn cmd_transcript(db: &HcomDb, args: &TranscriptArgs, ctx: Option<&CommandCo
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            serde_json::to_string(&json_output).unwrap_or_default()
         );
         return 0;
     }
@@ -1387,7 +1387,7 @@ fn render_instance_transcript_impl(
                 obj
             })
             .collect();
-        return serde_json::to_string_pretty(&json_output).map_err(|e| e.to_string());
+        return serde_json::to_string(&json_output).map_err(|e| e.to_string());
     }
 
     if filtered.is_empty() {

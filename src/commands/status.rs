@@ -337,10 +337,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                     .map(|p| p.to_string_lossy().into_owned()),
             });
         }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&result).unwrap_or_default()
-        );
+        println!("{}", serde_json::to_string(&result).unwrap_or_default());
         return 0;
     }
 

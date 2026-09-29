@@ -163,6 +163,9 @@ pub enum Action {
     Version,
     /// Show help
     Help,
+    /// `hcom help <topic...>`: print that topic's help page. Never dispatches
+    /// the target, since not every target (scripts, relay-worker) honors --help.
+    TopicHelp { args: Vec<String> },
     /// Open TUI in new terminal window
     NewTerminal,
     /// Run relay-worker process
@@ -315,6 +318,13 @@ pub fn resolve_action(argv: &[String]) -> Action {
     // Global flags as commands
     match first {
         "--help" | "-h" => return Action::Help,
+        // `hcom help [cmd...]` == `hcom [cmd...] --help`
+        "help" if argv.len() == 1 => return Action::Help,
+        "help" => {
+            return Action::TopicHelp {
+                args: argv[1..].to_vec(),
+            };
+        }
         "--version" | "-v" => return Action::Version,
         "--new-terminal" => return Action::NewTerminal,
         _ => {}
@@ -462,7 +472,35 @@ fn is_config_dev_root_invocation(argv: &[String]) -> bool {
 /// the checkout executable path instead of updating the installed binary.
 fn is_update_invocation(argv: &[String]) -> bool {
     let (positional, _, _) = extract_global_flags_full(argv);
-    positional.first().is_some_and(|arg| arg == "update")
+    match positional.as_slice() {
+        [first, ..] if first == "update" => true,
+        [first, second, ..] => first == "help" && second == "update",
+        _ => false,
+    }
+}
+
+/// Print help for `hcom help <topic...>` without running anything.
+fn print_topic_help(args: &[String]) -> i32 {
+    let (stripped, _, _) = extract_global_flags_full(args);
+    // `hcom help 3 claude` == `hcom help claude`
+    let words: Vec<String> = stripped
+        .into_iter()
+        .skip_while(|a| a.parse::<u32>().is_ok())
+        .collect();
+    let Some(name) = words.first().map(String::as_str) else {
+        crate::commands::help::print_help();
+        return 0;
+    };
+    let topic = if is_command(name) {
+        crate::commands::help::help_topic(name, &words[1..])
+    } else if is_launch_tool(name) || matches!(name, "resume" | "fork") {
+        name.to_string()
+    } else {
+        eprintln!("Error: {}", unknown_command_message(name, &words));
+        return 1;
+    };
+    crate::commands::help::print_command_help(&topic);
+    0
 }
 
 pub(crate) fn resolve_effective_dev_root(db_path: &Path) -> Option<(PathBuf, &'static str)> {
@@ -550,7 +588,11 @@ pub fn dispatch() -> anyhow::Result<()> {
     if !is_update_cmd
         && matches!(
             action,
-            Action::Command { .. } | Action::Launch { .. } | Action::Version | Action::Help
+            Action::Command { .. }
+                | Action::Launch { .. }
+                | Action::Version
+                | Action::Help
+                | Action::TopicHelp { .. }
         )
         && let Some(notice) = crate::update::get_update_notice()
     {
@@ -661,6 +703,12 @@ pub fn dispatch() -> anyhow::Result<()> {
         Action::Help => {
             crate::commands::help::print_help();
         }
+        Action::TopicHelp { ref args } => {
+            let exit_code = print_topic_help(args);
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
         Action::NewTerminal => {
             let exit_code = launch_new_terminal();
             if exit_code != 0 {
@@ -741,7 +789,8 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
     // Per-command --help: native help text
     // ("run" handles --help itself for script-level help)
     if help_requested && cmd != "run" {
-        crate::commands::help::print_command_help(cmd);
+        let topic = crate::commands::help::help_topic(cmd, stripped.get(1..).unwrap_or_default());
+        crate::commands::help::print_command_help(&topic);
         return 0;
     }
 
@@ -1055,6 +1104,7 @@ mod tests {
         assert!(is_update_invocation(&sv(&[
             "--name", "lovi", "update", "--check"
         ])));
+        assert!(is_update_invocation(&sv(&["help", "update"])));
         assert!(!is_update_invocation(&sv(&["config", "update"])));
         assert!(!is_update_invocation(&sv(&[
             "send", "@lovi", "--", "update"
@@ -1355,6 +1405,16 @@ mod tests {
     fn help_flag() {
         assert_eq!(resolve_action(&sv(&["--help"])), Action::Help);
         assert_eq!(resolve_action(&sv(&["-h"])), Action::Help);
+        assert_eq!(resolve_action(&sv(&["help"])), Action::Help);
+        assert_eq!(
+            resolve_action(&sv(&["help", "relay-worker"])),
+            Action::TopicHelp {
+                args: sv(&["relay-worker"])
+            }
+        );
+        assert_eq!(print_topic_help(&sv(&["relay-worker"])), 1);
+        assert_eq!(print_topic_help(&sv(&["events", "sub"])), 0);
+        assert_eq!(print_topic_help(&sv(&["3", "claude"])), 0);
     }
 
     #[test]

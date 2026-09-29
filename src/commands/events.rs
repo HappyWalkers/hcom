@@ -257,7 +257,25 @@ fn events_sub_list(db: &HcomDb) -> i32 {
         return 0;
     }
 
-    println!("{:<10} {:<12} {:<10} FILTER", "ID", "FOR", "MODE");
+    let id_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("id").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(2)
+        .max(10);
+    let caller_width = subs
+        .iter()
+        .filter_map(|sub| sub.get("caller").and_then(|v| v.as_str()))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(3)
+        .max(12);
+
+    println!(
+        "{:<id_width$} {:<caller_width$} {:<10} FILTER",
+        "ID", "FOR", "MODE"
+    );
     for sub in &subs {
         let id = sub.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let caller = sub.get("caller").and_then(|v| v.as_str()).unwrap_or("");
@@ -304,9 +322,12 @@ fn events_sub_list(db: &HcomDb) -> i32 {
             }
         };
 
-        println!("{id:<10} {caller:<12} {mode:<10} {filter_display}");
+        println!("{id:<id_width$} {caller:<caller_width$} {mode:<10} {filter_display}");
         if let Some(on_hit) = sub.get("on_hit_text").and_then(|v| v.as_str()) {
-            println!("{:<10} {:<12} {:<10} on-hit: {on_hit:?}", "", "", "");
+            println!(
+                "{:<id_width$} {:<caller_width$} {:<10} on-hit: {on_hit:?}",
+                "", "", ""
+            );
         }
     }
 
