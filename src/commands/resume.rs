@@ -1059,12 +1059,126 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Grok => merge_grok_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
         crate::tool::Tool::Adhoc => {
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
+}
+
+/// Merge grok original launch args with resume args.
+///
+/// Drop session selectors, one-shot flags, and worktree flags (the session
+/// already lives in that tree). `-w`/`--worktree` take an optional value.
+fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
+    const VALUE_FLAGS: &[&str] = &[
+        "--model",
+        "-m",
+        "--rules",
+        "--agent",
+        "--permission-mode",
+        "--reasoning-effort",
+        "--effort",
+        "--max-turns",
+        "--output-format",
+        "--disallowed-tools",
+        "--tools",
+        "--sandbox",
+        "--debug-file",
+        "--system-prompt-override",
+        "--system-prompt",
+        "--agents",
+        "--json-schema",
+    ];
+    // `--cwd`: hcom already starts a resume/fork in the right directory.
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--cwd",
+        "--resume",
+        "-r",
+        "--session-id",
+        "-s",
+        "--single",
+        "-p",
+        "--prompt-file",
+        "--prompt-json",
+        "--worktree",
+        "-w",
+        "--worktree-ref",
+        "--ref",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session", "--restore-code"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+
+    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_next = false;
+    for token in resume {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+            if VALUE_FLAGS.contains(&bare.as_str()) {
+                skip_next = !token.contains('=');
+            }
+            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
+                resume_flags.insert(bare);
+            }
+        }
+    }
+
+    let mut filtered_original: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        // The launch prompt follows `--`, whatever it looks like: drop it all.
+        if token == "--" {
+            break;
+        }
+        if is_flag(token) {
+            let lower = token.to_lowercase();
+            let (bare, has_eq_value) = if let Some(pos) = lower.find('=') {
+                (lower[..pos].to_string(), true)
+            } else {
+                (lower.clone(), false)
+            };
+            if DROP_WITH_VALUE.contains(&bare.as_str()) {
+                i += 1;
+                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            if DROP_BOOLEAN.contains(&bare.as_str()) {
+                i += 1;
+                continue;
+            }
+            if resume_flags.contains(&bare) {
+                i += 1;
+                if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            filtered_original.push(token.clone());
+            i += 1;
+            if !has_eq_value && VALUE_FLAGS.contains(&bare.as_str()) && i < original.len() {
+                filtered_original.push(original[i].clone());
+                i += 1;
+            }
+        } else {
+            // Drop bare positional task prompt from original launch.
+            i += 1;
+        }
+    }
+
+    let mut result = resume.to_vec();
+    result.extend(filtered_original);
+    result
 }
 
 /// Merge copilot original launch args with resume args.
@@ -1776,7 +1890,12 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
-    // 8. Pi / OMP. Attribute by root PROVENANCE, not probe order:
+    // 8. Grok
+    if let Some(path) = derive_grok_transcript_path(session_id) {
+        return Some(("grok".to_string(), Some(path)));
+    }
+
+    // 9. Pi / OMP. Attribute by root PROVENANCE, not probe order:
     //   - `PI_CODING_AGENT_SESSION_DIR` + `~/.pi`            => Pi-exclusive
     //   - XDG-omp / `~/.omp` / OMP profile trees             => OMP-exclusive
     //   - `PI_CODING_AGENT_DIR/sessions`                     => genuinely shared
@@ -1998,6 +2117,27 @@ fn derive_copilot_transcript_path(session_id: &str) -> Option<String> {
     }
 }
 
+/// Grok keeps each session in `$GROK_HOME/sessions/<url-encoded cwd>/<id>/`.
+fn derive_grok_transcript_path(session_id: &str) -> Option<String> {
+    let sessions = crate::transcript::grok::grok_config_dir().join("sessions");
+    std::fs::read_dir(sessions)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(session_id).join("updates.jsonl"))
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// Grok's `summary.json`, next to `updates.jsonl`, records the session cwd.
+fn recover_grok_cwd(transcript_path: &str) -> Option<String> {
+    let summary = std::path::Path::new(transcript_path)
+        .parent()?
+        .join("summary.json");
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(summary).ok()?).ok()?;
+    value["info"]["cwd"].as_str().map(str::to_string)
+}
+
 /// cursor transcripts carry no `cwd`, so recover it from the per-workspace
 /// `.workspace-trusted` marker cursor writes at
 /// `~/.cursor/projects/<slug>/.workspace-trusted` (`workspacePath` field). The
@@ -2057,6 +2197,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
         "gemini" | "antigravity" => recover_gemini_cwd(path),
         "cursor" => recover_cursor_cwd(path),
         "kimi" => None, // Kimi context.jsonl does not store cwd
+        "grok" => recover_grok_cwd(path),
         "copilot" => scan_lines_for_cwd(path, 20, |v| {
             v.get("event")
                 .or_else(|| v.get("type"))
@@ -2200,10 +2341,14 @@ fn build_adopt_plan(
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
+                 - Grok:     {grok}/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
                  - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
+                grok = crate::transcript::grok::grok_config_dir()
+                    .join("sessions")
+                    .display(),
                 short = session_id.split('-').next().unwrap_or(session_id),
             )
         }
@@ -3638,6 +3783,52 @@ mod tests {
         // copilot has fork: None, so build_resume_args returns resume-only args
         let args = build_resume_args("copilot", "sess-abc", true);
         assert_eq!(args, s(&["--resume", "sess-abc"]));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_worktree_and_keeps_rules() {
+        let original = s(&["--worktree", "feat", "--rules", "BOOT", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "--worktree" || t == "feat"));
+        assert!(merged.contains(&"--rules".to_string()));
+        assert!(merged.contains(&"BOOT".to_string()));
+        assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_cwd() {
+        let original = s(&["--cwd", "/old", "--model", "grok-build"]);
+        let merged = merge_resume_args("grok", &original, &s(&["--resume", "sess-1"]));
+        assert!(!merged.iter().any(|arg| arg == "--cwd" || arg == "/old"));
+        assert!(merged.contains(&"grok-build".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_bare_worktree_does_not_eat_model() {
+        let original = s(&["--worktree", "--model", "grok-build"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.contains(&"--worktree".to_string()));
+        assert!(merged.contains(&"--model".to_string()));
+        assert!(merged.contains(&"grok-build".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_short_worktree_drops_name() {
+        let original = s(&["-w", "mytree", "--always-approve"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert!(!merged.iter().any(|t| t == "-w" || t == "mytree"));
+        assert!(merged.contains(&"--always-approve".to_string()));
+    }
+
+    #[test]
+    fn test_merge_grok_args_drops_prompt_after_separator() {
+        let original = s(&["--model", "grok-4", "--", "-x looks like a flag"]);
+        let resume = s(&["--resume", "sess-1"]);
+        let merged = merge_resume_args("grok", &original, &resume);
+        assert_eq!(merged, s(&["--resume", "sess-1", "--model", "grok-4"]));
     }
 
     #[test]

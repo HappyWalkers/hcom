@@ -2,6 +2,7 @@
 
 #[path = "delivery/antigravity.rs"]
 mod antigravity;
+pub(crate) mod grok;
 
 use std::io::Write;
 use std::net::TcpStream;
@@ -904,6 +905,8 @@ pub struct GateResult {
 /// Shared state for delivery thread
 pub struct DeliveryState {
     pub screen: Arc<std::sync::RwLock<ScreenState>>,
+    /// Grok's native ACP transport; set for every hcom-launched Grok.
+    pub grok_acp: Option<grok::Launch>,
     /// True while the launch outcome is still Pending. Cleared once any
     /// terminal outcome (ready/failed/blocked) fires, so the PTY proxy can
     /// stop computing launch-only signals (e.g. `visible_tail`).
@@ -1674,7 +1677,23 @@ pub fn run_delivery_loop(
     // After that, the plugin takes over (messages.transform for active, promptAsync for idle).
     use crate::tool::Tool;
     use std::str::FromStr;
-    if matches!(
+    if let Some(launch) = state.grok_acp.as_ref() {
+        grok::run(
+            launch,
+            &running,
+            db,
+            notify,
+            state,
+            &process_id,
+            &mut current_name,
+            config,
+            &shared_name,
+            &shared_status,
+            &title_wake,
+            &mut host_label,
+            &mut launch_outcome,
+        );
+    } else if matches!(
         Tool::from_str(&config.tool),
         Ok(Tool::OpenCode | Tool::Kilo | Tool::Pi | Tool::Omp)
     ) {
@@ -2666,6 +2685,7 @@ mod tests {
     /// Helper: create DeliveryState with given screen state
     fn make_state(screen: ScreenState, cooldown_ms: u64) -> DeliveryState {
         DeliveryState {
+            grok_acp: None,
             screen: Arc::new(std::sync::RwLock::new(screen)),
             launch_phase_active: Arc::new(AtomicBool::new(true)),
             inject_port: 0,

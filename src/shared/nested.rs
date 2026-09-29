@@ -14,7 +14,7 @@
 //! Detected hooks have the inherited identity scrubbed from the process env at
 //! startup, so they run as a plain unlaunched session.
 //!
-//! Supported: any cross-tool child, and same-tool Codex and Gemini children.
+//! Supported: any cross-tool child, and same-tool Codex, Gemini and Grok children.
 //! Per-run tools (Claude, Codex, Copilot, Pi, Omp, OpenCode, Kilo; see
 //! `hooks::runtime`) load hcom only through launch args or env, so a plain
 //! same-tool child doesn't load hcom at all (OpenCode's inherited env var is
@@ -34,6 +34,8 @@ fn shell_only_markers(tool: Tool) -> &'static [&'static str] {
         Tool::Codex => &["CODEX_SESSION_ID", "CODEX_THREAD_ID"],
         // gemini-cli sets it only in shellExecutionService and MCP server envs.
         Tool::Gemini => &["GEMINI_CLI"],
+        // Grok sets it on agent terminal children only (`apply_grok_agent_marker`).
+        Tool::Grok => &["GROK_AGENT"],
         _ => &[],
     }
 }
@@ -222,6 +224,13 @@ mod tests {
             assert!(!e.contains_key(gone), "{gone} should be scrubbed");
         }
         assert!(detect(&launched("gemini", &[("GEMINI_CLI", "1")]), Tool::Gemini).is_some());
+        // Grok hooks get GROK_SESSION_ID; only its shell commands get GROK_AGENT.
+        assert_eq!(
+            detect(&launched("grok", &[("GROK_SESSION_ID", "s")]), Tool::Grok),
+            None
+        );
+        assert!(detect(&launched("grok", &[("GROK_AGENT", "1")]), Tool::Grok).is_some());
+        assert!(detect(&launched("grok", &[]), Tool::Claude).is_some());
     }
 
     #[test]

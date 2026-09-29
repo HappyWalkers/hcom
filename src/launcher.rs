@@ -23,8 +23,9 @@ use crate::shared::constants::HCOM_IDENTITY_VARS;
 use crate::shared::tool_detection::tool_marker_vars;
 use crate::terminal;
 use crate::tools::launch_arg_validation::{
-    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, KILO_REJECTED_ARGS, KIMI_REJECTED_ARGS,
-    OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS, validate_rejected_args,
+    ANTIGRAVITY_REJECTED_ARGS, GEMINI_REJECTED_ARGS, GROK_REJECTED_ARGS, KILO_REJECTED_ARGS,
+    KIMI_REJECTED_ARGS, OMP_REJECTED_ARGS, OPENCODE_REJECTED_ARGS, PI_REJECTED_ARGS,
+    validate_rejected_args,
 };
 use crate::tools::{
     codex_preprocessing, copilot_preprocessing, cursor_preprocessing, opencode_preprocessing,
@@ -44,6 +45,7 @@ pub enum LaunchTool {
     Cursor,
     Kimi,
     Copilot,
+    Grok,
     Omp,
 }
 
@@ -63,6 +65,7 @@ impl LaunchTool {
             "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             "kimi" => Ok(LaunchTool::Kimi),
             "copilot" => Ok(LaunchTool::Copilot),
+            "grok" | "grok-build" => Ok(LaunchTool::Grok),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -81,6 +84,7 @@ impl LaunchTool {
             LaunchTool::Cursor => "cursor",
             LaunchTool::Kimi => "kimi",
             LaunchTool::Copilot => "copilot",
+            LaunchTool::Grok => "grok",
         }
     }
 
@@ -101,6 +105,7 @@ impl LaunchTool {
             LaunchTool::Cursor => crate::tool::Tool::Cursor,
             LaunchTool::Kimi => crate::tool::Tool::Kimi,
             LaunchTool::Copilot => crate::tool::Tool::Copilot,
+            LaunchTool::Grok => crate::tool::Tool::Grok,
         }
     }
 
@@ -170,7 +175,8 @@ impl LaunchBackend {
             | LaunchTool::Antigravity
             | LaunchTool::Cursor
             | LaunchTool::Kimi
-            | LaunchTool::Copilot => LaunchBackend::HeadlessPty,
+            | LaunchTool::Copilot
+            | LaunchTool::Grok => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -330,6 +336,53 @@ fn apply_inherited_notes(instance_env: &mut HashMap<String, String>, inherited: 
     }
 }
 
+/// Start a new Grok conversation under an explicit session id.
+///
+/// Without one the TUI opens on its welcome screen over a hidden "home"
+/// session, and never draws turns another client (hcom's queue) runs there.
+/// `--session-id` opens the conversation view directly. Resume/continue
+/// already open a conversation.
+fn ensure_grok_session_id(args: &mut Vec<String>) {
+    let opens_conversation = args.iter().take_while(|arg| *arg != "--").any(|arg| {
+        let flag = arg.split('=').next().unwrap_or(arg);
+        matches!(
+            flag,
+            "-r" | "--resume" | "-c" | "--continue" | "-s" | "--session-id"
+        )
+    });
+    if !opens_conversation {
+        args.insert(0, "--session-id".to_string());
+        args.insert(1, uuid::Uuid::new_v4().to_string());
+    }
+}
+
+/// Prepend `extra` to Grok's `--rules` (text appended to its system prompt).
+fn inject_grok_rules(args: &mut Vec<String>, extra: &str) {
+    if extra.is_empty() {
+        return;
+    }
+    let mut i = 0;
+    // Flags only: after `--` it is the prompt, whatever it looks like.
+    while i < args.len() && args[i] != "--" {
+        let token = &args[i];
+        if token == "--rules" {
+            if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                args[i + 1] = format!("{}\n\n{}", extra, args[i + 1]);
+            } else {
+                args.insert(i + 1, extra.to_string());
+            }
+            return;
+        }
+        if let Some(rest) = token.strip_prefix("--rules=") {
+            args[i] = format!("--rules={}\n\n{}", extra, rest);
+            return;
+        }
+        i += 1;
+    }
+    args.insert(0, "--rules".to_string());
+    args.insert(1, extra.to_string());
+}
+
 fn build_codex_bootstrap(
     db: &HcomDb,
     hcom_dir: &Path,
@@ -337,15 +390,50 @@ fn build_codex_bootstrap(
     background: bool,
     instance_env: &HashMap<String, String>,
 ) -> String {
-    // Codex takes its bootstrap at launch, so render it from the env the
-    // instance will run with. HCOM_BACKGROUND is only added to the runner env
-    // later, hence the explicit override.
+    build_launch_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "codex",
+        background,
+        instance_env,
+    )
+}
+
+fn build_grok_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+) -> String {
+    build_launch_bootstrap(
+        db,
+        hcom_dir,
+        instance_name,
+        "grok",
+        background,
+        instance_env,
+    )
+}
+
+fn build_launch_bootstrap(
+    db: &HcomDb,
+    hcom_dir: &Path,
+    instance_name: &str,
+    tool: &str,
+    background: bool,
+    instance_env: &HashMap<String, String>,
+) -> String {
+    // Codex and Grok take their bootstrap at launch, so render it from the env
+    // the instance will run with. HCOM_BACKGROUND is only added to the runner
+    // env later, hence the explicit override.
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut ctx = crate::shared::HcomContext::from_env(instance_env, cwd);
     ctx.hcom_dir = hcom_dir.to_path_buf();
     ctx.is_launched = true;
     ctx.is_background = background;
-    crate::bootstrap::get_bootstrap(db, &ctx, instance_name, "codex")
+    crate::bootstrap::get_bootstrap(db, &ctx, instance_name, tool)
 }
 
 fn build_launch_env_with_resolver<F>(
@@ -442,6 +530,7 @@ fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
         crate::tool::Tool::Cursor => ".cursor",
         crate::tool::Tool::Kimi => ".kimi",
         crate::tool::Tool::Copilot => ".copilot",
+        crate::tool::Tool::Grok => ".grok",
         crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
     };
     Some(root.join(dirname))
@@ -675,6 +764,7 @@ fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Resul
             Ok(())
         }
         LaunchTool::Copilot => unreachable!("Copilot uses per-run hooks"),
+        LaunchTool::Grok => unreachable!("Grok has no hooks"),
     }
 }
 
@@ -2325,6 +2415,49 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         inside_ai_tool,
                     )
                 }
+                LaunchTool::Grok => {
+                    // Grok hook output never reaches the model, so the bootstrap
+                    // goes in at launch through `--rules` (appended to the
+                    // system prompt).
+                    let bootstrap = build_grok_bootstrap(
+                        db,
+                        &paths::hcom_dir(),
+                        &instance_name,
+                        params.background,
+                        &instance_env,
+                    );
+                    let mut grok_args = params.args.clone();
+                    inject_grok_rules(&mut grok_args, &bootstrap);
+                    ensure_grok_session_id(&mut grok_args);
+                    if let Some(ref sp) = params.system_prompt {
+                        inject_grok_rules(&mut grok_args, sp);
+                    }
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([
+                            ("launch_args".to_string(), json!(&stored_launch_args)),
+                            ("name_announced".to_string(), json!(true)),
+                        ]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "grok",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &grok_args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
             }
         })();
 
@@ -2423,6 +2556,14 @@ pub(crate) fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<Stri
             ANTIGRAVITY_REJECTED_ARGS,
         ),
         LaunchTool::Copilot => crate::tools::copilot_preprocessing::validate_copilot_args(args),
+        LaunchTool::Grok => {
+            let mut errors = validate_rejected_args("Grok", "hcom grok", args, GROK_REJECTED_ARGS);
+            let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+            if let Err(error) = crate::delivery::grok::Launch::validate_args(&borrowed) {
+                errors.push(error.to_string());
+            }
+            errors
+        }
     }
 }
 
@@ -2534,6 +2675,11 @@ mod tests {
             LaunchTool::from_str("copilot").unwrap(),
             LaunchTool::Copilot
         );
+        assert_eq!(LaunchTool::from_str("grok").unwrap(), LaunchTool::Grok);
+        assert_eq!(
+            LaunchTool::from_str("grok-build").unwrap(),
+            LaunchTool::Grok
+        );
         assert!(LaunchTool::from_str("unknown").is_err());
     }
 
@@ -2611,6 +2757,27 @@ mod tests {
         let mut args = vec!["--model".to_string(), "safe-model".to_string()];
         append_initial_prompt_args(&LaunchTool::Gemini, &mut args, "hcom".into()).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("hcom"));
+    }
+
+    #[test]
+    fn validate_grok_rejects_one_shot() {
+        let errors = validate_tool_args(&LaunchTool::Grok, &["-p".to_string(), "task".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("-p") || errors[0].contains("single"));
+        assert!(
+            validate_tool_args(&LaunchTool::Grok, &["--always-approve".to_string()]).is_empty()
+        );
+        assert_eq!(
+            validate_tool_args(&LaunchTool::Grok, &["--no-leader".into()]).len(),
+            1
+        );
+        for flag in ["--deny=bash", "--disable-web-search", "--allow"] {
+            assert_eq!(
+                validate_tool_args(&LaunchTool::Grok, &[flag.to_string()]).len(),
+                1
+            );
+        }
+        assert!(validate_tool_args(&LaunchTool::Grok, &["--no-subagents".to_string()]).is_empty());
     }
 
     #[test]
@@ -3071,6 +3238,73 @@ mod tests {
         assert_eq!(env.get("HCOM_TAG").map(String::as_str), Some("config-tag"));
 
         unsafe { std::env::remove_var("HCOM_TAG") }
+    }
+
+    #[test]
+    fn test_inject_grok_rules_prepends_when_absent() {
+        let mut args = vec!["--always-approve".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(
+            args,
+            vec![
+                "--rules".to_string(),
+                "BOOT".to_string(),
+                "--always-approve".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn grok_new_launch_gets_session_id_unless_it_opens_one() {
+        let mut args = vec!["--always-approve".to_string()];
+        ensure_grok_session_id(&mut args);
+        assert_eq!(args[0], "--session-id");
+        assert!(uuid::Uuid::parse_str(&args[1]).is_ok());
+        for existing in [
+            vec!["--resume", "abc"],
+            vec!["-c"],
+            vec!["--session-id=abc"],
+            vec!["--resume", "abc", "--fork-session"],
+        ] {
+            let mut args: Vec<String> = existing.iter().map(|s| s.to_string()).collect();
+            let before = args.clone();
+            ensure_grok_session_id(&mut args);
+            assert_eq!(args, before);
+        }
+        let mut literal = vec!["--".to_string(), "--resume".to_string()];
+        ensure_grok_session_id(&mut literal);
+        assert_eq!(literal[0], "--session-id");
+    }
+
+    #[test]
+    fn grok_prompt_that_looks_like_a_flag_stays_a_prompt() {
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--rules=x".into()).unwrap();
+        assert_eq!(args, ["--", "--rules=x"]);
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args, ["--rules", "BOOT", "--", "--rules=x"]);
+        let mut args = Vec::new();
+        append_initial_prompt_args(&LaunchTool::Grok, &mut args, "--continue".into()).unwrap();
+        ensure_grok_session_id(&mut args);
+        assert_eq!(args[0], "--session-id");
+    }
+
+    #[test]
+    fn test_inject_grok_rules_prefixes_existing_value() {
+        let mut args = vec!["--rules".to_string(), "user-rules".to_string()];
+        inject_grok_rules(&mut args, "BOOT");
+        assert_eq!(args[0], "--rules");
+        assert!(args[1].starts_with("BOOT"));
+        assert!(args[1].contains("user-rules"));
+    }
+
+    #[test]
+    fn test_grok_bootstrap_uses_automatic_delivery() {
+        let db = launcher_test_db();
+        let hcom_dir = tempfile::tempdir().unwrap();
+        let bootstrap = build_grok_bootstrap(&db, hcom_dir.path(), "kumo", true, &HashMap::new());
+        assert!(bootstrap.contains("Your name: kumo"));
+        assert!(bootstrap.contains("Messages instantly and automatically arrive"));
     }
 
     #[test]

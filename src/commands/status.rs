@@ -66,6 +66,7 @@ fn is_tool_installed(tool: crate::tool::Tool) -> bool {
         crate::tool::Tool::Omp => crate::terminal::which_bin("omp").is_some(),
         crate::tool::Tool::Cursor => crate::terminal::which_bin("cursor-agent").is_some(),
         crate::tool::Tool::Copilot => crate::terminal::which_bin("copilot").is_some(),
+        crate::tool::Tool::Grok => crate::terminal::which_bin("grok").is_some(),
         crate::tool::Tool::Adhoc => false,
         _ => is_in_path(tool.spec().cli_binary),
     }
@@ -102,17 +103,17 @@ fn get_tool_statuses() -> Vec<ToolStatus> {
         .filter(|spec| spec.released)
         .map(|spec| {
             let hook_mode = HookMode::of(spec.tool);
-            let per_run = hook_mode == HookMode::PerRun;
+            let persistent = hook_mode == HookMode::Persistent;
             ToolStatus {
                 key: spec.name,
                 name: spec.label,
                 installed: is_tool_installed(spec.tool),
-                hooks: per_run || spec.tool.verify_hooks_installed(false),
+                hooks: !persistent || spec.tool.verify_hooks_installed(false),
                 hook_mode,
-                settings_path: if per_run {
-                    String::new()
-                } else {
+                settings_path: if persistent {
                     spec.tool.hooks_settings_path()
+                } else {
+                    String::new()
                 },
             }
         })

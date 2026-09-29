@@ -559,19 +559,7 @@ fn handle_erroroccurred(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -
 }
 
 fn command_looks_safe_hcom(command: &str) -> bool {
-    let trimmed = command.trim();
-    for prefix in ["hcom", "uvx hcom"] {
-        if trimmed == prefix {
-            return true;
-        }
-        for safe in common::SAFE_HCOM_COMMANDS {
-            let expected = format!("{prefix} {safe}");
-            if trimmed == expected || trimmed.starts_with(&format!("{expected} ")) {
-                return true;
-            }
-        }
-    }
-    false
+    common::is_safe_hcom_command(command)
 }
 
 fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayload) -> Value {
@@ -582,7 +570,9 @@ fn handle_permissionrequest(_db: &HcomDb, _ctx: &HcomContext, payload: &HookPayl
         .or_else(|| payload.tool_input.get("script"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if matches!(payload.tool_name.as_str(), "bash" | "powershell" | "shell")
+    // POSIX shells only: the check parses POSIX quoting, and PowerShell
+    // reads a backslash-escaped `;` as a statement separator.
+    if (payload.tool_name == "bash" || (payload.tool_name == "shell" && !cfg!(windows)))
         && command_looks_safe_hcom(command)
     {
         json!({ "behavior": "allow", "message": "hcom coordination command" })
@@ -803,5 +793,24 @@ mod tests {
         assert!(command_looks_safe_hcom("uvx hcom list --json"));
         assert!(!command_looks_safe_hcom("hcom kill luna"));
         assert!(!command_looks_safe_hcom("echo hcom send @luna"));
+        assert!(command_looks_safe_hcom("hcom"));
+        assert!(command_looks_safe_hcom(
+            "hcom send @luna --name nova -- 'costs $5; fine (really)'"
+        ));
+        assert!(command_looks_safe_hcom(r#"hcom send @luna -- "a; b | c""#));
+        for chained in [
+            "hcom send @luna -- hi; rm -rf ~",
+            "hcom send @luna -- hi && rm -rf ~",
+            "hcom list | sh",
+            "hcom send @luna -- $(cat ~/.ssh/id_rsa)",
+            r#"hcom send @luna -- "$(whoami)""#,
+            "hcom send @luna -- `id`",
+            "hcom list > /tmp/x",
+            "hcom list\nrm -rf ~",
+            "hcom send @luna -- 'unterminated",
+            "hcomx list",
+        ] {
+            assert!(!command_looks_safe_hcom(chained), "{chained}");
+        }
     }
 }

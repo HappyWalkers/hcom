@@ -315,6 +315,9 @@ const COPILOT_HOOKS: &[&str] = &[
     "copilot-sessionend",
 ];
 
+/// Grok has no hooks: status and delivery come over its ACP (`delivery/grok.rs`).
+const GROK_HOOKS: &[&str] = &[];
+
 // ── Help examples / extra-env tables ────────────────────────────────────
 
 const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[(
@@ -388,6 +391,14 @@ const KIMI_HELP_EXAMPLES: &[HelpEntry] = &[
     ),
     ("hcom kimi --auto", "Never ask for approval"),
     ("hcom kimi --plan", "Flags forwarded to kimi"),
+];
+
+const GROK_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom grok --reasoning-effort high",
+        "Flags forwarded to grok",
+    ),
+    ("hcom grok --always-approve", "Auto-approve tool executions"),
 ];
 
 const COPILOT_HELP_EXAMPLES: &[HelpEntry] = &[
@@ -1052,6 +1063,61 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     },
 };
 
+pub static GROK: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Grok,
+    name: "grok",
+    label: "Grok Build",
+    aliases: &["grok-build"],
+    cli_binary: "grok",
+    tui_prefix: "grk ",
+    adhoc_icon: None,
+    released: true,
+    // Delivery goes through Grok's prompt queue (delivery/grok.rs), never the
+    // PTY, so there is no composer to parse and no ready footer to wait for.
+    ready_pattern: b"",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 10,
+    },
+    // Session id is instance-specific and would corrupt a same-tool child launch.
+    instance_state_env: &["GROK_SESSION_ID"],
+    hooks: HooksSpec {
+        names: GROK_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        // Launch readiness falls back to the settle timeout.
+        launch_requires_ready: false,
+        launch_ready_on_plugin_bind: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_GROK_ARGS"),
+        config_dir_env: Some("GROK_HOME"),
+        initial_prompt: InitialPromptShape::DashDashPositional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: Some(ForkArgs::AppendFlag("--fork-session")),
+    }),
+    help: HelpSpec {
+        unique_examples: GROK_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["run_terminal_command", "Bash"],
+        file: &["search_replace", "write", "Edit", "Write", "MultiEdit"],
+        delegate: &["spawn_subagent", "Task"],
+    },
+};
+
 pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tool: Tool::Adhoc,
     name: "adhoc",
@@ -1116,6 +1182,7 @@ pub static ALL: &[&IntegrationSpec] = &[
     &CURSOR,
     &KIMI,
     &COPILOT,
+    &GROK,
     &ADHOC,
 ];
 
@@ -1134,6 +1201,7 @@ impl Tool {
             Tool::Cursor => &CURSOR,
             Tool::Kimi => &KIMI,
             Tool::Copilot => &COPILOT,
+            Tool::Grok => &GROK,
             Tool::Adhoc => &ADHOC,
         }
     }
@@ -1181,6 +1249,7 @@ mod tests {
             Tool::Cursor,
             Tool::Kimi,
             Tool::Copilot,
+            Tool::Grok,
             Tool::Pi,
             Tool::Omp,
             Tool::Adhoc,
@@ -1248,8 +1317,9 @@ mod tests {
         assert!(names.contains(&"cursor"));
         assert!(names.contains(&"kimi"));
         assert!(names.contains(&"copilot"));
+        assert!(names.contains(&"grok"));
         assert!(names.contains(&"omp"));
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]

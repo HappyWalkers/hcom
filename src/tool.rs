@@ -20,6 +20,7 @@ pub enum Tool {
     Cursor,
     Kimi,
     Copilot,
+    Grok,
     Pi,
     Omp,
     Adhoc,
@@ -85,7 +86,8 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
             }
@@ -110,7 +112,8 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Antigravity => {
                 crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions)
                     .map_err(|e| e.to_string())
@@ -141,6 +144,7 @@ impl Tool {
             Tool::Cursor => Ok(crate::hooks::cursor::remove_cursor_hooks()),
             Tool::Kimi => Ok(crate::hooks::kimi::remove_kimi_hooks()),
             Tool::Copilot => Ok(crate::hooks::copilot::remove_copilot_hooks()),
+            Tool::Grok => Ok(true),
             Tool::Pi => crate::hooks::pi::remove_pi_plugin()
                 .map(|_| true)
                 .map_err(|e| e.to_string()),
@@ -162,7 +166,8 @@ impl Tool {
             | Tool::Pi
             | Tool::Omp
             | Tool::OpenCode
-            | Tool::Kilo => per_run_has_no_install(*self),
+            | Tool::Kilo
+            | Tool::Grok => per_run_has_no_install(*self),
             Tool::Gemini => crate::hooks::gemini::get_gemini_settings_path(),
             Tool::Antigravity => crate::hooks::antigravity::get_antigravity_hooks_path(),
             Tool::Cursor => crate::hooks::cursor::get_cursor_hooks_path(),
