@@ -1980,6 +1980,16 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
 
         let tool_type = base_tool;
         instance_env.insert("HCOM_TOOL".to_string(), tool_type.to_string());
+        // A resumed OpenCode session emits no session event until the first
+        // prompt, so the plugin binds at startup from this instead. Always set
+        // (empty unless resuming) so a launch from inside a resumed agent does
+        // not inherit it.
+        if matches!(tool_type, "opencode" | "kilo") {
+            instance_env.insert(
+                "HCOM_RESUME_SESSION_ID".to_string(),
+                params.prior_session_id.clone().unwrap_or_default(),
+            );
+        }
 
         // Pre-format the pane title for templates that substitute
         // `{pane_title}` (custom user templates only — the built-in herdr

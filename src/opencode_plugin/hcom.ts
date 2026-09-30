@@ -423,6 +423,22 @@ export const HcomPlugin: Plugin = async ({ client, $ }) => {
     await bindingPromise
   }
 
+  // Resumed session (`hcom r`): OpenCode emits no session.created, and no
+  // session.status until the first prompt, so bind now and deliver anything
+  // already pending. Without this, messages waited for the user to type.
+  // Not awaited: plugin load must not wait on hcom.
+  const resumeSessionId = process.env.HCOM_RESUME_SESSION_ID
+  if (resumeSessionId && checkHcom()) {
+    void (async () => {
+      await bindIdentity(resumeSessionId)
+      if (disposed || !instanceName || sessionId !== resumeSessionId) return
+      log("INFO", "plugin.resume_bound", instanceName, { session_id: sessionId })
+      lastReportedStatus = "listening"
+      startReconcileTimer()
+      await deliverPendingToIdle(resumeSessionId)
+    })().catch((e) => log("ERROR", "plugin.resume_bind_error", instanceName, { error: String(e) }))
+  }
+
   return {
     event: async ({ event }: { event: HcomEvent }) => {
       try {
