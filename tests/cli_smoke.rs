@@ -13,7 +13,7 @@ use support::{Hcom, parse_hcom_marker};
 fn fixture_drop_terminates_registered_process_group() {
     #[cfg(unix)]
     let mut child = Command::new("sh")
-        .args(["-c", "sleep 60"])
+        .args(["-c", "exec sleep 60"])
         .process_group(0)
         .spawn()
         .expect("spawn cleanup test process group");
@@ -47,6 +47,70 @@ fn fixture_drop_terminates_registered_process_group() {
         !support::process_group_alive(pid),
         "fixture drop left process group {pid} alive"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_drop_terminates_orphan_without_instance_row() {
+    let h = Hcom::new();
+    // Only the pidfile owns this process; neither instance rows nor explicit
+    // fixture cleanup registration can discover it.
+    // Reap the descendant on group termination so zombie lifetime does not
+    // depend on the host init process. Killing only the shell still leaves it
+    // waiting for its live child, which the bounded exit check detects.
+    let ready_path = h.root_path().join("orphan-ready");
+    let mut child = Command::new("sh")
+        .args([
+            "-c",
+            r#"sleep 60 & descendant=$!; trap 'wait "$descendant"; exit 143' TERM; printf ready > "$1"; wait "$descendant""#,
+            "orphan-fixture",
+        ])
+        .arg(&ready_path)
+        .process_group(0)
+        .spawn()
+        .expect("spawn orphan process group");
+    let pid = i64::from(child.id());
+    let tmp = h.hcom_dir.join(".tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("launched_pids.json"),
+        serde_json::json!({pid.to_string(): {
+            "tool": "claude", "names": ["orphan"], "launched_at": 1.0
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    // Confirm the descendant exists without an unbounded pipe read. Register
+    // its group first so fixture cleanup also runs if readiness times out.
+    h.eventually("orphan descendant started", Duration::from_secs(3), || {
+        Ok(ready_path.exists().then_some(()))
+    });
+    drop(h);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll orphan") {
+            assert!(
+                !status.success(),
+                "orphan must be terminated by fixture teardown"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            support::terminate_process_group(pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture teardown left orphan {pid} alive");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while support::process_group_alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if support::process_group_alive(pid) {
+        support::terminate_process_group(pid);
+        panic!("fixture teardown left orphan descendants in group {pid}");
+    }
 }
 
 #[test]
@@ -1481,12 +1545,13 @@ fn run_events_wait_cli_oracle(timing: UnreadTiming, wait_secs: u64, expected_cod
 
     let send_ok = send_code.is_none_or(|c| c == 0);
     let pending = premature_exit.is_none();
-    // Composite oracle: first establish send_ok and pending mid-wait.
-    // In GREEN, pending=true implies cursor unchanged, preview_count <= 1 (no duplicate preview),
-    // and expected final code. Endpoint registration is diagnostic-only and not required.
-    // In RED, premature_exit is Some(ExitStatus(0)), failing immediately on pending=false.
+    // A timeout may legitimately finish before the mid-wait probe on a busy
+    // runner. Its final exit code and unchanged cursor still reject a false
+    // match. Success scenarios must remain pending until we insert the match.
+    let wait_state_ok = pending
+        || (expected_code == 1 && premature_exit.is_some_and(|status| status.code() == Some(1)));
     let oracle_passed = send_ok
-        && pending
+        && wait_state_ok
         && mid_wait_cursor == initial_cursor
         && preview_count <= 1
         && code == expected_code;

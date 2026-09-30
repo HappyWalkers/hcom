@@ -263,7 +263,15 @@ impl HcomDb {
             return Ok(());
         }
 
-        self.conn.execute_batch(
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        // A concurrent initializer may have finished while we acquired the
+        // write lock. Avoid rebuilding its view after it published the schema.
+        let current: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if current == SCHEMA_VERSION {
+            return Ok(());
+        }
+
+        tx.execute_batch(
             "
             -- Events table
             CREATE TABLE IF NOT EXISTS events (
@@ -428,8 +436,8 @@ impl HcomDb {
         )?;
 
         // Set schema version
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION))?;
+        tx.commit()?;
 
         Ok(())
     }
@@ -1168,6 +1176,65 @@ pub(super) mod tests {
 
         let db = HcomDb::open_at(&db_path).unwrap();
         (db, db_path)
+    }
+
+    #[test]
+    fn schema_initialization_failure_rolls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("broken.db")).unwrap();
+        db.conn()
+            .execute_batch("CREATE TABLE instances (name TEXT PRIMARY KEY);")
+            .unwrap();
+        assert!(db.init_db().is_err());
+        let mut statement = db.conn().prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        ).unwrap();
+        let tables: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tables, vec!["instances"]);
+        let version: i32 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        db.conn().execute_batch("DROP TABLE instances;").unwrap();
+        db.init_db().unwrap();
+    }
+
+    #[test]
+    fn concurrent_schema_initializers_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        // Open connections before spawning: a failed open must fail the test,
+        // rather than leave other workers stuck at a barrier forever.
+        let connections: Vec<_> = (0..4).map(|_| HcomDb::open_raw(&path).unwrap()).collect();
+        let workers: Vec<_> = connections
+            .into_iter()
+            .map(|db| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.init_db().unwrap();
+                    db.conn().execute(
+                        "INSERT INTO events(timestamp,type,instance,data) VALUES ('now','test','probe','{}')",
+                        [],
+                    ).unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let db = HcomDb::open_raw(&path).unwrap();
+        let count: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
     }
 
     #[test]

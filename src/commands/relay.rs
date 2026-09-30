@@ -957,7 +957,7 @@ mod tests {
     fn test_relay_off_all_disables_local_relay_without_peers() {
         let (_dir, _hcom_dir, _home, _guard) = isolated_test_env();
         let cfg = crate::config::HcomConfig {
-            relay: "mqtts://broker.emqx.io:8883".to_string(),
+            relay: "mqtt://127.0.0.1:1".to_string(),
             relay_id: "relay-1".to_string(),
             relay_psk: relay::encode_psk(&fake_psk()),
             relay_enabled: true,

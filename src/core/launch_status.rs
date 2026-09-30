@@ -1128,7 +1128,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = wait_for_launch(&db, None, Some("batch-fresh-placeholder"), 1);
+        // This checks timeout finalization, not polling elapsed time. An
+        // immediate deadline exercises the same finalization path.
+        let result = wait_for_launch(&db, None, Some("batch-fresh-placeholder"), 0);
         assert_eq!(result.status, LaunchStatus::Timeout);
         assert_eq!(result.ready, Some(0));
         assert_eq!(result.failed, Some(0));

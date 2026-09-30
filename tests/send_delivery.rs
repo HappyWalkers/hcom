@@ -56,40 +56,67 @@ fn cursor(db: &Connection, receiver: &str) -> i64 {
 }
 
 /// Verify batch boundaries and sequential exactly-once output for each routing mode.
-#[test]
-fn send_delivers_one_contiguous_prefix_before_advancing_cursor() {
-    for tool in ["claude", "codex", "adhoc"] {
-        for count in [50usize, 51, 101] {
-            let (h, db, sender, receiver) = setup(tool);
-            let ids: Vec<i64> = (0..count)
-                .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
-                .collect();
-            let first = send(&h, &receiver, &sender, "reply");
-            assert_eq!(cursor(&db, &receiver), ids[49], "{tool}/{count}");
+fn check_contiguous_prefix(tool: &str) {
+    let (h, db, sender, receiver) = setup(tool);
+    for count in [50usize, 51, 101] {
+        db.execute(
+            "UPDATE instances SET last_event_id=0 WHERE name=?",
+            [&receiver],
+        )
+        .unwrap();
+        db.execute("DELETE FROM events WHERE type='message'", [])
+            .unwrap();
+        let ids: Vec<i64> = (0..count)
+            .map(|i| queue(&db, &sender, &receiver, &format!("sentinel-{i:03}-end")))
+            .collect();
+        let first = send(&h, &receiver, &sender, "reply");
+        assert_eq!(cursor(&db, &receiver), ids[49], "{tool}/{count}");
+        assert_eq!(
+            first.contains(&format!("[+{} more unread", count.saturating_sub(50))),
+            count > 50,
+            "{tool}/{count}: remaining note"
+        );
+        for i in 0..count {
             assert_eq!(
-                first.contains(&format!("[+{} more unread", count.saturating_sub(50))),
-                count > 50,
-                "{tool}/{count}: remaining note"
+                first.contains(&format!("sentinel-{i:03}-end")),
+                i < 50,
+                "{tool}/{count}/{i}"
             );
-            for i in 0..count {
-                assert_eq!(
-                    first.contains(&format!("sentinel-{i:03}-end")),
-                    i < 50,
-                    "{tool}/{count}/{i}"
-                );
-            }
-            let all = first
-                + &send(&h, &receiver, &sender, "reply2")
-                + &send(&h, &receiver, &sender, "reply3");
-            for i in 0..count {
-                assert_eq!(
-                    all.matches(&format!("sentinel-{i:03}-end")).count(),
-                    1,
-                    "{tool}/{count}/{i}"
-                );
-            }
+        }
+        let mut all = first;
+        for batch in 1..count.div_ceil(50) {
+            all += &send(&h, &receiver, &sender, &format!("reply-{batch}"));
+        }
+        assert_eq!(cursor(&db, &receiver), *ids.last().unwrap());
+        let empty = send(&h, &receiver, &sender, "after-drain");
+        assert!(
+            !empty.contains("sentinel-"),
+            "{tool}/{count}: replay after drain"
+        );
+        assert_eq!(cursor(&db, &receiver), *ids.last().unwrap());
+        for i in 0..count {
+            assert_eq!(
+                all.matches(&format!("sentinel-{i:03}-end")).count(),
+                1,
+                "{tool}/{count}/{i}"
+            );
         }
     }
+}
+
+#[test]
+fn contiguous_prefix_claude() {
+    check_contiguous_prefix("claude");
+}
+
+#[test]
+fn contiguous_prefix_codex() {
+    check_contiguous_prefix("codex");
+}
+
+#[test]
+fn contiguous_prefix_adhoc() {
+    check_contiguous_prefix("adhoc");
 }
 
 /// Main and child senders cannot create holes in a shared cursor prefix.
@@ -314,8 +341,20 @@ fn relay_reply_ids_survive_inline_receive() {
     // --from receives inline only for adhoc; codex gets messages via hooks.
     for (tool, external) in [("codex", false), ("adhoc", false), ("adhoc", true)] {
         {
+            let (h, db, sender, receiver) = setup(tool);
             for count in [1, 2] {
-                let (h, db, sender, receiver) = setup(tool);
+                db.execute("DELETE FROM events WHERE type='message'", [])
+                    .unwrap();
+                db.execute(
+                    "UPDATE instances SET last_event_id=0 WHERE name=?",
+                    [&receiver],
+                )
+                .unwrap();
+                let base: i64 = db
+                    .query_row("SELECT COALESCE(MAX(id),0)+100 FROM events", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
                 for i in 0..count {
                     let data = serde_json::json!({
                         "from":"remote:BOXE", "text":format!("relay-sentinel-{i}"),
@@ -323,7 +362,7 @@ fn relay_reply_ids_survive_inline_receive() {
                         "sender_kind":"instance", "intent":"request",
                         "_relay":{"id":42+i,"short":"BOXE","device":"remote-device"}
                     });
-                    db.execute("INSERT INTO events(id,timestamp,type,instance,data) VALUES(?,datetime('now'),'message','remote:BOXE',?)",params![100+i,data.to_string()]).unwrap();
+                    db.execute("INSERT INTO events(id,timestamp,type,instance,data) VALUES(?,datetime('now'),'message','remote:BOXE',?)",params![base+i,data.to_string()]).unwrap();
                 }
                 let mut args = vec!["send", "--name", &receiver];
                 if external {
@@ -338,9 +377,9 @@ fn relay_reply_ids_survive_inline_receive() {
                         out.contains(&format!("[request #{}:BOXE]", 42 + i)),
                         "{tool}/{external}/{count}: {out}"
                     );
-                    assert!(!out.contains(&format!("[request #{}]", 100 + i)));
+                    assert!(!out.contains(&format!("[request #{}]", base + i)));
                 }
-                assert_eq!(cursor(&db, &receiver), 99 + count);
+                assert_eq!(cursor(&db, &receiver), base + count - 1);
             }
         }
     }
