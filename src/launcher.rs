@@ -1387,7 +1387,7 @@ fn finalize_background_launch(
     log_file: String,
     pid: u32,
     effective_preset: String,
-) {
+) -> Result<()> {
     instance_binding::persist_terminal_launch_context(
         ctx.db,
         ctx.instance_name,
@@ -1395,14 +1395,46 @@ fn finalize_background_launch(
         &effective_preset,
         Some(ctx.process_id),
     );
-    instances::update_instance_position(
-        ctx.db,
-        ctx.instance_name,
-        &serde_json::Map::from_iter([
-            ("pid".to_string(), json!(pid)),
-            ("background_log_file".to_string(), json!(&log_file)),
-        ]),
-    );
+    let updates =
+        serde_json::Map::from_iter([("background_log_file".to_string(), json!(&log_file))]);
+    let pid_identity = crate::db::observe_pid_identity(pid);
+    let persist_result = pid_identity
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|identity| {
+            ctx.db.update_instance_pid_with_identity_and_fields(
+                ctx.instance_name,
+                pid,
+                identity.as_deref(),
+                &updates,
+            )
+        });
+    if let Err(e) = persist_result {
+        // Keep the log path as diagnostics even though PID ownership was not
+        // established, and stop the untracked runner. Never kill by an
+        // unverified PID: it may already have exited and been reused. A runner
+        // that was alive but had no observable identity is still our unreaped
+        // child, so its PID can't have been recycled yet.
+        let _ = ctx.db.update_instance_fields(ctx.instance_name, &updates);
+        let still_ours = match pid_identity.as_ref() {
+            Ok(Some(expected)) => crate::sys::process::identity(pid).as_ref() == Some(expected),
+            Ok(None) => true,
+            Err(_) => false,
+        };
+        if still_ours {
+            let _ = crate::sys::process::kill_group(pid);
+        }
+        crate::log::log_error(
+            "launcher",
+            "background.persist_pid",
+            &format!("instance={} pid={} err={}", ctx.instance_name, pid, e),
+        );
+        bail!(
+            "failed to persist background process for '{}': {}",
+            ctx.instance_name,
+            e
+        );
+    }
     crate::pidtrack::record_pid(&crate::pidtrack::PidRecord {
         process_id: ctx.process_id,
         terminal_preset: &effective_preset,
@@ -1422,6 +1454,7 @@ fn finalize_background_launch(
         "log_file": log_file,
         "pid": pid,
     }));
+    Ok(())
 }
 
 fn launch_background_runner(
@@ -1488,7 +1521,7 @@ fn launch_pty_or_background(
             ctx.terminal_mode,
             inside_ai_tool,
         )?;
-        finalize_background_launch(ctx, log_file, pid, effective_preset);
+        finalize_background_launch(ctx, log_file, pid, effective_preset)?;
         Ok(true)
     } else {
         let effective_run_here = will_run_in_current_terminal(
@@ -2097,7 +2130,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                                     log_file,
                                     pid,
                                     effective_preset,
-                                );
+                                )?;
                                 Ok(true)
                             }
                             _ => Ok(false),

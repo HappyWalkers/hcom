@@ -657,7 +657,7 @@ impl Proxy {
         // SAFETY: pre_exec closure runs in the child process after fork() but before exec().
         // All operations are async-signal-safe (setsid, ioctl, dup2, close).
         // slave_fd and master_fd are i32 (Copy), captured by value before the OwnedFds are moved.
-        let child = unsafe {
+        let mut child = unsafe {
             Command::new(command)
                 .args(args)
                 .envs(
@@ -704,24 +704,43 @@ impl Proxy {
                 .spawn()
                 .context("spawn failed")?
         };
+        let child_pid = child.id();
+        let child_identity = crate::sys::process::identity(child_pid);
         let spawned_at = Instant::now();
         shared::log_spawned(
             config.instance_name.as_deref(),
-            Some(child.id()),
+            Some(child_pid),
             spawned_at.duration_since(spawn_started),
             command,
         );
         let startup_trace = shared::StartupTrace::new(spawned_at, config.instance_name.as_deref());
 
         // Write PID and launch context to database for hcom kill
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = crate::db::HcomDb::open()
-        {
-            let _ = db.update_instance_pid(instance_name, child.id());
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let db = crate::db::HcomDb::open()?;
+                // Our unreaped child can't have been recycled, so a missing identity
+                // (unobservable on this platform) just means no reuse protection.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    child_pid,
+                    child_identity.as_deref(),
+                )?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                // The child is still unreaped, so its PID (and the process group it
+                // leads after setsid) can't have been reused yet.
+                let _ = crate::sys::process::kill_group(child_pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to persist PTY process"));
+            }
         }
 
         // Close slave in parent

@@ -437,7 +437,6 @@ fn attach_runtime_state(
     }
 
     let mut updates = serde_json::Map::new();
-    updates.insert("pid".into(), serde_json::json!(orphan.pid));
     if !orphan.terminal_preset.is_empty() {
         updates.insert(
             "terminal_preset_effective".into(),
@@ -480,8 +479,13 @@ fn attach_runtime_state(
             ),
         );
     }
-    db.update_instance_fields(instance_name, &updates)
-        .map_err(|e| format!("failed to attach pid to '{}': {}", instance_name, e))?;
+    db.update_instance_pid_with_fields(instance_name, orphan.pid, &updates)
+        .map_err(|e| {
+            format!(
+                "failed to attach runtime state to '{}': {}",
+                instance_name, e
+            )
+        })?;
     Ok(())
 }
 
@@ -498,43 +502,58 @@ pub fn recover_single_orphan_to_db(
     orphan: &OrphanProcess,
     instance_name: &str,
 ) -> Result<(), String> {
-    use crate::instances;
     use crate::shared::constants::ST_LISTENING;
 
     let now = crate::shared::time::now_epoch_i64();
 
-    // Create instance row — this is the critical step; fail = abort recovery
     db.conn()
-        .execute(
-            "INSERT OR IGNORE INTO instances (name, tool, status, status_context, created_at) VALUES (?1, ?2, 'inactive', 'new', ?3)",
-            rusqlite::params![instance_name, orphan.tool, now],
-        )
-        .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
+        .execute_batch("SAVEPOINT hcom_recover_orphan")
+        .map_err(|e| format!("failed to begin orphan recovery: {e}"))?;
+    let recovery = (|| -> Result<(), String> {
+        // Create instance row — this is the critical step; fail = abort recovery
+        db.conn()
+            .execute(
+                "INSERT OR IGNORE INTO instances (name, tool, status, status_context, created_at) VALUES (?1, ?2, 'inactive', 'new', ?3)",
+                rusqlite::params![instance_name, orphan.tool, now],
+            )
+            .map_err(|e| format!("failed to insert instance '{}': {}", instance_name, e))?;
 
-    if !orphan.directory.is_empty() {
-        let mut updates = serde_json::Map::new();
-        updates.insert("directory".into(), serde_json::json!(orphan.directory));
-        instances::update_instance_position(db, instance_name, &updates);
+        if !orphan.directory.is_empty() {
+            let mut updates = serde_json::Map::new();
+            updates.insert("directory".into(), serde_json::json!(orphan.directory));
+            db.update_instance_fields(instance_name, &updates)
+                .map_err(|e| format!("failed to set orphan directory: {e}"))?;
+        }
+
+        // Create process binding
+        if !orphan.process_id.is_empty() {
+            db.set_process_binding(&orphan.process_id, &orphan.session_id, instance_name)
+                .map_err(|e| format!("failed to set process binding: {}", e))?;
+        }
+
+        // Create session binding
+        if !orphan.session_id.is_empty() {
+            db.rebind_session(&orphan.session_id, instance_name)
+                .map_err(|e| format!("failed to rebind session: {}", e))?;
+            let mut sid_update = serde_json::Map::new();
+            sid_update.insert("session_id".into(), serde_json::json!(orphan.session_id));
+            db.update_instance_fields(instance_name, &sid_update)
+                .map_err(|e| format!("failed to set orphan session id: {e}"))?;
+        }
+
+        attach_runtime_state(db, orphan, instance_name)
+    })();
+
+    if let Err(error) = recovery {
+        let _ = db.conn().execute_batch("ROLLBACK TO hcom_recover_orphan");
+        let _ = db.conn().execute_batch("RELEASE hcom_recover_orphan");
+        return Err(error);
     }
+    db.conn()
+        .execute_batch("RELEASE hcom_recover_orphan")
+        .map_err(|e| format!("failed to commit orphan recovery: {e}"))?;
 
-    // Create process binding
-    if !orphan.process_id.is_empty() {
-        db.set_process_binding(&orphan.process_id, &orphan.session_id, instance_name)
-            .map_err(|e| format!("failed to set process binding: {}", e))?;
-    }
-
-    // Create session binding
-    if !orphan.session_id.is_empty() {
-        db.rebind_session(&orphan.session_id, instance_name)
-            .map_err(|e| format!("failed to rebind session: {}", e))?;
-        let mut sid_update = serde_json::Map::new();
-        sid_update.insert("session_id".into(), serde_json::json!(orphan.session_id));
-        instances::update_instance_position(db, instance_name, &sid_update);
-    }
-
-    attach_runtime_state(db, orphan, instance_name)?;
-
-    // Set listening so PTY delivery gate allows message injection
+    // Set listening so PTY delivery gate allows message injection.
     lifecycle::set_status(
         db,
         instance_name,
@@ -744,6 +763,41 @@ mod tests {
         assert!(
             result.is_err(),
             "expected error when DB has no instances table"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_recover_single_orphan_rolls_back_partial_registration() {
+        let (_dir, _hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let db = crate::db::HcomDb::open().unwrap();
+        let orphan = OrphanProcess {
+            pid: u32::MAX,
+            tool: "claude".into(),
+            names: vec!["luna".into()],
+            directory: "/tmp".into(),
+            process_id: "proc-retry".into(),
+            terminal_preset: String::new(),
+            pane_id: String::new(),
+            terminal_id: String::new(),
+            kitty_listen_on: String::new(),
+            zellij_session_name: String::new(),
+            session_id: "sess-retry".into(),
+            notify_port: 0,
+            inject_port: 0,
+            tag: String::new(),
+        };
+
+        let result = recover_single_orphan_to_db(&db, &orphan, "luna");
+        assert!(result.is_err(), "unobservable PID must fail recovery");
+        assert!(
+            db.get_instance_full("luna").unwrap().is_none(),
+            "failed recovery must not strand an inactive row"
+        );
+        assert_eq!(
+            db.get_process_binding("proc-retry").unwrap(),
+            None,
+            "failed recovery must roll back process ownership"
         );
     }
 

@@ -139,7 +139,7 @@ impl Proxy {
             cmd.cwd(crate::shared::platform::child_process_path(&cwd));
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("ConPTY spawn failed")?;
@@ -150,26 +150,47 @@ impl Proxy {
             spawned_at.duration_since(spawn_started),
             command,
         );
+        // Install descendant cleanup immediately. Any later setup failure must
+        // still reap the spawned process tree.
+        let job = child.process_id().and_then(job::KillOnDropJob::assign);
         // The parent does not need the slave handle once the child holds it.
         drop(pair.slave);
 
         let writer = pair.master.take_writer().context("take_writer failed")?;
 
         // Persist PID so `hcom kill` can target the agent.
-        if let Some(ref instance_name) = config.instance_name
-            && let Ok(db) = HcomDb::open()
-            && let Some(pid) = child.process_id()
-        {
-            let _ = db.update_instance_pid(instance_name, pid);
+        if let Some(ref instance_name) = config.instance_name {
+            let persist_result = (|| -> Result<()> {
+                let pid = child
+                    .process_id()
+                    .context("ConPTY child has no process id")?;
+                let db = HcomDb::open()?;
+                // The child handle keeps this PID from being reused, so a missing
+                // identity only means no reuse protection for later cleanup.
+                db.update_instance_pid_with_identity(
+                    instance_name,
+                    pid,
+                    crate::sys::process::identity(pid).as_deref(),
+                )?;
 
-            // Capture minimal launch context early so kill can close the terminal pane.
-            // The start hook may later overwrite with richer context (git_branch, tty, env).
-            let _ = db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                // Capture minimal launch context early so kill can close the terminal pane.
+                // The start hook may later overwrite with richer context (git_branch, tty, env).
+                let _ =
+                    db.store_launch_context(instance_name, &shared::build_early_launch_context());
+                Ok(())
+            })();
+            if let Err(error) = persist_result {
+                // We still hold the child's handle, so its PID can't have been
+                // reused. Kill the tree, then the child itself, and reap it so
+                // nothing outlives the failed launch (matches the Unix path).
+                if let Some(pid) = child.process_id() {
+                    let _ = crate::sys::process::kill_group(pid);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.context("failed to persist ConPTY process"));
+            }
         }
-
-        // Tie the child to a kill-on-close job so its whole tree is reaped if we
-        // die abnormally (the explicit snapshot-kill in Drop covers clean exit).
-        let job = child.process_id().and_then(job::KillOnDropJob::assign);
 
         let initial_name = config.instance_name.clone().unwrap_or_default();
 

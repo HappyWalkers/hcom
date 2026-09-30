@@ -279,7 +279,14 @@ fn start_from_orphan(
     };
 
     // Core DB registration
-    let _ = pidtrack::recover_single_orphan_to_db(db, orphan, &name);
+    if let Err(e) = pidtrack::recover_single_orphan_to_db(db, orphan, &name) {
+        // Release a generated name's reservation row so retries don't strand
+        // one pending placeholder per attempt.
+        if !can_reuse {
+            let _ = db.delete_instance(&name);
+        }
+        bail!("Failed to recover orphan PID {pid}: {e}");
+    }
 
     db.log_event(
         "life",

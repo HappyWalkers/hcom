@@ -721,6 +721,23 @@ fn kill_instance(
             &format!("name={name} err={e}"),
         );
     }
+    // The PID now belongs to an unrelated process (reboot, crash): don't
+    // signal it or resolve a pane through it. A merely dead PID falls through
+    // so its group and pane are still cleaned up.
+    if instance.pid_reused(pid) {
+        log_info(
+            "kill",
+            "lifecycle.kill_pid_reused",
+            &format!("name={name} pid={pid} now belongs to another process; not signalling"),
+        );
+        return (
+            terminal::KillResult::AlreadyDead,
+            false,
+            None,
+            String::new(),
+            String::new(),
+        );
+    }
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed, pane_retry_command) =
