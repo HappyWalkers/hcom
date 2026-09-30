@@ -7,6 +7,8 @@
 //! - Inject: TCP injection server
 //! - Delivery: Notify-driven message delivery (integrated)
 
+#[cfg(unix)]
+mod forward;
 mod inject;
 pub mod screen;
 #[cfg(any(unix, windows))]
@@ -49,6 +51,8 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
+use forward::{ChildInput, InputOrigin, PendingWrite, QUEUE_LIMIT, TerminalOutput, WRITE_BATCH};
 #[cfg(unix)]
 use inject::InjectServer;
 #[cfg(unix)]
@@ -811,9 +815,11 @@ impl Proxy {
     pub fn run(&mut self) -> Result<i32> {
         let stdin_fd = io::stdin();
         let stdout_fd = io::stdout();
-        let _stdout_flags = NonblockingGuard::new(stdout_fd.as_fd())?;
+        let output_writer = TerminalOutput::new(stdout_fd.as_fd())?;
         let mut terminal_output = PendingWrite::default();
-        let mut child_input = PendingWrite::default();
+        let mut child_input = ChildInput::default();
+        let mut output_eof = false;
+        let mut child_exited = false;
 
         // Check if stdout is a TTY before writing escape sequences
         let stdout_is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
@@ -885,9 +891,11 @@ impl Proxy {
                 break;
             }
 
-            // The master may be omitted while stdout is backed up. Detect
-            // child exit independently so backpressure cannot prevent cleanup.
-            if self.child.try_wait()?.is_some() {
+            child_exited |= self.child.try_wait()?.is_some();
+            if output_writer.pump(&mut terminal_output).is_err() {
+                break; // Terminal closed: preserve the existing cleanup path.
+            }
+            if output_eof && terminal_output.is_empty() && output_writer.len() == 0 {
                 break;
             }
 
@@ -904,10 +912,10 @@ impl Proxy {
             // Stop reading child output under terminal backpressure, while still
             // servicing input, screen requests, signals, and pending writes.
             let mut master_events = PollFlags::empty();
-            if terminal_output.len() < 1024 * 1024 {
+            if !output_eof && terminal_output.len() + output_writer.len() < QUEUE_LIMIT {
                 master_events |= PollFlags::POLLIN;
             }
-            if !child_input.is_empty() {
+            if !child_exited && !child_input.is_empty() {
                 master_events |= PollFlags::POLLOUT;
             }
             let mut poll_fds = Vec::new();
@@ -924,20 +932,15 @@ impl Proxy {
             // the poll set, not just pass empty events, because some platforms
             // (macOS) may still return immediately for a readable fd even with
             // events=0.
-            let stdin_idx = if poll_stdin && child_input.len() < 1024 * 1024 {
+            let stdin_idx = if poll_stdin && !child_exited && child_input.len() < QUEUE_LIMIT {
                 let idx = poll_fds.len();
                 poll_fds.push(PollFd::new(stdin_borrowed, PollFlags::POLLIN));
                 Some(idx)
             } else {
                 None
             };
-            let stdout_idx = if terminal_output.is_empty() {
-                None
-            } else {
-                let idx = poll_fds.len();
-                poll_fds.push(PollFd::new(stdout_fd.as_fd(), PollFlags::POLLOUT));
-                Some(idx)
-            };
+            let output_notify_idx = poll_fds.len();
+            poll_fds.push(PollFd::new(output_writer.wake_fd(), PollFlags::POLLIN));
 
             let title_notify_idx = poll_fds.len();
             poll_fds.push(PollFd::new(
@@ -958,8 +961,11 @@ impl Proxy {
             };
 
             // Add inject client fds
-            let client_raw_fds: Vec<i32> = self.inject_server.client_raw_fds().collect();
-            for raw_fd in &client_raw_fds {
+            let client_fds = self
+                .inject_server
+                .pollable_clients(QUEUE_LIMIT.saturating_sub(child_input.len()));
+            let clients_base = poll_fds.len();
+            for (_, raw_fd) in &client_fds {
                 let fd = unsafe { BorrowedFd::borrow_raw(*raw_fd) };
                 poll_fds.push(PollFd::new(fd, PollFlags::POLLIN));
             }
@@ -986,6 +992,9 @@ impl Proxy {
                     delivery_start_timeout,
                     startup_time.elapsed(),
                 ));
+            }
+            if child_exited {
+                poll_timeout = poll_timeout.min(100);
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
@@ -1070,24 +1079,42 @@ impl Proxy {
             // kernel PTY buffer (~4KB on macOS) splits them across reads. Writing each
             // read individually makes the terminal render partial frames (flicker).
             // Draining coalesces the fragments into one write.
-            if let Some(idx) = stdout_idx
-                && let Some(events) = poll_fds[idx].revents()
+            if poll_fds[output_notify_idx]
+                .revents()
+                .is_some_and(|events| events.contains(PollFlags::POLLIN))
+                && output_writer.pump(&mut terminal_output).is_err()
             {
-                if events.intersects(PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL)
-                {
-                    break;
-                }
-                if events.contains(PollFlags::POLLOUT) {
-                    terminal_output.flush(&stdout_fd)?;
-                }
+                break;
             }
             if let Some(idx) = master_idx
                 && let Some(revents) = poll_fds[idx].revents()
             {
                 if revents.contains(PollFlags::POLLOUT) {
-                    child_input.flush(&self.pty_master)?;
+                    for origin in child_input.flush(&self.pty_master)? {
+                        match origin {
+                            InputOrigin::User => {
+                                if self.config.target.name() != "cursor" {
+                                    self.screen.clear_approval();
+                                }
+                                shared::note_user_keystroke(
+                                    &self.config.target,
+                                    &self.delivery_state,
+                                    &|a| self.publish_approval(a),
+                                );
+                            }
+                            InputOrigin::Injected => {
+                                if shared::clear_injected_approval_state(
+                                    &self.config.target,
+                                    &self.delivery_state,
+                                    &|a| self.publish_approval(a),
+                                ) {
+                                    self.screen.clear_approval();
+                                }
+                            }
+                        }
+                    }
                 }
-                if revents.contains(PollFlags::POLLIN) {
+                if !output_eof && revents.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
                     let mut coalesced = Vec::new();
                     let mut raw_chunks: Vec<Vec<u8>> = Vec::new();
                     let mut had_title_this_drain = false;
@@ -1101,8 +1128,9 @@ impl Proxy {
                     // by microseconds. Without this second chance, we'd write the first
                     // chunk alone and the terminal renders a partial frame (flicker).
                     let mut eagain_retries = 0;
+                    let mut read_bytes = 0;
                     loop {
-                        if coalesced.len() >= 256 * 1024 {
+                        if read_bytes >= WRITE_BATCH {
                             break;
                         }
                         match nix_read(&self.pty_master, &mut buf) {
@@ -1111,6 +1139,7 @@ impl Proxy {
                                 break;
                             }
                             Ok(n) => {
+                                read_bytes += n;
                                 eagain_retries = 0; // reset on successful read
                                 let data = &buf[..n];
                                 raw_chunks.push(data.to_vec());
@@ -1234,14 +1263,12 @@ impl Proxy {
                     }
 
                     if hit_eof {
-                        break;
+                        output_eof = true;
+                        terminal_output.push(&title_filter.flush());
                     }
                     if let Some(e) = hit_error {
                         bail!("read from pty failed: {}", e);
                     }
-                }
-                if revents.contains(PollFlags::POLLHUP) {
-                    break;
                 }
             }
 
@@ -1265,7 +1292,8 @@ impl Proxy {
                     // terminal-disconnect signal for headless PTY launches.
                     poll_stdin = false;
                 } else if revents.contains(PollFlags::POLLIN) {
-                    match nix_read(&stdin_fd, &mut buf) {
+                    let capacity = buf.len().min(QUEUE_LIMIT.saturating_sub(child_input.len()));
+                    match nix_read(&stdin_fd, &mut buf[..capacity]) {
                         Ok(0) => {
                             // stdin EOF: only treat as terminal disconnect if stdin is a real TTY.
                             // When running headless, stdin may be /dev/null or a pipe,
@@ -1285,20 +1313,8 @@ impl Proxy {
 
                             if has_user_input {
                                 self.last_user_input = Instant::now();
-                                // Genuine keystrokes answering a title-detected approval
-                                // clear it immediately. Cursor's approval is screen-scraped
-                                // and authoritative-by-prompt, so it clears only when the
-                                // prompt actually leaves the screen.
-                                let cursor_scrape = self.config.target.name() == "cursor";
-                                if !cursor_scrape {
-                                    self.screen.clear_approval();
-                                }
-                                shared::note_user_keystroke(
-                                    &self.config.target,
-                                    &self.delivery_state,
-                                    &|a| self.publish_approval(a),
-                                );
                             }
+                            let origin = has_user_input.then_some(InputOrigin::User);
                             // Copilot pauses stdin processing on terminal focus-out
                             // (it enables DECSET 1004). Since hcom drives it via
                             // injection, that pause silently stalls delivery until the
@@ -1306,9 +1322,9 @@ impl Proxy {
                             if self.config.target.name() == "copilot"
                                 && let Some(filtered) = focus_filtered
                             {
-                                child_input.push(&filtered);
+                                child_input.push(&filtered, origin);
                             } else {
-                                child_input.push(&buf[..n]);
+                                child_input.push(&buf[..n], origin);
                             }
                         }
                         Err(Errno::EAGAIN) => {}
@@ -1329,32 +1345,19 @@ impl Proxy {
                 }
             }
 
-            // Handle inject client data (process in reverse to handle removals)
-            // Clients are pushed immediately after the listener (or immediately after
-            // stdin when listener is in backoff), so their base index shifts by one
-            // depending on whether the listener is present this iteration.
-            let clients_base = inject_listener_idx
-                .map_or_else(|| poll_fds.len() - client_raw_fds.len(), |idx| idx + 1);
-            for i in (0..client_raw_fds.len()).rev() {
-                let poll_idx = clients_base + i;
+            // Reverse client order so removals cannot invalidate later indexes.
+            for (offset, &(i, _)) in client_fds.iter().enumerate().rev() {
+                let poll_idx = clients_base + offset;
                 if let Some(revents) = poll_fds[poll_idx].revents()
                     && (revents.contains(PollFlags::POLLIN) || revents.contains(PollFlags::POLLHUP))
                 {
-                    match self.inject_server.read_client(i)? {
+                    match self
+                        .inject_server
+                        .read_client_with_budget(i, QUEUE_LIMIT.saturating_sub(child_input.len()))?
+                    {
                         inject::InjectResult::Inject(text) => {
-                            child_input.push(text.as_bytes());
-                            // Injected keystrokes reach the PTY master directly and
-                            // bypass the interactive stdin handler. When one answers a
-                            // pending approval, publish the cleared edge synchronously
-                            // here — while the row is still blocked — instead of leaving
-                            // it to the scrape falling edge, which races (and loses to)
-                            // lifecycle hooks and drops the `pty:approval_cleared` event.
-                            if shared::clear_injected_approval_state(
-                                &self.config.target,
-                                &self.delivery_state,
-                                &|a| self.publish_approval(a),
-                            ) {
-                                self.screen.clear_approval();
+                            if !child_exited {
+                                child_input.push(text.as_bytes(), Some(InputOrigin::Injected));
                             }
                         }
                         inject::InjectResult::Query(client) => match client.command {
@@ -1396,7 +1399,12 @@ impl Proxy {
             // but only when that write left no incomplete UTF-8 or escape sequence
             // (`title_write_safe`) — splitting one would corrupt the stream.
             // pending_utf8/pending_escape carry that state across read boundaries.
-            if stdout_is_tty && title_enabled && title_write_safe(pending_utf8, pending_escape) {
+            if !output_eof
+                && terminal_output.len() + output_writer.len() < QUEUE_LIMIT
+                && stdout_is_tty
+                && title_enabled
+                && title_write_safe(pending_utf8, pending_escape)
+            {
                 let (name, status) = {
                     let n = self
                         .current_name
@@ -1442,33 +1450,8 @@ impl Proxy {
             }
         }
 
-        // Flush any held prefix bytes from title filter
-        if stdout_is_tty {
-            let remaining = title_filter.flush();
-            if !remaining.is_empty() {
-                terminal_output.push(&remaining);
-            }
-        }
-
-        // Flush what the terminal can accept without delaying shutdown forever.
-        let flush_deadline = Instant::now() + Duration::from_millis(250);
-        while !terminal_output.is_empty() && Instant::now() < flush_deadline {
-            let mut output_poll = [PollFd::new(stdout_fd.as_fd(), PollFlags::POLLOUT)];
-            match poll(&mut output_poll, PollTimeout::from(10u16)) {
-                Ok(_)
-                    if output_poll[0]
-                        .revents()
-                        .is_some_and(|events| events.contains(PollFlags::POLLOUT)) =>
-                {
-                    if terminal_output.flush(&stdout_fd).is_err() {
-                        break;
-                    }
-                }
-                Err(Errno::EINTR) => continue,
-                Err(_) => break,
-                _ => {}
-            }
-        }
+        // Normal EOF drains through the control loop above. Forced termination
+        // or a disconnected terminal may abandon output rather than delay exit.
 
         // Reap first so EOF/HUP races cannot make try_wait() miss a fast child
         // exit. drain_and_wait_child also feeds trailing PTY bytes into the
@@ -1705,70 +1688,6 @@ fn title_wake_callback(write_fd: Arc<OwnedFd>) -> crate::delivery::TitleWake {
 }
 
 #[cfg(unix)]
-#[derive(Default)]
-struct PendingWrite {
-    bytes: Vec<u8>,
-    offset: usize,
-}
-
-#[cfg(unix)]
-impl PendingWrite {
-    fn len(&self) -> usize {
-        self.bytes.len() - self.offset
-    }
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-    fn push(&mut self, bytes: &[u8]) {
-        if self.offset > 0 {
-            self.bytes.drain(..self.offset);
-            self.offset = 0;
-        }
-        self.bytes.extend_from_slice(bytes);
-    }
-    fn flush<F: AsFd>(&mut self, fd: &F) -> Result<()> {
-        // Bound work per iteration even when the peer consumes continuously.
-        let end = self.bytes.len().min(self.offset + 256 * 1024);
-        while self.offset < end {
-            match write(fd, &self.bytes[self.offset..end]) {
-                Ok(0) => bail!("write returned zero"),
-                Ok(n) => self.offset += n,
-                Err(Errno::EINTR) => continue,
-                Err(Errno::EAGAIN) => return Ok(()),
-                Err(e) => bail!("write failed: {}", e),
-            }
-        }
-        if self.offset == self.bytes.len() {
-            self.bytes.clear();
-            self.offset = 0;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-struct NonblockingGuard<'a> {
-    fd: BorrowedFd<'a>,
-    flags: OFlag,
-}
-
-#[cfg(unix)]
-impl<'a> NonblockingGuard<'a> {
-    fn new(fd: BorrowedFd<'a>) -> Result<Self> {
-        let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
-        fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
-        Ok(Self { fd, flags })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for NonblockingGuard<'_> {
-    fn drop(&mut self) {
-        let _ = fcntl(self.fd, FcntlArg::F_SETFL(self.flags));
-    }
-}
-
-#[cfg(unix)]
 fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
@@ -1862,23 +1781,6 @@ mod tests {
         let mut expected = payload;
         expected.extend_from_slice(b"tail");
         assert_eq!(received, expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn nonblocking_guard_restores_descriptor_flags() {
-        use std::os::fd::AsFd;
-        let (reader, _writer) = nix::unistd::pipe().unwrap();
-        let before = nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
-        {
-            let _guard = super::NonblockingGuard::new(reader.as_fd()).unwrap();
-            let during = nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
-            assert_ne!(during & libc::O_NONBLOCK, 0);
-        }
-        assert_eq!(
-            nix::fcntl::fcntl(reader.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap(),
-            before
-        );
     }
 
     #[test]

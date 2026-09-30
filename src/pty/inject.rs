@@ -8,6 +8,10 @@ use std::os::fd::AsRawFd;
 
 /// Magic prefix for query commands (not injection)
 const QUERY_PREFIX: u8 = 0x00;
+// Bound incomplete requests as well as the PTY queue. Larger requests are
+// rejected rather than letting a sender hold unbounded memory in the proxy.
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CLIENTS: usize = 32;
 
 /// Result of reading from an inject client
 pub enum InjectResult {
@@ -74,14 +78,36 @@ impl InjectServer {
         self.listener.as_raw_fd()
     }
 
-    /// Get raw file descriptors for active clients (Unix poll loop only).
+    /// Screen queries remain readable even when the child stops consuming input.
     #[cfg(unix)]
-    pub fn client_raw_fds(&self) -> impl Iterator<Item = i32> + '_ {
-        self.clients.iter().map(|(stream, _)| stream.as_raw_fd())
+    pub fn pollable_clients(&self, input_budget: usize) -> Vec<(usize, i32)> {
+        self.clients
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (stream, buffer))| {
+                let mut first = [0u8; 1];
+                let peek = stream.peek(&mut first).ok();
+                let query = buffer
+                    .first()
+                    .copied()
+                    .or_else(|| (peek == Some(1)).then_some(first[0]))
+                    == Some(QUERY_PREFIX);
+                let can_read = if peek == Some(0) && !buffer.is_empty() {
+                    let decoded_len = Self::process_inject_data(buffer).len();
+                    decoded_len <= input_budget || decoded_len > MAX_REQUEST_BYTES
+                } else {
+                    buffer.len() < input_budget || buffer.len() >= MAX_REQUEST_BYTES
+                };
+                // An unclassified idle connection must stay polled so a SCREEN
+                // command arriving later wakes the proxy under input backpressure.
+                let unknown = buffer.is_empty() && peek.is_none();
+                (query || can_read || unknown).then_some((index, stream.as_raw_fd()))
+            })
+            .collect()
     }
 
     /// Number of connected inject clients (portable; the Unix loop uses
-    /// `client_raw_fds().count()`, but tests and the Windows loop need this
+    /// `pollable_clients`, but tests and the Windows loop need this
     /// without raw fds).
     #[cfg(any(test, windows))]
     pub fn client_count(&self) -> usize {
@@ -98,6 +124,10 @@ impl InjectServer {
         match self.listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(true)?;
+                if self.clients.len() >= MAX_CLIENTS {
+                    let _ = (&stream).write_all(b"error: too many pending injection clients\n");
+                    return Ok(true);
+                }
                 self.clients.push((stream, Vec::new()));
                 Ok(true)
             }
@@ -110,7 +140,16 @@ impl InjectServer {
     /// - Inject(text): text to write to PTY
     /// - ScreenQuery(index): caller should dump screen and call respond_query()
     /// - Pending: no data ready yet
+    #[cfg(any(windows, test))]
     pub fn read_client(&mut self, index: usize) -> Result<InjectResult> {
+        self.read_client_with_budget(index, MAX_REQUEST_BYTES)
+    }
+
+    pub fn read_client_with_budget(
+        &mut self,
+        index: usize,
+        input_budget: usize,
+    ) -> Result<InjectResult> {
         if index >= self.clients.len() {
             return Ok(InjectResult::Pending);
         }
@@ -118,28 +157,75 @@ impl InjectServer {
         let (stream, buffer) = &mut self.clients[index];
         let mut buf = [0u8; 8192];
 
+        let mut read_bytes = 0;
         loop {
-            match stream.read(&mut buf) {
+            let mut first = [0u8; 1];
+            let query = buffer
+                .first()
+                .copied()
+                .or_else(|| (stream.peek(&mut first).ok() == Some(1)).then_some(first[0]))
+                == Some(QUERY_PREFIX);
+            let limit = if query {
+                MAX_REQUEST_BYTES
+            } else {
+                input_budget.min(MAX_REQUEST_BYTES)
+            };
+            let capacity = limit.saturating_sub(buffer.len());
+            let count = buf.len().min(capacity);
+            // At the budget boundary, only consume EOF. Leave further bytes
+            // in TCP so the sender experiences backpressure until PTY input drains.
+            if count == 0 {
+                let mut peek = [0u8; 1];
+                match stream.peek(&mut peek) {
+                    Ok(0) => {}
+                    Ok(_) if buffer.len() >= MAX_REQUEST_BYTES => {
+                        let _ = stream.write_all(b"error: injection request exceeds 1 MiB\n");
+                        crate::log::log_warn(
+                            "native",
+                            "inject.request_too_large",
+                            "Rejected injection request exceeding 1 MiB",
+                        );
+                        self.clients.remove(index);
+                        return Ok(InjectResult::Pending);
+                    }
+                    _ => return Ok(InjectResult::Pending),
+                }
+            }
+            // A one-byte read here observes the EOF established by peek above.
+            match stream.read(&mut buf[..count.max(1)]) {
                 Ok(0) => {
                     // EOF - client closed, process the data
-                    let data = std::mem::take(buffer);
+                    let data = buffer.as_slice();
 
                     // Check for command (starts with \x00)
                     if data.first() == Some(&QUERY_PREFIX) {
                         let cmd = std::str::from_utf8(&data[1..]).unwrap_or("").trim();
-                        let (stream, _) = self.clients.remove(index);
                         let command = match cmd {
                             "SCREEN" => QueryCommand::Screen,
                             _ => QueryCommand::Unknown,
                         };
+                        let (stream, _) = self.clients.remove(index);
                         return Ok(InjectResult::Query(QueryClient { stream, command }));
                     }
 
+                    let text = Self::process_inject_data(data);
+                    if text.len() > MAX_REQUEST_BYTES {
+                        let _ = stream.write_all(b"error: decoded injection exceeds 1 MiB\n");
+                        self.clients.remove(index);
+                        return Ok(InjectResult::Pending);
+                    }
+                    if text.len() > input_budget {
+                        return Ok(InjectResult::Pending);
+                    }
                     self.clients.remove(index);
-                    return Ok(InjectResult::Inject(self.process_inject_data(&data)));
+                    return Ok(InjectResult::Inject(text));
                 }
                 Ok(n) => {
                     buffer.extend_from_slice(&buf[..n]);
+                    read_bytes += n;
+                    if read_bytes >= 64 * 1024 {
+                        return Ok(InjectResult::Pending);
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;
@@ -156,7 +242,7 @@ impl InjectServer {
 
     /// Process injection data: decode and strip trailing LF
     /// Fix #7: Use UTF-8 with Latin-1 fallback instead of lossy (which mangles bytes)
-    fn process_inject_data(&self, data: &[u8]) -> String {
+    fn process_inject_data(data: &[u8]) -> String {
         let mut text = match String::from_utf8(data.to_vec()) {
             Ok(s) => s,
             Err(_) => {
@@ -208,6 +294,43 @@ mod tests {
 
         assert!(accepted);
         assert_eq!(server.client_count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn screen_queries_bypass_input_backpressure() {
+        let mut server = InjectServer::new().unwrap();
+        let mut text = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        text.write_all(b"queued").unwrap();
+        text.shutdown(Shutdown::Write).unwrap();
+        assert!(server.accept().unwrap());
+        assert!(matches!(
+            server.read_client_with_budget(0, 3).unwrap(),
+            InjectResult::Pending
+        ));
+        assert_eq!(server.clients[0].1, b"que");
+        assert!(server.pollable_clients(0).is_empty());
+
+        let mut query = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
+        assert!(server.accept().unwrap());
+        // Unclassified connections remain polled even before their first byte.
+        assert_eq!(server.pollable_clients(0).len(), 1);
+        query.write_all(b"\0SCREEN\n").unwrap();
+        query.shutdown(Shutdown::Write).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if matches!(
+                server.read_client_with_budget(1, 0).unwrap(),
+                InjectResult::Query(_)
+            ) {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(server.read_client_with_budget(0, 6).unwrap(), InjectResult::Inject(text) if text == "queued")
+        );
     }
 
     #[test]
