@@ -1594,14 +1594,26 @@ pub fn finalize_session(
         &format!("instance={} reason={}", instance_name, reason),
     );
 
-    // Set inactive status
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_INACTIVE,
-        &format!("exit:{}", reason),
-        Default::default(),
-    );
+    // `hcom kill` records exit:killed + its initiator before signalling, and the
+    // tool's SessionEnd fires in response to that signal. Keep the kill as the
+    // stop reason: overwriting it here would make whichever finalizer wins (this
+    // hook, the PTY cleanup, or the kill command) record a plain session exit.
+    let killed_by = db
+        .get_instance_full(instance_name)
+        .ok()
+        .flatten()
+        .filter(|inst| inst.status_context == "exit:killed")
+        .map(|inst| inst.status_detail);
+
+    if killed_by.is_none() {
+        lifecycle::set_status(
+            db,
+            instance_name,
+            ST_INACTIVE,
+            &format!("exit:{}", reason),
+            Default::default(),
+        );
+    }
 
     // Persist metadata updates
     if let Some(updates) = updates {
@@ -1609,7 +1621,13 @@ pub fn finalize_session(
     }
 
     // Full stop_instance chain: snapshot, cleanup bindings, log, delete
-    stop_instance(db, instance_name, "session", &format!("exit:{}", reason));
+    match killed_by {
+        Some(initiator) if !initiator.is_empty() => {
+            stop_instance(db, instance_name, &initiator, "killed")
+        }
+        Some(_) => stop_instance(db, instance_name, "session", "killed"),
+        None => stop_instance(db, instance_name, "session", &format!("exit:{}", reason)),
+    };
 }
 
 /// Update instance status for tool execution.
@@ -2584,6 +2602,42 @@ mod tests {
             [], |r| r.get(0)
         ).unwrap();
         assert_eq!(count, 1, "stopped life event should be logged");
+    }
+
+    #[test]
+    fn test_finalize_session_keeps_recorded_kill() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        let _ = db.conn().execute(
+            "INSERT INTO instances (name, tool, session_id, status, status_context, status_time, created_at)
+             VALUES ('inst', 'claude', 'sess-1', 'active', 'running', 0, 0)",
+            [],
+        );
+        db.mark_killed("inst", "boss").unwrap();
+
+        // The tool's SessionEnd fires in response to the kill's SIGTERM.
+        finalize_session(&db, "inst", "other", None);
+
+        let (by, reason): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT json_extract(data, '$.by'), json_extract(data, '$.reason') FROM events
+                 WHERE type = 'life' AND instance = 'inst' AND json_extract(data, '$.action') = 'stopped'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((by.as_str(), reason.as_str()), ("boss", "killed"));
+        let exit_statuses: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE type = 'status' AND instance = 'inst'
+                 AND json_extract(data, '$.context') = 'exit:other'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exit_statuses, 0, "SessionEnd must not overwrite the kill");
     }
 
     #[test]
