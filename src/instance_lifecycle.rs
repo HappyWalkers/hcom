@@ -499,7 +499,7 @@ fn extract_launch_failure_detail(data: &InstanceRow) -> Option<String> {
     }
 }
 
-fn read_launch_log_tail(path: &str) -> Option<String> {
+pub(crate) fn read_launch_log_tail(path: &str) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut lines: Vec<&str> = content
         .lines()

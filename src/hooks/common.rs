@@ -1630,6 +1630,22 @@ pub fn finalize_session(
     };
 }
 
+/// Whether launch `batch_id` has emitted `ready` for `instance_name`.
+pub fn launch_reached_ready(db: &HcomDb, instance_name: &str, batch_id: &str) -> bool {
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                WHERE type = 'life' AND instance = ?1
+                  AND json_extract(data, '$.action') = 'ready'
+                  AND json_extract(data, '$.batch_id') = ?2
+            )",
+            rusqlite::params![instance_name, batch_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(true)
+}
+
 /// Update instance status for tool execution.
 ///
 /// Calls extract_tool_detail for tool-specific detail formatting,
@@ -2602,6 +2618,21 @@ mod tests {
             [], |r| r.get(0)
         ).unwrap();
         assert_eq!(count, 1, "stopped life event should be logged");
+    }
+
+    #[test]
+    fn test_launch_reached_ready_is_scoped_to_batch() {
+        crate::config::Config::init();
+        let (_dir, db) = make_test_db();
+        // An earlier launch of the same name was ready; the current one is not.
+        db.log_event(
+            "life",
+            "inst",
+            &serde_json::json!({"action": "ready", "batch_id": "old"}),
+        )
+        .unwrap();
+        assert!(launch_reached_ready(&db, "inst", "old"));
+        assert!(!launch_reached_ready(&db, "inst", "new"));
     }
 
     #[test]

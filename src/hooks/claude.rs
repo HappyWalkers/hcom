@@ -1999,6 +1999,26 @@ fn handle_sessionend(
         return (0, String::new());
     }
 
+    // Claude fires SessionEnd even when it dies at startup (e.g. a rejected
+    // `--resume`). For an hcom PTY launch that never became ready, leave the
+    // row to the PTY exit path: it records launch_failed with Claude's own
+    // output, then stops the row. Stopping it here first would hand launch
+    // waiters a bare `exit:other` instead.
+    if std::env::var("HCOM_PTY_MODE").as_deref() == Ok("1")
+        && std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1")
+        && let Ok(batch_id) = std::env::var("HCOM_LAUNCH_BATCH_ID")
+        && !common::launch_reached_ready(db, instance_name, &batch_id)
+    {
+        log::log_info(
+            "hooks",
+            "sessionend.deferred_to_pty",
+            &format!("instance={instance_name} reason={reason} launch not ready"),
+        );
+        instances::update_instance_position(db, instance_name, updates);
+        cleanup_sessionend_scoped_state(db, session_id);
+        return (0, String::new());
+    }
+
     common::finalize_session(
         db,
         instance_name,
@@ -6012,6 +6032,77 @@ mod tests {
             stopped_events, 1,
             "concurrent duplicate delivery must log exactly one life.stopped event, not {n}"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn sessionend_defers_until_current_launch_is_ready() {
+        let (_dir, _guard, db) = make_isolated_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, session_id, tool, status, status_context, created_at)
+             VALUES ('nova', 'sess-1', 'claude', 'inactive', 'new', 1)",
+                [],
+            )
+            .unwrap();
+        db.log_event(
+            "life",
+            "nova",
+            &serde_json::json!({"action": "ready", "batch_id": "old"}),
+        )
+        .unwrap();
+
+        struct LaunchEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for LaunchEnv {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: this test is serialized.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _launch_env = LaunchEnv(
+            ["HCOM_PTY_MODE", "HCOM_LAUNCHED", "HCOM_LAUNCH_BATCH_ID"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        // SAFETY: this test is serialized; LaunchEnv restores these variables.
+        unsafe {
+            std::env::set_var("HCOM_PTY_MODE", "1");
+            std::env::set_var("HCOM_LAUNCHED", "1");
+            std::env::set_var("HCOM_LAUNCH_BATCH_ID", "current");
+        }
+        let raw = serde_json::json!({"reason": "other"});
+        let updates = serde_json::Map::from_iter([(
+            "transcript_path".into(),
+            serde_json::json!("/tmp/deferred-session.jsonl"),
+        )]);
+        handle_sessionend(&db, "nova", "sess-1", &raw, &updates);
+        let instance = db.get_instance_full("nova").unwrap().unwrap();
+        assert_eq!(instance.transcript_path, "/tmp/deferred-session.jsonl");
+        let stopped: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE json_extract(data, '$.action') = 'stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stopped, 0);
+        db.log_event(
+            "life",
+            "nova",
+            &serde_json::json!({"action": "ready", "batch_id": "current"}),
+        )
+        .unwrap();
+        handle_sessionend(&db, "nova", "sess-1", &raw, &serde_json::Map::new());
+        assert!(db.get_instance_full("nova").unwrap().is_none());
     }
 
     /// A delayed SessionEnd from a historical Claude session must not finalize

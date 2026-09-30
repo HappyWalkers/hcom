@@ -375,11 +375,7 @@ fn prepare_resume_plan_from_source(
     };
 
     if session_id.is_empty() {
-        bail!(
-            "No session ID found for '{}' — cannot {}",
-            display_name,
-            if fork { "fork" } else { "resume" }
-        );
+        bail!(missing_session_error(db, &display_name, fork));
     }
 
     validate_resume_operation(&tool, fork)?;
@@ -561,6 +557,41 @@ fn prepare_resume_plan_from_source(
         session_id,
         tracked_fork_identity,
     })
+}
+
+/// A missing session is not evidence that no work happened. Refuse to
+/// relaunch, and include the last launch's saved output when available.
+fn missing_session_error(db: &HcomDb, name: &str, fork: bool) -> String {
+    let log_file = db
+        .get_instance_full(name)
+        .ok()
+        .flatten()
+        .map(|instance| instance.background_log_file)
+        .or_else(|| {
+            db.conn()
+                .query_row(
+                    "SELECT json_extract(data, '$.snapshot.background_log_file')
+                     FROM events WHERE type = 'life' AND instance = ?1
+                       AND json_extract(data, '$.action') = 'stopped'
+                     ORDER BY id DESC LIMIT 1",
+                    [name],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+        });
+    let mut message = format!(
+        "No session ID recorded for '{name}' — cannot {}",
+        if fork { "fork" } else { "resume" }
+    );
+    if let Some(tail) = log_file
+        .filter(|path| !path.is_empty())
+        .and_then(|path| crate::instance_lifecycle::read_launch_log_tail(&path))
+    {
+        message.push_str("\nSaved PTY output:\n");
+        message.push_str(&tail);
+    }
+    message
 }
 
 fn execute_prepared_resume(
@@ -2411,6 +2442,70 @@ mod tests {
         db.init_db().unwrap();
         std::mem::forget(dir);
         db
+    }
+
+    #[test]
+    fn missing_session_refuses_resume_and_fork_with_saved_output() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("pty.log");
+        std::fs::write(&log, "Startup failed: invalid model\n").unwrap();
+        db.log_event(
+            "life",
+            "luna",
+            &json!({
+                "action": "stopped",
+                "snapshot": {
+                    "tool": "codex", "session_id": "", "launch_args": "[]",
+                    "background_log_file": log,
+                }
+            }),
+        )
+        .unwrap();
+        for fork in [false, true] {
+            let error = prepare_resume_plan(&db, "luna", fork, &[], &GlobalFlags::default())
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains("No session ID recorded"), "{error}");
+            assert!(error.contains(if fork { "cannot fork" } else { "cannot resume" }));
+            assert!(error.contains("Saved PTY output:\nStartup failed: invalid model"));
+        }
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        std::fs::remove_file(log).unwrap();
+        let error = prepare_resume_plan(&db, "luna", false, &[], &GlobalFlags::default())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("cannot resume"));
+        assert!(!error.contains("PTY output"));
+    }
+
+    #[test]
+    fn recorded_session_is_passed_to_native_resume_without_disk_lookup() {
+        let db = test_db();
+        for tool in ["claude", "pi", "omp"] {
+            db.log_event(
+                "life",
+                tool,
+                &json!({
+                    "action": "stopped",
+                    "snapshot": {"tool": tool, "session_id": "missing-on-disk", "launch_args": "[]"}
+                }),
+            )
+            .unwrap();
+            let plan = prepare_resume_plan(&db, tool, false, &[], &GlobalFlags::default()).unwrap();
+            assert_eq!(
+                plan.launch.prior_session_id.as_deref(),
+                Some("missing-on-disk")
+            );
+            assert!(
+                plan.launch
+                    .args
+                    .iter()
+                    .any(|arg| arg.contains("missing-on-disk"))
+            );
+        }
     }
 
     #[test]

@@ -2554,7 +2554,11 @@ pub fn run_delivery_loop(
 }
 
 /// True when this delivery thread's process_id still owns `current_name`.
-fn instance_owns_process_binding(db: &HcomDb, process_id: &str, current_name: &str) -> bool {
+pub(crate) fn instance_owns_process_binding(
+    db: &HcomDb,
+    process_id: &str,
+    current_name: &str,
+) -> bool {
     if process_id.is_empty() {
         return true;
     }

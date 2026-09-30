@@ -655,46 +655,125 @@ pub(super) fn finalize_launch_failure_after_exit(
         return;
     };
 
-    let Ok(db) = HcomDb::open() else {
+    let Ok(mut db) = HcomDb::open() else {
         return;
     };
-    let Ok(Some(instance)) = db.get_instance_full(instance_name) else {
-        return;
-    };
+    finalize_launch_failure_with_db(
+        &mut db,
+        instance_name,
+        tail,
+        launch_phase_active,
+        elapsed,
+        exit_code,
+        std::env::var("HCOM_LAUNCHED").as_deref() == Ok("1"),
+    );
+}
 
-    if instance.session_id.is_some()
-        || instance.status_context != "new"
-        || (instance.status != crate::shared::ST_INACTIVE && instance.status != "pending")
+fn finalize_launch_failure_with_db(
+    db: &mut HcomDb,
+    instance_name: &str,
+    tail: Option<&str>,
+    launch_phase_active: &Arc<AtomicBool>,
+    elapsed: Duration,
+    exit_code: i32,
+    launched: bool,
+) {
+    let instance = db.get_instance_full(instance_name).ok().flatten();
+    // The tool can receive SIGTERM without the PTY wrapper receiving it.
+    // In that case EXIT_WAS_KILLED stays false, and kill may already have
+    // deleted the row. Use the launch's event cursor to recognize its stop
+    // without confusing a previous incarnation's kill with a resume failure.
+    let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok());
+    if instance
+        .as_ref()
+        .is_some_and(|instance| instance.status_context == "exit:killed")
+        || launch_was_killed(db, instance_name, launch_event_id)
     {
+        launch_phase_active.store(false, Ordering::Release);
+        return;
+    }
+
+    // Unbound placeholder: the tool never reported a session.
+    let unbound = instance.as_ref().is_some_and(|inst| {
+        inst.session_id.is_none()
+            && inst.status_context == "new"
+            && (inst.status == crate::shared::ST_INACTIVE || inst.status == "pending")
+    });
+    // Never ready: covers a bound or already-stopped row too, e.g. a resume
+    // (row pre-seeded with the prior session id) whose tool rejects the
+    // session, or Claude's SessionEnd deleting the row before exit.
+    let never_ready = launch_phase_active.load(Ordering::Acquire) && launched;
+    if !unbound && !never_ready {
         return;
     }
 
     let elapsed_secs = elapsed.as_secs();
-    let mut fallback =
-        format!("exited {elapsed_secs}s after spawn before binding (exit code {exit_code})");
+    let mut fallback = if unbound {
+        format!("exited {elapsed_secs}s after spawn before binding (exit code {exit_code})")
+    } else {
+        format!("exited {elapsed_secs}s after spawn before ready (exit code {exit_code})")
+    };
     if let Some(tail) = tail {
         fallback.push_str("\nPTY output:\n");
         fallback.push_str(tail);
     }
-    let Some(detail) =
-        crate::instance_lifecycle::finalize_launch_failure_detail(&db, &instance, Some(&fallback))
-    else {
-        return;
+    let detail = match instance.as_ref().filter(|_| unbound) {
+        Some(instance) => match crate::instance_lifecycle::finalize_launch_failure_detail(
+            db,
+            instance,
+            Some(&fallback),
+        ) {
+            Some(detail) => detail,
+            None => return,
+        },
+        None => fallback,
     };
     let _ = db.emit_launch_failed_event(
         instance_name,
         crate::shared::ST_INACTIVE,
         "launch_failed",
-        "exited_before_bind",
+        if unbound {
+            "exited_before_bind"
+        } else {
+            "exited_before_ready"
+        },
         &detail,
     );
     launch_phase_active.store(false, Ordering::Release);
 
-    if let Ok(process_id) = std::env::var("HCOM_PROCESS_ID")
-        && !process_id.is_empty()
+    let process_id = std::env::var("HCOM_PROCESS_ID").unwrap_or_default();
+    // A bound row that never got ready is stopped here (snapshot kept, so
+    // `hcom r` still works): a child this quick exits before the delivery
+    // thread starts, so its cleanup never runs, and Claude's SessionEnd defers
+    // to this path.
+    if !unbound
+        && instance.is_some()
+        && crate::delivery::instance_owns_process_binding(db, &process_id, instance_name)
     {
+        crate::delivery::cleanup_deleted_instance(db, instance_name);
+    }
+    if !process_id.is_empty() {
         let _ = db.delete_process_binding(&process_id);
     }
+}
+
+fn launch_was_killed(db: &HcomDb, name: &str, launch_event_id: Option<i64>) -> bool {
+    let Some(launch_event_id) = launch_event_id else {
+        return false;
+    };
+    db.conn()
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events WHERE type = 'life' AND instance = ?1 AND id > ?2
+                  AND json_extract(data, '$.action') = 'stopped'
+                  AND json_extract(data, '$.reason') = 'killed'
+            )",
+            rusqlite::params![name, launch_event_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(false)
 }
 
 /// Build the OSC 1/2 title-set escape for `name`/`status` under `tool_name`.
@@ -1128,6 +1207,157 @@ fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn intentional_kill_is_not_a_launch_failure_even_after_row_deletion() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        db.save_instance_named(
+            "luna",
+            &serde_json::Map::from_iter([
+                ("tool".into(), serde_json::json!("claude")),
+                ("status".into(), serde_json::json!("inactive")),
+                ("status_context".into(), serde_json::json!("exit:killed")),
+                ("created_at".into(), serde_json::json!(1.0)),
+            ]),
+        )
+        .unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("Startup screen"),
+            &active,
+            Duration::from_secs(1),
+            143,
+            true,
+        );
+        assert!(!active.load(Ordering::Acquire));
+        assert_eq!(db.get_last_event_id(), 0);
+
+        let cursor = db.get_last_event_id();
+        db.log_event(
+            "life",
+            "luna",
+            &serde_json::json!({"action": "stopped", "reason": "killed"}),
+        )
+        .unwrap();
+        db.delete_instance("luna").unwrap();
+        assert!(launch_was_killed(&db, "luna", Some(cursor)));
+        // A new resume begins after the earlier incarnation's kill. Its
+        // real missing-session error must still be reported.
+        assert!(!launch_was_killed(
+            &db,
+            "luna",
+            Some(db.get_last_event_id())
+        ));
+        assert!(!launch_was_killed(&db, "nova", Some(cursor)));
+        assert!(!launch_was_killed(&db, "luna", None));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rejected_resume_records_output_and_preserves_stopped_snapshot() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        db.save_instance_named(
+            "luna",
+            &serde_json::Map::from_iter([
+                ("tool".into(), serde_json::json!("claude")),
+                ("session_id".into(), serde_json::json!("rejected-session")),
+                ("status".into(), serde_json::json!("inactive")),
+                ("status_context".into(), serde_json::json!("new")),
+                ("created_at".into(), serde_json::json!(1.0)),
+            ]),
+        )
+        .unwrap();
+        let process_id = std::env::var("HCOM_PROCESS_ID").unwrap_or_default();
+        if !process_id.is_empty() {
+            db.set_process_binding(&process_id, "rejected-session", "luna")
+                .unwrap();
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("No conversation found"),
+            &active,
+            Duration::from_secs(1),
+            1,
+            true,
+        );
+        assert!(!active.load(Ordering::Acquire));
+        assert!(db.get_instance_full("luna").unwrap().is_none());
+        let events: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT data FROM events WHERE type = 'life' AND instance = 'luna' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let events: Vec<serde_json::Value> = events
+            .iter()
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["action"], "launch_failed");
+        assert_eq!(events[0]["reason"], "exited_before_ready");
+        assert!(
+            events[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("PTY output:\nNo conversation found")
+        );
+        assert_eq!(events[1]["action"], "stopped");
+        assert_eq!(events[1]["snapshot"]["session_id"], "rejected-session");
+        if !process_id.is_empty() {
+            assert!(db.get_process_binding(&process_id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_exit_after_row_deleted_still_records_failure_but_ready_exit_does_not() {
+        let (_dir, hcom_dir, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
+        let mut db = HcomDb::open_at(&hcom_dir.join("test.db")).unwrap();
+        let active = Arc::new(AtomicBool::new(true));
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("Resume rejected"),
+            &active,
+            Duration::from_secs(1),
+            1,
+            true,
+        );
+        assert!(!active.load(Ordering::Acquire));
+        let count: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM events WHERE instance = 'luna' AND json_extract(data, '$.action') = 'launch_failed'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1);
+        finalize_launch_failure_with_db(
+            &mut db,
+            "luna",
+            Some("Normal exit"),
+            &active,
+            Duration::from_secs(2),
+            0,
+            true,
+        );
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE instance = 'luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     #[test]
     fn startup_preview_escapes_controls_and_truncates() {
         assert_eq!(super::preview(b"\x1b[6n\x1b[m"), r"\x1b[6n\x1b[m");
