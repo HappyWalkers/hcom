@@ -3,7 +3,6 @@
 pub mod antigravity;
 pub mod claude;
 pub mod codex;
-pub mod codex_file_edits;
 pub mod common;
 pub mod copilot;
 pub mod cursor;

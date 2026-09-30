@@ -21,14 +21,14 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item};
 
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::{HookPayload, HookResult, common};
+use crate::hooks::{HookPayload, HookResult, common, family};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instances;
 use crate::log;
 use crate::paths;
 use crate::shared::context::HcomContext;
-use crate::shared::{ST_ACTIVE, ST_LISTENING};
+use crate::shared::{ST_ACTIVE, ST_BLOCKED, ST_LISTENING};
 
 use super::common::SAFE_HCOM_COMMANDS;
 use super::runtime::{self, LaunchCtx, LegacyFile, PerRunAdapter, RuntimeInjection};
@@ -37,6 +37,12 @@ use anyhow::{Context as _, Result as AnyResult, bail};
 const HCOM_TRIGGER: &str = "<hcom>";
 // `fork` is its own SessionStart source since Codex 0.155 (earlier releases
 // reported forks as `startup`); without it a forked session never binds hooks.
+//
+// PermissionRequest fires for every tool that asks for approval, so PostToolUse
+// must match every tool too, or an approved apply_patch/MCP call would leave the
+// row blocked until the next shell call. PreToolUse only feeds status detail.
+// A denied or aborted approval skips PostToolUse; Stop, Interrupt, and the next
+// PreToolUse clear it instead.
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
@@ -44,9 +50,15 @@ const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
         Some("startup|resume|clear|fork"),
     ),
     ("UserPromptSubmit", "codex-userpromptsubmit", None),
-    ("PreToolUse", "codex-pretooluse", Some("Bash")),
-    ("PostToolUse", "codex-posttooluse", Some("Bash")),
+    (
+        "PreToolUse",
+        "codex-pretooluse",
+        Some("Bash|apply_patch|spawn_agent"),
+    ),
+    ("PermissionRequest", "codex-permissionrequest", None),
+    ("PostToolUse", "codex-posttooluse", None),
     ("Stop", "codex-stop", None),
+    ("Interrupt", "codex-interrupt", None),
 ];
 
 pub static PER_RUN: PerRunAdapter = PerRunAdapter {
@@ -822,6 +834,59 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
         &payload.tool_name,
         &payload.tool_input,
     );
+    // The row holds one detail (the first file); log the rest of a multi-file
+    // patch too so collision detection sees every file it writes.
+    if payload.tool_name == "apply_patch" {
+        for file in family::patch_files(&payload.tool_input).iter().skip(1) {
+            let data = serde_json::json!({
+                "status": ST_ACTIVE,
+                "context": "tool:apply_patch",
+                "detail": file,
+            });
+            if let Err(e) = db.log_event("status", &instance.name, &data) {
+                log::log_warn("hooks", "codex.patch_file_event", &format!("{e}"));
+            }
+        }
+    }
+    hook_noop()
+}
+
+/// Approval blocks set by PermissionRequest or by the PTY's approval scrape.
+fn is_approval_block(instance: &InstanceRow) -> bool {
+    instance.status == ST_BLOCKED
+        && matches!(
+            instance.status_context.as_str(),
+            "approval" | "pty:approval"
+        )
+}
+
+/// Observe an approval prompt without deciding it: no output means Codex falls
+/// through to its reviewer or the user.
+fn handle_permissionrequest(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
+        Some(instance) => instance,
+        None => return hook_noop(),
+    };
+
+    // Keep the PTY's context when it saw the prompt first, so its falling edge
+    // still owns the release.
+    let context = if instance.status == ST_BLOCKED && instance.status_context == "pty:approval" {
+        "pty:approval"
+    } else {
+        "approval"
+    };
+    let detail = family::extract_tool_detail("codex", &payload.tool_name, &payload.tool_input);
+    lifecycle::set_status(
+        db,
+        &instance.name,
+        ST_BLOCKED,
+        context,
+        lifecycle::StatusUpdate {
+            detail: &detail,
+            tool_name: &payload.tool_name,
+            ..Default::default()
+        },
+    );
     hook_noop()
 }
 
@@ -830,6 +895,19 @@ fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> 
         Some(instance) => instance,
         None => return hook_noop(),
     };
+
+    if is_approval_block(&instance) {
+        lifecycle::set_status(
+            db,
+            &instance.name,
+            ST_ACTIVE,
+            &format!("approved:{}", payload.tool_name),
+            lifecycle::StatusUpdate {
+                tool_name: &payload.tool_name,
+                ..Default::default()
+            },
+        );
+    }
 
     prepare_codex_delivery(db, &instance.name).unwrap_or_else(hook_noop)
 }
@@ -845,13 +923,33 @@ fn handle_stop(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookRes
     hook_noop()
 }
 
+/// Esc (or an aborted approval) ends the turn without Stop.
+fn handle_interrupt(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
+    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
+        Some(instance) => instance,
+        None => return hook_noop(),
+    };
+
+    lifecycle::set_status(
+        db,
+        &instance.name,
+        ST_LISTENING,
+        "interrupted",
+        Default::default(),
+    );
+    common::notify_hook_instance_with_db(db, &instance.name);
+    hook_noop()
+}
+
 fn get_codex_handler(hook_name: &str) -> Option<CodexHookHandler> {
     match hook_name {
         "codex-sessionstart" => Some(handle_sessionstart),
         "codex-userpromptsubmit" => Some(handle_userpromptsubmit),
         "codex-pretooluse" => Some(handle_pretooluse),
+        "codex-permissionrequest" => Some(handle_permissionrequest),
         "codex-posttooluse" => Some(handle_posttooluse),
         "codex-stop" => Some(handle_stop),
+        "codex-interrupt" => Some(handle_interrupt),
         _ => None,
     }
 }
@@ -1191,6 +1289,7 @@ fn codex_hook_event_state_label(event: &str) -> &'static str {
         "SessionStart" => "session_start",
         "UserPromptSubmit" => "user_prompt_submit",
         "Stop" => "stop",
+        "Interrupt" => "interrupt",
         _ => "unknown",
     }
 }

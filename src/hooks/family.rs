@@ -31,6 +31,7 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
             .or_else(|| tool_input.get("TargetFile")) // antigravity
             .or_else(|| tool_input.get("path")) // cursor/copilot
             .and_then(|v| v.as_str())
+            .or_else(|| patch_first_file(tool_input)) // codex apply_patch
             .unwrap_or("")
             .to_string();
     }
@@ -38,12 +39,39 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
         return tool_input
             .get("prompt")
             .or_else(|| tool_input.get("task"))
+            .or_else(|| tool_input.get("message")) // codex spawn_agent
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
     }
 
     String::new()
+}
+
+/// Files a Codex `apply_patch` envelope (`{"command": patch}`) writes, in order.
+pub fn patch_files(tool_input: &serde_json::Value) -> Vec<&str> {
+    let Some(patch) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    patch
+        .lines()
+        .filter_map(|line| {
+            [
+                "*** Update File: ",
+                "*** Add File: ",
+                "*** Delete File: ",
+                "*** Move to: ",
+            ]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn patch_first_file(tool_input: &serde_json::Value) -> Option<&str> {
+    patch_files(tool_input).into_iter().next()
 }
 
 #[cfg(test)]
@@ -76,7 +104,24 @@ mod tests {
         let d = spec_for("codex");
         assert!(d.bash.contains(&"execute_command"));
         assert!(d.file.contains(&"apply_patch"));
-        assert!(d.delegate.is_empty());
+        assert!(d.delegate.contains(&"spawn_agent"));
+    }
+
+    #[test]
+    fn test_extract_tool_detail_codex_patch_and_spawn() {
+        let patch = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-x\n+y\n*** Add File: b.rs\n*** End Patch"
+        });
+        assert_eq!(
+            extract_tool_detail("codex", "apply_patch", &patch),
+            "src/a.rs"
+        );
+        assert_eq!(patch_files(&patch), ["src/a.rs", "b.rs"]);
+        let spawn = serde_json::json!({"message": "review the diff"});
+        assert_eq!(
+            extract_tool_detail("codex", "spawn_agent", &spawn),
+            "review the diff"
+        );
     }
 
     #[test]

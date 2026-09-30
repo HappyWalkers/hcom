@@ -250,8 +250,10 @@ const CODEX_HOOKS: &[&str] = &[
     "codex-sessionstart",
     "codex-userpromptsubmit",
     "codex-pretooluse",
+    "codex-permissionrequest",
     "codex-posttooluse",
     "codex-stop",
+    "codex-interrupt",
 ];
 
 const OPENCODE_HOOKS: &[&str] = &[
@@ -567,7 +569,7 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["Bash", "execute_command", "shell", "shell_command"],
         file: &["apply_patch"],
-        delegate: &[],
+        delegate: &["spawn_agent"],
     },
 };
 

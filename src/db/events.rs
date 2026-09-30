@@ -582,9 +582,8 @@ impl HcomDb {
             .unwrap_or(0)
     }
 
-    /// Log a status event to the events table
-    ///
-    /// Used by TranscriptWatcher to log tool:apply_patch, tool:shell, and prompt events.
+    /// Log a bare status event (test fixture for status-driven subscriptions).
+    #[cfg(test)]
     pub fn log_status_event(
         &self,
         instance: &str,

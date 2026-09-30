@@ -384,22 +384,6 @@ pub(super) fn start_delivery_thread(
                 // Signal successful initialization to parent
                 let _ = init_tx.send(Ok(()));
 
-                // For Codex: spawn the transcript watcher only after delivery
-                // init has succeeded (#5). Spawning it before init meant a failed
-                // or timed-out init still left an orphan watcher running against a
-                // session that never came up. Init success is reached exactly once
-                // per live delivery thread, so the watcher starts exactly once.
-                if matches!(target.known_tool(), Some(Tool::Codex)) {
-                    let watcher_running = running.clone();
-                    let watcher_name = instance_name.clone();
-                    std::thread::spawn(move || {
-                        crate::hooks::codex_file_edits::run_transcript_watcher(
-                            watcher_running,
-                            watcher_name,
-                            Duration::from_secs(5),
-                        );
-                    });
-                }
                 (db, notify)
             }
             Err(e) => {
