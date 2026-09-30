@@ -574,9 +574,9 @@ fn poll_loop(
         // TCP wake fires as soon as remote events land — no separate relay
         // polling needed.
         let wait_time = if notify_server.is_some() {
-            Duration::from_secs(remaining.as_secs().min(30))
+            remaining.min(Duration::from_secs(30))
         } else {
-            Duration::from_millis(remaining.as_millis().min(100) as u64)
+            remaining.min(Duration::from_millis(100))
         };
 
         if let Some(server) = notify_server {
@@ -1636,6 +1636,36 @@ mod tests {
             .unwrap();
         db.set_session_binding(session_id, name).unwrap();
         db.mark_claude_session_validated(session_id, name).unwrap();
+    }
+
+    #[test]
+    fn fractional_notification_timeout_does_not_spin_heartbeat_writes() {
+        let (_dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, created_at) VALUES ('polltest', 'claude', 0)",
+                [],
+            )
+            .unwrap();
+        db.conn().execute_batch(
+            "CREATE TABLE heartbeat_writes (n INTEGER); INSERT INTO heartbeat_writes VALUES (0);
+             CREATE TRIGGER count_heartbeat AFTER UPDATE OF last_stop ON instances
+             BEGIN UPDATE heartbeat_writes SET n = n + 1; END;").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        let timeout = Duration::from_millis(180);
+        let result = poll_loop(&db, "polltest", timeout, start, true, Some(&listener)).unwrap();
+        assert!(result.timed_out);
+        assert!(start.elapsed() >= timeout);
+        let writes: i64 = db
+            .conn()
+            .query_row("SELECT n FROM heartbeat_writes", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            writes <= 3,
+            "fractional wait spun {writes} heartbeat writes"
+        );
     }
 
     fn context_with_process_id(

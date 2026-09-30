@@ -24,7 +24,47 @@ use crate::shared::{
 /// missing one: its hooks haven't bound yet (or never will), or its hcom
 /// process is gone. Subagents use their parent's session and relay mirrors are
 /// bound on their own device, so neither gets a star.
-fn tool_label(db: &HcomDb, data: &InstanceRow) -> String {
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct Bindings {
+    session: bool,
+    process: bool,
+}
+
+impl Bindings {
+    fn for_instance(db: &HcomDb, name: &str) -> Self {
+        Self {
+            session: db.has_session_binding(name),
+            process: db.has_process_binding_for_instance(name),
+        }
+    }
+}
+
+fn get_bindings_batch(db: &HcomDb) -> HashMap<String, Bindings> {
+    let Ok(mut stmt) = db.conn().prepare(
+        "SELECT name,
+            EXISTS(SELECT 1 FROM session_bindings WHERE instance_name = instances.name),
+            EXISTS(SELECT 1 FROM process_bindings WHERE instance_name = instances.name)
+         FROM instances",
+    ) else {
+        return HashMap::new();
+    };
+    stmt.query_map([], |row| {
+        Ok((
+            row.get(0)?,
+            Bindings {
+                session: row.get(1)?,
+                process: row.get(2)?,
+            },
+        ))
+    })
+    .ok()
+    .into_iter()
+    .flatten()
+    .filter_map(Result::ok)
+    .collect()
+}
+
+fn tool_label(bindings: Bindings, data: &InstanceRow) -> String {
     if data.tool == "adhoc" {
         return "AD-HOC".to_string();
     }
@@ -32,7 +72,7 @@ fn tool_label(db: &HcomDb, data: &InstanceRow) -> String {
     if is_remote_instance(data) || is_subagent_instance(data) {
         return tool;
     }
-    if db.has_session_binding(&data.name) && db.has_process_binding_for_instance(&data.name) {
+    if bindings.session && bindings.process {
         tool
     } else {
         format!("{tool}*")
@@ -41,12 +81,12 @@ fn tool_label(db: &HcomDb, data: &InstanceRow) -> String {
 
 /// Binding summary for verbose/detail views: "hooks, process", "hooks", ...
 /// An ad-hoc row's session binding only keys its identity (no hooks run).
-fn bindings_display(db: &HcomDb, data: &InstanceRow) -> &'static str {
-    let session = db.has_session_binding(&data.name);
+fn bindings_display(bindings: Bindings, data: &InstanceRow) -> &'static str {
+    let session = bindings.session;
     if data.tool == "adhoc" {
         return if session { "session" } else { "none" };
     }
-    match (session, db.has_process_binding_for_instance(&data.name)) {
+    match (session, bindings.process) {
         (true, true) => "hooks, process",
         (true, false) => "hooks",
         (false, true) => "process",
@@ -102,14 +142,46 @@ fn get_unread_count(db: &HcomDb, name: &str, last_event_id: i64) -> i64 {
 
 /// Get unread counts for all instances in batch.
 fn get_unread_counts_batch(db: &HcomDb, instances: &[InstanceRow]) -> HashMap<String, i64> {
+    let recipients: HashMap<&str, i64> = instances
+        .iter()
+        .filter(|inst| !is_remote_instance(inst))
+        .map(|inst| (inst.name.as_str(), inst.last_event_id))
+        .collect();
+    let Some(min_cursor) = recipients.values().min() else {
+        return HashMap::new();
+    };
+    let Ok(mut stmt) = db
+        .conn()
+        .prepare("SELECT id, json_extract(data, '$.delivered_to') FROM events WHERE type = 'message' AND id > ? ORDER BY id")
+    else {
+        return HashMap::new();
+    };
+    let Ok(rows) = stmt.query_map([min_cursor], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    }) else {
+        return HashMap::new();
+    };
     let mut counts = HashMap::new();
-    for inst in instances {
-        if is_remote_instance(inst) {
+    // Scan the unread tail once. Joining json_each recipients in SQL otherwise
+    // makes SQLite re-scan messages per agent, even inside a single statement.
+    for row in rows {
+        let Ok((id, Some(data))) = row else {
             continue;
-        }
-        let count = get_unread_count(db, &inst.name, inst.last_event_id);
-        if count > 0 {
-            counts.insert(inst.name.clone(), count);
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+        let Some(delivered_to) = data.as_array() else {
+            continue;
+        };
+        let mut seen = std::collections::HashSet::new();
+        for name in delivered_to.iter().filter_map(serde_json::Value::as_str) {
+            if let Some(cursor) = recipients.get(name)
+                && id > *cursor
+                && seen.insert(name)
+            {
+                *counts.entry(name.to_owned()).or_insert(0) += 1;
+            }
         }
     }
     counts
@@ -246,14 +318,15 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         }
     };
 
-    let unread_counts = get_unread_counts_batch(db, &sorted_instances);
-
     if names_output {
         for data in &sorted_instances {
             println!("{}", get_full_name(data));
         }
         return 0;
     }
+
+    let unread_counts = get_unread_counts_batch(db, &sorted_instances);
+    let binding_counts = get_bindings_batch(db);
 
     if json_output || format_template.is_some() {
         let mut result_list: Vec<serde_json::Value> = Vec::new();
@@ -264,8 +337,9 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             let (status, description, age_seconds) = (cs.status, cs.description, cs.age_seconds);
 
             // Get binding status
-            let hooks_bound = db.has_session_binding(&data.name);
-            let process_bound = db.has_process_binding_for_instance(&data.name);
+            let bindings = binding_counts.get(&data.name).copied().unwrap_or_default();
+            let hooks_bound = bindings.session;
+            let process_bound = bindings.process;
 
             // Parse launch_context JSON
             let launch_context: serde_json::Value = data
@@ -418,7 +492,13 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
         let desc_sep = if !description.is_empty() { ": " } else { "" };
 
         let tool_prefix = if show_tool {
-            let padded = format!("[{}]", tool_label(db, data));
+            let padded = format!(
+                "[{}]",
+                tool_label(
+                    binding_counts.get(&data.name).copied().unwrap_or_default(),
+                    data
+                )
+            );
             format!("{padded:<10}")
         } else {
             String::new()
@@ -527,7 +607,13 @@ pub fn cmd_list(db: &HcomDb, args: &ListArgs, ctx: Option<&CommandContext>) -> i
             }
 
             // Binding status
-            println!("    bindings:     {}", bindings_display(db, data));
+            println!(
+                "    bindings:     {}",
+                bindings_display(
+                    binding_counts.get(&data.name).copied().unwrap_or_default(),
+                    data
+                )
+            );
 
             let transcript = if data.transcript_path.is_empty() {
                 "(none)".to_string()
@@ -678,7 +764,10 @@ fn print_instance_details(db: &HcomDb, data: &InstanceRow, display_name: &str) {
     }
 
     // Bindings
-    println!("  Bindings:    {}", bindings_display(db, data));
+    println!(
+        "  Bindings:    {}",
+        bindings_display(Bindings::for_instance(db, &data.name), data)
+    );
 
     if let Some(pid) = data.pid {
         println!("  PID:         {pid}");
@@ -981,8 +1070,148 @@ mod tests {
         db
     }
 
+    #[test]
+    fn unread_batch_preserves_cursors_recipients_and_duplicate_semantics() {
+        let db = test_db();
+        for (name, origin) in [
+            ("full", None),
+            ("pend", None),
+            ("none", None),
+            ("remo", Some("dev-1")),
+        ] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, origin_device_id, created_at) VALUES (?, 'codex', ?, 0)",
+                    rusqlite::params![name, origin],
+                )
+                .unwrap();
+        }
+        let first = db
+            .log_event(
+                "message",
+                "sender",
+                &serde_json::json!({"delivered_to": ["full", "pend", "remo"]}),
+            )
+            .unwrap();
+        db.log_event(
+            "status",
+            "sender",
+            &serde_json::json!({"delivered_to": ["full"]}),
+        )
+        .unwrap();
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({"delivered_to": ["full", "full", "pend", "remo"]}),
+        )
+        .unwrap();
+        db.log_event("message", "sender", &serde_json::json!({}))
+            .unwrap();
+        db.log_event(
+            "message",
+            "sender",
+            &serde_json::json!({"delivered_to": []}),
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE instances SET last_event_id = ? WHERE name = 'full'",
+                [first],
+            )
+            .unwrap();
+        let instances = db.iter_instances_full().unwrap();
+        let counts = get_unread_counts_batch(&db, &instances);
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts["full"], 1);
+        assert_eq!(counts["pend"], 2);
+        for inst in instances.iter().filter(|inst| !is_remote_instance(inst)) {
+            assert_eq!(
+                counts.get(&inst.name).copied().unwrap_or(0),
+                get_unread_count(&db, &inst.name, inst.last_event_id)
+            );
+        }
+        assert!(get_unread_counts_batch(&db, &[]).is_empty());
+        let remote: Vec<_> = instances.into_iter().filter(is_remote_instance).collect();
+        assert!(get_unread_counts_batch(&db, &remote).is_empty());
+    }
+
+    #[test]
+    fn binding_batch_matches_individual_checks_with_multiple_bindings() {
+        let db = test_db();
+        for name in ["full", "hook", "proc", "none"] {
+            db.conn()
+                .execute(
+                    "INSERT INTO instances (name, tool, created_at) VALUES (?, 'codex', 0)",
+                    [name],
+                )
+                .unwrap();
+        }
+        db.set_session_binding("s1", "full").unwrap();
+        db.set_session_binding("s2", "full").unwrap();
+        db.set_process_binding("p1", "s1", "full").unwrap();
+        db.set_process_binding("p2", "s2", "full").unwrap();
+        db.set_session_binding("s3", "hook").unwrap();
+        db.set_process_binding("p3", "", "proc").unwrap();
+        let bindings = get_bindings_batch(&db);
+        assert_eq!(bindings.len(), 4);
+        for name in ["full", "hook", "proc", "none"] {
+            assert_eq!(bindings[name], Bindings::for_instance(&db, name));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual unread-count scaling benchmark"]
+    fn benchmark_unread_counts_batch() {
+        for (agents, base_cursor, body_size) in [
+            (10, 9000, 16),
+            (100, 9000, 16),
+            (500, 9000, 16),
+            (10, 0, 4096),
+        ] {
+            let db = test_db();
+            db.conn().execute_batch("BEGIN").unwrap();
+            for i in 0..agents {
+                db.conn()
+                    .execute(
+                        "INSERT INTO instances (name, tool, last_event_id, created_at) VALUES (?, 'codex', ?, 0)",
+                        rusqlite::params![format!("agent{i}"), base_cursor + if base_cursor > 0 { i % 500 } else { 0 }],
+                    )
+                    .unwrap();
+            }
+            for id in 1..=10000 {
+                let data = serde_json::json!({"delivered_to": [format!("agent{}", id % agents), format!("agent{}", (id + 1) % agents)], "text": "x".repeat(body_size)});
+                db.conn().execute("INSERT INTO events (id, timestamp, type, instance, data) VALUES (?, '2026-01-01', 'message', 'sender', ?)",
+                    rusqlite::params![id, data.to_string()]).unwrap();
+            }
+            db.conn().execute_batch("COMMIT").unwrap();
+            let instances = db.iter_instances_full().unwrap();
+            let start = std::time::Instant::now();
+            let old: HashMap<_, _> = instances
+                .iter()
+                .filter_map(|inst| {
+                    let count = get_unread_count(&db, &inst.name, inst.last_event_id);
+                    (count > 0).then(|| (inst.name.clone(), count))
+                })
+                .collect();
+            let old_time = start.elapsed();
+            let start = std::time::Instant::now();
+            let new = get_unread_counts_batch(&db, &instances);
+            let new_time = start.elapsed();
+            assert_eq!(old, new);
+            println!(
+                "{agents} agents / 10000 messages / cursor {base_cursor} / body {body_size} bytes: per-agent {old_time:?}, batch {new_time:?}"
+            );
+        }
+    }
+
     fn label(db: &HcomDb, name: &str) -> String {
-        tool_label(db, &db.get_instance_full(name).unwrap().unwrap())
+        tool_label(
+            get_bindings_batch(db)
+                .get(name)
+                .copied()
+                .unwrap_or_default(),
+            &db.get_instance_full(name).unwrap().unwrap(),
+        )
     }
 
     #[test]
@@ -1017,7 +1246,15 @@ mod tests {
         assert_eq!(label(&db, "remo"), "CLAUDE");
         assert_eq!(label(&db, "adho"), "AD-HOC");
 
-        let bindings = |name| bindings_display(&db, &db.get_instance_full(name).unwrap().unwrap());
+        let bindings = |name| {
+            bindings_display(
+                get_bindings_batch(&db)
+                    .get(name)
+                    .copied()
+                    .unwrap_or_default(),
+                &db.get_instance_full(name).unwrap().unwrap(),
+            )
+        };
         assert_eq!(bindings("full"), "hooks, process");
         assert_eq!(bindings("pend"), "process");
         assert_eq!(bindings("subx"), "none");

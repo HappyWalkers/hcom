@@ -499,6 +499,30 @@ impl HcomDb {
         )?;
         let event_id = self.conn.last_insert_rowid();
 
+        // Wake launch confirmations only for changes they can observe. The
+        // usual autocommit INSERT is visible before the listener re-queries.
+        // Writes inside an outer transaction remain covered by fallback polling.
+        let action = data.get("action").and_then(serde_json::Value::as_str);
+        let context = data.get("context").and_then(serde_json::Value::as_str);
+        if (event_type == "life"
+            && matches!(
+                action,
+                Some(
+                    "ready"
+                        | "launch_failed"
+                        | "launch_blocked"
+                        | "launch_blocked_cleared"
+                        | "stopped"
+                )
+            ))
+            || (event_type == "status" && context == Some("launch_failed"))
+        {
+            crate::notify::wake::wake_launch_waiters(
+                self,
+                data.get("batch_id").and_then(serde_json::Value::as_str),
+            );
+        }
+
         // Check event subscriptions inline.
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
 
