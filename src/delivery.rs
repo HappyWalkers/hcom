@@ -1225,11 +1225,11 @@ fn launch_ready_observed(
         return true;
     }
     if config.launch_ready_on_plugin_bind {
-        // Authoritative readiness for plugin-driven tools (OMP): the extension's
+        // Authoritative readiness for plugin-driven tools (Pi, OMP): the extension's
         // bind (a kind='plugin' notify endpoint) proves both TUI construction
         // and extension load. It deliberately REPLACES on-screen scraping rather
-        // than OR-ing with it — OMP's visible chrome is theme/preset dependent
-        // (status-line presets omit the pi glyph), and a syntactically broken /
+        // than OR-ing with it — their visible chrome is configurable (Pi's
+        // header, OMP's status-line presets), and a syntactically broken /
         // non-running extension could still render default chrome and be falsely
         // declared ready. Requiring the bind makes a dead extension block.
         return db.has_notify_endpoint_kind(name, "plugin");
@@ -3175,13 +3175,20 @@ mod tests {
     }
 
     #[test]
-    fn omp_launch_ready_requires_plugin_bind_not_screen() {
-        // OMP readiness is bind-driven: a rendered/ready screen must NOT be
+    fn pi_family_launch_ready_requires_plugin_bind_not_screen() {
+        // Pi/OMP readiness is bind-driven: a rendered/ready screen must NOT be
         // enough, and a kind='plugin' notify endpoint must flip it ready even
         // with no on-screen marker.
+        for tool in [crate::tool::Tool::Pi, crate::tool::Tool::Omp] {
+            assert_plugin_bind_readiness(tool);
+        }
+    }
+
+    fn assert_plugin_bind_readiness(tool: crate::tool::Tool) {
         let (_dir, db) = open_ready_test_db();
-        let config = ToolConfig::for_tool(crate::tool::Tool::Omp);
-        assert!(config.launch_ready_on_plugin_bind);
+        let config = ToolConfig::for_tool(tool);
+        assert!(config.launch_ready_on_plugin_bind, "{tool:?}");
+        assert!(tool.ready_pattern().is_empty(), "{tool:?}");
 
         let mut screen = safe_screen();
         screen.ready = true; // empty pattern => is_ready() always true

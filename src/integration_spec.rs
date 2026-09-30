@@ -62,9 +62,9 @@ pub struct GatesSpec {
     pub launch_requires_ready: bool,
     /// Treat the plugin's extension bind (a `kind='plugin'` notify endpoint) as
     /// launch readiness, in addition to the on-screen `ready_pattern`. For
-    /// plugin-driven tools whose visible chrome is theme/preset configurable
-    /// (OMP: status-line presets omit the pi glyph), the bind is the only
-    /// rendering-independent proof the interactive TUI is up.
+    /// plugin-driven tools whose visible chrome is configurable (Pi: quiet or
+    /// expanded header; OMP: status-line presets omit the pi glyph), the bind
+    /// is the only rendering-independent proof the interactive TUI is up.
     pub launch_ready_on_plugin_bind: bool,
 }
 
@@ -886,7 +886,13 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "pi  ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"/ commands",
+    // Readiness comes from the hcom extension's bind, not on-screen text.
+    // Pi's header hint differs between the compact ("/ commands"), expanded
+    // ("/ for commands") and quiet-startup (none) headers, and it is drawn
+    // before Pi enables its key/submit handlers. Pi fires session_start (our
+    // bind) from rebindCurrentSession() after those handlers are set up, so
+    // the bind is the earliest point at which the TUI reliably accepts input.
+    ready_pattern: b"",
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -904,7 +910,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
         block_on_user_activity: false,
         block_on_approval: true,
         launch_requires_ready: true,
-        launch_ready_on_plugin_bind: false,
+        launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
         args_env: Some("HCOM_PI_ARGS"),
