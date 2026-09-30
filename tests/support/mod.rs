@@ -628,11 +628,8 @@ impl Hcom {
     /// model is a stable real id so Codex advertises its normal tool set; the
     /// mock supplies every turn so the id is never used for routing.
     ///
-    /// Deliberately omits `approval_policy`: approvals are hcom's job, driven by
-    /// the `--sandbox <mode>` launch flag (`get_sandbox_flags` →
-    /// `--sandbox workspace-write` / bypass). Hand-writing the
-    /// policy here would bypass that translation and let a regression in it pass
-    /// unnoticed — so tests set the policy through the real hcom launch path.
+    /// Omits permission settings so each test chooses native Codex config or
+    /// flags through the real hcom launch path.
     pub fn prepare_codex_config(&self, mock_base_url: &str) {
         fs::create_dir_all(&self.codex_home).expect("create isolated Codex home");
         // The migration notice marks gpt-5.5's upgrade as already seen. Without

@@ -2260,16 +2260,8 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_env,
                     );
 
-                    let sandbox_mode = instance_env
-                        .get("HCOM_CODEX_SANDBOX_MODE")
-                        .cloned()
-                        .unwrap_or_else(|| "workspace".to_string());
-
-                    effective_args = codex_preprocessing::preprocess_codex_args(
-                        &effective_args,
-                        &bootstrap,
-                        &sandbox_mode,
-                    );
+                    effective_args =
+                        codex_preprocessing::preprocess_codex_args(&effective_args, &bootstrap);
 
                     instances::update_instance_position(
                         db,
@@ -2279,8 +2271,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                             json!(&stored_launch_args),
                         )]),
                     );
-
-                    instance_env.insert("HCOM_CODEX_SANDBOX_MODE".to_string(), sandbox_mode);
 
                     launch_pty_or_background(
                         &mut BackgroundLaunchCtx {
@@ -3441,11 +3431,10 @@ mod tests {
 
         let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
-        let args =
-            crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, "workspace");
+        let args = crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap);
 
         // Locate the `-c developer_instructions=<TOML>` value and decode it.
-        // preprocess also injects sandbox `-c` args, so match by prefix rather
+        // Other per-run config overrides may precede it, so match by prefix rather
         // than by the first `-c` position.
         let encoded = args
             .iter()

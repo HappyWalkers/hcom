@@ -52,16 +52,19 @@ impl ToolCase for CodexCase {
 
     fn prepare(&self, h: &Hcom, base_url: &str) {
         h.prepare_codex_config(base_url);
-        let (code, stdout, stderr) = h.run(["config", "codex_sandbox_mode", "danger-full-access"]);
-        assert_eq!(
-            code, 0,
-            "set Codex lifecycle sandbox mode failed: stdout={stdout} stderr={stderr}"
-        );
+        // A conflicting default makes every lifecycle turn check that saved
+        // launch overrides survive resume/fork (issue #147).
+        let path = h.codex_home.join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("model_reasoning_effort = \"high\"\n{config}")).unwrap();
     }
 
     fn launch_args(&self, _h: &Hcom) -> Vec<String> {
-        // hcom supplies Codex's sandbox/trust/add-dir flags itself.
-        Vec::new()
+        vec![
+            "--yolo".to_string(),
+            "-c".to_string(),
+            "model_reasoning_effort=\"low\"".to_string(),
+        ]
     }
 
     fn is_followup_turn(&self, body: &str) -> bool {
@@ -82,6 +85,10 @@ impl ToolCase for CodexCase {
         let body = &req.body;
         if is_title_request(body) {
             return title_reply();
+        }
+        let request: Value = serde_json::from_str(body).expect("Responses request JSON");
+        if request["reasoning"]["effort"] != "low" {
+            return Reply::Status(500);
         }
         let has_output =
             |call_id: &str| body.contains("function_call_output") && body.contains(call_id);
@@ -283,7 +290,7 @@ pub fn shell_call(call_id: &str, command: &str) -> (&'static str, Value) {
 }
 
 /// A shell call that asks to run outside the sandbox. Under Codex's default
-/// `on-request` policy (hcom's `workspace` mode) that request is what makes
+/// `on-request` policy that request is what makes
 /// Codex stop for the user's approval.
 pub fn escalated_shell_call(
     call_id: &str,

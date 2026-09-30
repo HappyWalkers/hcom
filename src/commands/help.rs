@@ -588,10 +588,6 @@ const CONFIG_KEYS_HELP: &[HelpEntry] = &[
         "  gemini_system_prompt / codex_system_prompt",
         "Default system prompt",
     ),
-    (
-        "  codex_sandbox_mode",
-        "workspace | danger-full-access | none",
-    ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
     ("  auto_subscribe", "Event auto-subscribe presets"),
     (

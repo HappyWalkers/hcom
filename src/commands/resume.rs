@@ -1069,19 +1069,20 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
 
 /// Merge original launch args with resume-specific args.
 fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<String> {
-    // Claude/Gemini/Codex stay grammar-free: preserve the stored user/config
-    // vector verbatim and append hcom's resume injection.
+    // Preserve user/config args where the tool accepts them. Codex config
+    // overrides must reach the resume/fork scope to take effect.
     let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
     let tool = tool_lookup
         .parse::<crate::tool::Tool>()
         .expect("resume tool must be validated before argument merging");
 
     match tool {
-        crate::tool::Tool::Claude | crate::tool::Tool::Gemini | crate::tool::Tool::Codex => {
+        crate::tool::Tool::Claude | crate::tool::Tool::Gemini => {
             let mut merged = original.to_vec();
             merged.extend_from_slice(resume);
             merged
         }
+        crate::tool::Tool::Codex => merge_codex_resume_args(original, resume),
         crate::tool::Tool::OpenCode | crate::tool::Tool::Kilo => {
             merge_opencode_args(original, resume)
         }
@@ -1096,6 +1097,43 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             unreachable!("Adhoc sessions do not support resume argument merging")
         }
     }
+}
+
+/// Keep ordinary flags at the root, but replay config overrides after the
+/// session selector. Extra resume overrides follow saved overrides so Codex
+/// resolves precedence itself. Moving all flags would put saved and new
+/// singular options (such as --model) in one clap scope, where they conflict.
+fn merge_codex_resume_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut root = Vec::new();
+    let mut config = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if token == "--" {
+            root.extend_from_slice(&original[i..]);
+            break;
+        }
+        if matches!(token.as_str(), "-c" | "--config") {
+            config.push(token.clone());
+            i += 1;
+            if let Some(value) = original.get(i) {
+                config.push(value.clone());
+                i += 1;
+            }
+        } else {
+            if (token.starts_with("-c") && token.len() > 2) || token.starts_with("--config=") {
+                config.push(token.clone());
+            } else {
+                root.push(token.clone());
+            }
+            i += 1;
+        }
+    }
+    // hcom constructs this pair with build_resume_args.
+    root.extend_from_slice(&resume[..2]);
+    root.extend(config);
+    root.extend_from_slice(&resume[2..]);
+    root
 }
 
 /// Merge grok original launch args with resume args.
@@ -2573,6 +2611,49 @@ mod tests {
     fn test_build_resume_args_codex_fork() {
         let args = build_resume_args("codex", "sess-456", true);
         assert_eq!(args, s(&["fork", "sess-456"]));
+    }
+
+    #[test]
+    fn codex_resume_replays_config_in_session_scope_with_new_overrides_last() {
+        let original = s(&[
+            "--model",
+            "gpt-6-luna",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "--yolo",
+            "--config=service_tier=\"fast\"",
+            "-c=features.foo=true",
+            "-cfeatures.bar=false",
+        ]);
+        for fork in [false, true] {
+            let mut resume = build_resume_args("codex", "session-id", fork);
+            resume.extend(s(&[
+                "--model",
+                "gpt-6-astra",
+                "--config",
+                "model_reasoning_effort=\"high\"",
+            ]));
+            let merged = merge_resume_args("codex", &original, &resume);
+            assert_eq!(
+                merged,
+                s(&[
+                    "--model",
+                    "gpt-6-luna",
+                    "--yolo",
+                    if fork { "fork" } else { "resume" },
+                    "session-id",
+                    "-c",
+                    "model_reasoning_effort=\"low\"",
+                    "--config=service_tier=\"fast\"",
+                    "-c=features.foo=true",
+                    "-cfeatures.bar=false",
+                    "--model",
+                    "gpt-6-astra",
+                    "--config",
+                    "model_reasoning_effort=\"high\"",
+                ])
+            );
+        }
     }
 
     #[test]

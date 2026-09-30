@@ -346,16 +346,10 @@ const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[(
     "hcom codex --sandbox danger-full-access",
     "Flags forwarded to codex",
 )];
-const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
-    (
-        "HCOM_CODEX_SYSTEM_PROMPT",
-        "System prompt (env var or config)",
-    ),
-    (
-        "HCOM_CODEX_SANDBOX_MODE",
-        "workspace | danger-full-access | none",
-    ),
-];
+const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[(
+    "HCOM_CODEX_SYSTEM_PROMPT",
+    "System prompt (env var or config)",
+)];
 
 const OPENCODE_HELP_EXAMPLES: &[HelpEntry] =
     &[("hcom opencode --agent plan", "Flags forwarded to opencode")];

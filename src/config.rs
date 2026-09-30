@@ -131,7 +131,6 @@ pub(crate) const TOML_KEY_MAP: &[(&str, &str)] = &[
     ("gemini_args", "launch.gemini.args"),
     ("gemini_system_prompt", "launch.gemini.system_prompt"),
     ("codex_args", "launch.codex.args"),
-    ("codex_sandbox_mode", "launch.codex.sandbox_mode"),
     ("codex_system_prompt", "launch.codex.system_prompt"),
     ("opencode_args", "launch.opencode.args"),
     ("kilo_args", "launch.kilo.args"),
@@ -172,7 +171,6 @@ const FIELD_TO_ENV: &[(&str, &str)] = &[
     ("claude_args", "HCOM_CLAUDE_ARGS"),
     ("gemini_args", "HCOM_GEMINI_ARGS"),
     ("codex_args", "HCOM_CODEX_ARGS"),
-    ("codex_sandbox_mode", "HCOM_CODEX_SANDBOX_MODE"),
     ("gemini_system_prompt", "HCOM_GEMINI_SYSTEM_PROMPT"),
     ("codex_system_prompt", "HCOM_CODEX_SYSTEM_PROMPT"),
     ("opencode_args", "HCOM_OPENCODE_ARGS"),
@@ -213,9 +211,6 @@ const RELAY_FIELDS: &[&str] = &[
 const TERMINAL_DANGEROUS_CHARS: &[char] = &['`', '$', ';', '|', '&', '\n', '\r'];
 
 use crate::shared::terminal_presets::TERMINAL_PRESETS;
-
-/// Valid codex sandbox modes.
-pub const VALID_SANDBOX_MODES: &[&str] = &["workspace", "danger-full-access", "none"];
 
 /// TOML file header comment.
 const TOML_HEADER: &str = "\
@@ -298,7 +293,6 @@ pub struct HcomConfig {
     pub kimi_args: String,
     pub copilot_args: String,
     pub grok_args: String,
-    pub codex_sandbox_mode: String,
     pub gemini_system_prompt: String,
     pub codex_system_prompt: String,
     pub relay: String,
@@ -337,7 +331,6 @@ impl Default for HcomConfig {
             kimi_args: String::new(),
             copilot_args: String::new(),
             grok_args: String::new(),
-            codex_sandbox_mode: "workspace".to_string(),
             gemini_system_prompt: String::new(),
             codex_system_prompt: String::new(),
             relay: String::new(),
@@ -469,17 +462,6 @@ impl HcomConfig {
             }
         }
 
-        // Validate codex_sandbox_mode
-        if !VALID_SANDBOX_MODES.contains(&self.codex_sandbox_mode.as_str()) {
-            errors.insert(
-                "codex_sandbox_mode".into(),
-                format!(
-                    "codex_sandbox_mode must be one of {:?}, got '{}'",
-                    VALID_SANDBOX_MODES, self.codex_sandbox_mode
-                ),
-            );
-        }
-
         // Validate auto_subscribe (comma-separated alphanumeric/underscore preset names)
         if !self.auto_subscribe.is_empty() {
             for preset in self.auto_subscribe.split(',') {
@@ -523,7 +505,6 @@ impl HcomConfig {
             "kimi_args" => Some(self.kimi_args.clone()),
             "copilot_args" => Some(self.copilot_args.clone()),
             "grok_args" => Some(self.grok_args.clone()),
-            "codex_sandbox_mode" => Some(self.codex_sandbox_mode.clone()),
             "gemini_system_prompt" => Some(self.gemini_system_prompt.clone()),
             "codex_system_prompt" => Some(self.codex_system_prompt.clone()),
             "relay" => Some(self.relay.clone()),
@@ -570,16 +551,6 @@ impl HcomConfig {
             "kimi_args" => self.kimi_args = value.to_string(),
             "copilot_args" => self.copilot_args = value.to_string(),
             "grok_args" => self.grok_args = value.to_string(),
-            "codex_sandbox_mode" => {
-                // Retired modes fall back to the default rather than turning an
-                // existing config into an error. `untrusted` relied on Codex's
-                // `-a untrusted`, which Codex 0.152 removed.
-                self.codex_sandbox_mode = if matches!(value, "full-auto" | "untrusted") {
-                    "workspace".to_string()
-                } else {
-                    value.to_string()
-                };
-            }
             "gemini_system_prompt" => self.gemini_system_prompt = value.to_string(),
             "codex_system_prompt" => self.codex_system_prompt = value.to_string(),
             "relay" => self.relay = value.to_string(),
@@ -704,7 +675,6 @@ impl HcomConfig {
             "cursor_args",
             "copilot_args",
             "grok_args",
-            "codex_sandbox_mode",
             "gemini_system_prompt",
             "codex_system_prompt",
             "auto_subscribe",
@@ -714,9 +684,8 @@ impl HcomConfig {
         for str_field in &str_fields {
             if let Some(val) = get_var(str_field) {
                 let s = val.as_string();
-                // terminal and codex_sandbox_mode: skip empty (use default)
-                if (*str_field == "terminal" || *str_field == "codex_sandbox_mode") && s.is_empty()
-                {
+                // Empty terminal uses the default.
+                if *str_field == "terminal" && s.is_empty() {
                     continue;
                 }
                 let _ = config.set_field(str_field, &s);
@@ -1864,7 +1833,6 @@ mod tests {
         assert_eq!(config.subagent_timeout, 30);
         assert_eq!(config.terminal, "default");
         assert_eq!(config.tag, "");
-        assert_eq!(config.codex_sandbox_mode, "workspace");
         assert!(config.relay_enabled);
         assert!(config.auto_approve);
         assert_eq!(config.auto_subscribe, "collision");
@@ -1902,22 +1870,6 @@ mod tests {
 
         config.tag = "".to_string(); // empty is valid
         assert!(!config.collect_errors().contains_key("tag"));
-    }
-
-    #[test]
-    fn test_hcom_config_validation_sandbox_mode() {
-        let mut config = HcomConfig::default();
-
-        for mode in VALID_SANDBOX_MODES {
-            config.codex_sandbox_mode = mode.to_string();
-            assert!(
-                !config.collect_errors().contains_key("codex_sandbox_mode"),
-                "mode '{mode}' should be valid"
-            );
-        }
-
-        config.codex_sandbox_mode = "invalid".to_string();
-        assert!(config.collect_errors().contains_key("codex_sandbox_mode"));
     }
 
     #[test]
@@ -2021,15 +1973,6 @@ mod tests {
             ..HcomConfig::default()
         };
         assert!(config.collect_errors().contains_key("terminal"));
-    }
-
-    #[test]
-    fn test_set_field_retired_sandbox_modes_normalize_to_workspace() {
-        for retired in ["full-auto", "untrusted"] {
-            let mut config = HcomConfig::default();
-            config.set_field("codex_sandbox_mode", retired).unwrap();
-            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
-        }
     }
 
     #[test]
@@ -2203,19 +2146,6 @@ mod tests {
         let env = HashMap::new();
         let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
         assert!(!config.auto_approve);
-    }
-
-    #[test]
-    fn test_load_from_sources_sandbox_mode_empty_uses_default() {
-        let mut file_config = HashMap::new();
-        file_config.insert(
-            "codex_sandbox_mode".to_string(),
-            TomlFieldValue::Str("".to_string()),
-        );
-
-        let env = HashMap::new();
-        let config = HcomConfig::load_from_sources(&file_config, Some(&env)).unwrap();
-        assert_eq!(config.codex_sandbox_mode, "workspace"); // Default, not empty
     }
 
     #[test]
@@ -2401,16 +2331,6 @@ auto_approve = false
             actual, expected,
             "HcomConfig *_args env vars must match IntegrationSpec.launch.args_env"
         );
-    }
-
-    #[test]
-    fn test_hcom_config_from_env_dict_with_retired_sandbox_modes() {
-        for retired in ["full-auto", "untrusted"] {
-            let mut data = HcomConfig::default().to_env_dict();
-            data.insert("HCOM_CODEX_SANDBOX_MODE".to_string(), retired.to_string());
-            let config = HcomConfig::from_env_dict(&data).unwrap();
-            assert_eq!(config.codex_sandbox_mode, "workspace", "{retired}");
-        }
     }
 
     #[test]

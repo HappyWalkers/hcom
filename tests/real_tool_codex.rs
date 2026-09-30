@@ -37,8 +37,8 @@ fn real_codex_full_lifecycle_send_fork_kill_resume_and_cleanup() {
 
 /// Codex's approval gate is hcom's only PTY-driven block path, and
 /// `blocked(pty:approval)` only latches when a message is pending behind a
-/// visible approval prompt. This drives that exact race: under hcom's default
-/// `workspace` mode (Codex's `on-request` policy), a scripted shell call that
+/// visible approval prompt. This drives that exact race: with Codex configured
+/// for workspace-write and on-request approvals, a scripted shell call that
 /// asks to run outside the sandbox raises Codex's approval prompt, an inbound
 /// hcom message is held while the prompt is up, then a real approval
 /// keystroke must both run the command and release the held message.
@@ -110,11 +110,15 @@ fn real_codex_approval_gate_blocks_pending_message_then_clears_on_approval() {
 
     h.prepare_codex_config(&mock.base_url());
 
-    // Launch in hcom's default `workspace` mode, exactly as a user would. Its
-    // `--sandbox workspace-write` leaves Codex's `on-request` approval policy
-    // in place, and the escalation request above is what that policy asks the
-    // user about. Setting `approval_policy` in config.toml instead would bypass
-    // hcom's launch translation, so a regression there could pass unnoticed.
+    // Permission policy comes from Codex's native config, without hcom flags.
+    let config_path = h.codex_home.join("config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap();
+    std::fs::write(
+        config_path,
+        format!("sandbox_mode = \"workspace-write\"\napproval_policy = \"on-request\"\n{config}"),
+    )
+    .unwrap();
+
     let (launch_code, launch_stdout, launch_stderr) = h.run([
         "codex",
         "--headless",

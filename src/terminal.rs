@@ -1079,7 +1079,7 @@ pub fn create_bash_script(
         // covered automatically) plus the non-identity per-launch vars exported
         // above that aren't in that list.
         let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
-        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        leftover_vars.push("HCOM_TAG");
         writeln!(f, "unset {}", leftover_vars.join(" "))?;
         writeln!(f, "rm -f {}", shell_quote(&script_file.to_string_lossy()))?;
         writeln!(f, "exec bash -l")?;
@@ -1238,7 +1238,7 @@ pub fn create_powershell_script(
         // Clear hcom state from the interactive shell left open after the tool
         // exits (window persists via `powershell -NoExit`).
         let mut leftover_vars: Vec<&str> = HCOM_IDENTITY_VARS.to_vec();
-        leftover_vars.extend(["HCOM_TAG", "HCOM_CODEX_SANDBOX_MODE"]);
+        leftover_vars.push("HCOM_TAG");
         let leftover: Vec<String> = leftover_vars.iter().map(|v| format!("Env:{v}")).collect();
         writeln!(
             f,
@@ -3898,14 +3898,6 @@ mod tests {
                 "id:13"
             ]
         );
-    }
-
-    #[test]
-    fn test_sandbox_flags_in_get_sandbox_flags() {
-        use crate::tools::codex_preprocessing::get_sandbox_flags;
-        let flags = get_sandbox_flags("workspace");
-        assert!(flags.contains(&"--sandbox".to_string()));
-        assert!(flags.contains(&"workspace-write".to_string()));
     }
 
     #[test]

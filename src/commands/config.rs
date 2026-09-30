@@ -115,11 +115,6 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
-        "HCOM_CODEX_SANDBOX_MODE",
-        "Codex permission profile (workspace | danger-full-access | none)",
-        "string",
-    ),
-    (
         "HCOM_GEMINI_SYSTEM_PROMPT",
         "System prompt for gemini on launch",
         "string",
@@ -331,20 +326,6 @@ fn config_set_at_path(path: &Path, key: &str, value: &str) -> Result<(), String>
     // Map HCOM_KEY to field name, then to nested TOML path
     let field_name = key.strip_prefix("HCOM_").unwrap_or(key).to_lowercase();
     validate_config_args(&field_name, value)?;
-
-    if field_name == "codex_sandbox_mode" && !value.is_empty() {
-        let normalized = if value == "full-auto" {
-            "danger-full-access"
-        } else {
-            value
-        };
-        if !crate::config::VALID_SANDBOX_MODES.contains(&normalized) {
-            return Err(format!(
-                "codex_sandbox_mode must be one of: {}. Got '{value}'",
-                crate::config::VALID_SANDBOX_MODES.join(", ")
-            ));
-        }
-    }
 
     if field_name == "title_mode"
         && !value.is_empty()
@@ -1434,28 +1415,6 @@ Example: hcom config codex_args \"--search\"
 Clear:   hcom config codex_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
-        ),
-
-        "HCOM_CODEX_SANDBOX_MODE" => Some(
-            "\
-HCOM_CODEX_SANDBOX_MODE - Permission flags hcom injects when launching codex
-
-Default: workspace
-
-Codex's default sandbox blocks the writes and Unix sockets hcom needs,
-so hcom injects flags on every codex launch to reshape it. This knob
-picks which set.
-
-Values:
-  workspace          Codex auto-runs; asks only when the model judges
-                     necessary.
-  danger-full-access No sandbox, no approvals.
-  none               Inject nothing. Codex uses your own config; DB
-                     writes fail unless your config allows ~/.hcom.
-
-Usage:
-  hcom config codex_sandbox_mode danger-full-access
-  hcom config codex_sandbox_mode \"\"        # Reset to default",
         ),
 
         "HCOM_RELAY" => Some(

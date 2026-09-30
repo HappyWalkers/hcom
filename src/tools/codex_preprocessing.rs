@@ -1,4 +1,4 @@
-//! Codex launch preprocessing — sandbox flags, DB access, bootstrap injection.
+//! Codex launch preprocessing — state access and bootstrap injection.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,102 +7,19 @@ use anyhow::{Result, bail};
 
 use crate::paths;
 
-/// Sandbox modes aligned with Codex TUI presets.
-///
-/// - `workspace`: Default — --sandbox workspace-write (interactive: on-request approvals)
-/// - `danger-full-access`: Full Access — --dangerously-bypass-approvals-and-sandbox
-/// - `none`: Raw codex, user's own settings (hcom may not work)
-///
-/// Codex 0.128.0 removed `--full-auto` from the TUI (it was sugar for
-/// workspace-write + on-failure approvals). The current shape — --sandbox
-/// workspace-write with default on-request approvals — matches the prior
-/// behavior closely enough for the TUI flow.
-pub fn get_sandbox_flags(mode: &str) -> Vec<String> {
-    // Seatbelt blocks Unix sockets by default, breaking tmux/kitty terminal launches.
-    // network_access=true adds (allow system-socket) to the seatbelt profile.
-    let net = vec![
-        "-c".to_string(),
-        "sandbox_workspace_write.network_access=true".to_string(),
-    ];
-
-    match mode {
-        "workspace" => {
-            let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
-            flags.extend(net);
-            flags
-        }
-        "danger-full-access" => {
-            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
-        }
-        "none" => vec![],
-        // Default to workspace (config normalizes the retired `untrusted` and
-        // `full-auto` to it; this also covers them arriving via raw env).
-        _ => {
-            let mut flags = vec!["--sandbox".to_string(), "workspace-write".to_string()];
-            flags.extend(net);
-            flags
-        }
-    }
-}
-
-fn has_explicit_sandbox_or_approval(tokens: &[String]) -> bool {
-    const POLICY_FLAGS: &[&str] = &[
-        "--sandbox",
-        "-s",
-        "--ask-for-approval",
-        "-a",
-        "--dangerously-bypass-approvals-and-sandbox",
-        "--full-auto",
-        "--yolo",
-    ];
-
-    tokens.iter().any(|token| {
-        POLICY_FLAGS.iter().any(|flag| {
-            token == flag
-                || token
-                    .strip_prefix(flag)
-                    .is_some_and(|suffix| suffix.starts_with('='))
-        })
-    })
-}
-
-/// Ensure ~/.hcom is a writable sandbox root so hcom can write to its DB.
-///
-/// Injected as `-c sandbox_workspace_write.writable_roots=[...]` rather than
-/// `--add-dir`: codex's TUI gates the flag on its effective-permissions
-/// preset, and a trusted project (hcom's auto-trust injection) or a missing
-/// explicit `-a` resolves to a preset that rejects extra writable roots
-/// outright ("Ignoring --add-dir ... Switch to workspace-write"). The config
-/// override bypasses that gate; like --add-dir, it is inert outside
-/// workspace-write mode.
-///
-/// If no sandbox flags are present (mode="none"), skip the injection since
-/// user is using codex's own folder settings.
+/// Add ~/.hcom as a writable sandbox root without replacing Codex's
+/// configured roots. Current Codex accepts `--add-dir` in workspace-write.
 pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
-    let has_sandbox = tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "--sandbox"
-                | "-s"
-                | "--dangerously-bypass-approvals-and-sandbox"
-                | "--full-auto"
-                | "--yolo"
-        ) || token.starts_with("--sandbox=")
-            || token.starts_with("-s=")
-    });
-    if !has_sandbox {
-        return tokens.to_vec();
-    }
-
+    let end = tokens
+        .iter()
+        .position(|token| token == "--")
+        .unwrap_or(tokens.len());
+    let options = &tokens[..end];
     let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
 
-    for (i, token) in tokens.iter().enumerate() {
-        // A user-supplied roots override owns the whole list — don't clobber.
-        if token.contains("sandbox_workspace_write.writable_roots") {
-            return tokens.to_vec();
-        }
+    for (i, token) in options.iter().enumerate() {
         // Respect an explicit --add-dir for the hcom dir.
-        if token == "--add-dir" && i + 1 < tokens.len() && tokens[i + 1] == hcom_dir {
+        if token == "--add-dir" && i + 1 < options.len() && options[i + 1] == hcom_dir {
             return tokens.to_vec();
         }
         if token
@@ -113,26 +30,12 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
         }
     }
 
-    // TOML basic-string escaping (backslashes first, then quotes) — every
-    // Windows path carries backslashes.
-    let toml_escaped = crate::runtime_env::toml_escape_path(&hcom_dir);
     let mut result = tokens.to_vec();
-    result.extend([
-        "-c".to_string(),
-        format!("sandbox_workspace_write.writable_roots=[\"{toml_escaped}\"]"),
-    ]);
+    crate::hooks::runtime::insert_before_separator(
+        &mut result,
+        ["--add-dir".to_string(), hcom_dir],
+    );
     result
-}
-
-/// Resolve `CODEX_HOME` the same way Codex itself does: env var if set and
-/// non-empty, otherwise `~/.codex`.
-fn resolve_codex_home() -> Option<(PathBuf, bool)> {
-    if let Ok(val) = std::env::var("CODEX_HOME")
-        && !val.is_empty()
-    {
-        return Some((PathBuf::from(val), true));
-    }
-    dirs::home_dir().map(|h| (h.join(".codex"), false))
 }
 
 /// Resolve the Codex state directory from the effective child launch
@@ -198,13 +101,6 @@ fn resolve_codex_home_from_env_with(
 /// message lets the parent codex's existing sandbox-escalation flow ("approve
 /// to run unsandboxed?") trigger naturally on the failed shell command,
 /// instead of leaving a brick agent behind.
-pub fn ensure_codex_home_writable() -> Result<()> {
-    let Some((codex_home, explicit_env)) = resolve_codex_home() else {
-        return Ok(());
-    };
-    ensure_codex_home_writable_at(&codex_home, explicit_env)
-}
-
 pub(crate) fn ensure_codex_home_writable_at(codex_home: &Path, explicit_env: bool) -> Result<()> {
     let probe_dir = if codex_home.exists() {
         codex_home
@@ -259,6 +155,10 @@ pub fn add_codex_developer_instructions(
     let mut i = 0;
     while i < codex_args.len() {
         let token = &codex_args[i];
+        if token == "--" {
+            remaining.extend_from_slice(&codex_args[i..]);
+            break;
+        }
         if let Some(value) = token
             .strip_prefix("-c=developer_instructions=")
             .or_else(|| token.strip_prefix("--config=developer_instructions="))
@@ -280,6 +180,12 @@ pub fn add_codex_developer_instructions(
     }
 
     let combined = if let Some(existing) = existing_dev_instructions {
+        // Codex accepts a TOML string, falling back to raw text on parse errors.
+        let existing = existing
+            .parse::<toml::Value>()
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or(existing);
         format!("{}\n---\n{}", bootstrap_text, existing)
     } else {
         bootstrap_text.to_string()
@@ -290,96 +196,63 @@ pub fn add_codex_developer_instructions(
     // silently dropping the hcom identity bootstrap. Serialize a real TOML
     // string so quotes, backslashes, and newlines survive on every platform.
     let encoded = toml::Value::String(combined).to_string();
-    remaining.extend([
-        "-c".to_string(),
-        format!("developer_instructions={encoded}"),
-    ]);
+    crate::hooks::runtime::insert_before_separator(
+        &mut remaining,
+        [
+            "-c".to_string(),
+            format!("developer_instructions={encoded}"),
+        ],
+    );
     remaining
 }
 
-/// Remove any Codex `developer_instructions=...` config entries.
-///
-/// Resume/fork should not carry the previous instance's embedded hcom session
-/// block because it hard-codes the original instance name. A fresh bootstrap is
-/// injected later for the new instance.
-pub fn strip_codex_developer_instructions(codex_args: &[String]) -> Vec<String> {
-    let mut result = Vec::new();
+/// Allow terminal Unix sockets in workspace-write without selecting Codex's
+/// sandbox or approval policy. Explicit CLI network settings take precedence.
+fn ensure_terminal_socket_access(args: &[String]) -> Vec<String> {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
     let mut i = 0;
-
-    while i < codex_args.len() {
-        let token = &codex_args[i];
-
-        if token.starts_with("-c=developer_instructions=")
-            || token.starts_with("--config=developer_instructions=")
-        {
+    while i < end {
+        let raw = if matches!(args[i].as_str(), "-c" | "--config") {
             i += 1;
-            continue;
+            args.get(i).filter(|_| i < end).map(String::as_str)
+        } else {
+            args[i]
+                .strip_prefix("--config=")
+                .or_else(|| args[i].strip_prefix("-c="))
+                .or_else(|| args[i].strip_prefix("-c"))
+        };
+        if let Some(raw) = raw
+            && let Some((key, _)) = raw.split_once('=')
+            && matches!(
+                key.trim(),
+                "sandbox_workspace_write" | "sandbox_workspace_write.network_access"
+            )
+        {
+            return args.to_vec();
         }
-
-        if (token == "-c" || token == "--config") && i + 1 < codex_args.len() {
-            let next = &codex_args[i + 1];
-            if next.starts_with("developer_instructions=") {
-                i += 2;
-                continue;
-            }
-        }
-
-        result.push(token.clone());
         i += 1;
     }
-
+    let mut result = args.to_vec();
+    // Seatbelt otherwise denies terminal Unix sockets (kitty/tmux).
+    crate::hooks::runtime::insert_before_separator(
+        &mut result,
+        [
+            "-c".to_string(),
+            "sandbox_workspace_write.network_access=true".to_string(),
+        ],
+    );
     result
 }
 
-/// Preprocess Codex CLI arguments for hcom integration.
-///
-/// Applies:
-/// 1. Strip stale developer_instructions (resume/fork only — they carry old identity)
-/// 2. Sandbox flags based on mode
-/// 3. writable_roots config override for ~/.hcom DB writes
-/// 4. Bootstrap injection via developer_instructions
-pub fn preprocess_codex_args(
-    codex_args: &[String],
-    bootstrap_text: &str,
-    sandbox_mode: &str,
-) -> Vec<String> {
-    // 1. Strip stale developer_instructions for resume/fork only.
-    //    Fresh launches may have user system_prompt in developer_instructions
-    //    that add_codex_developer_instructions will merge with bootstrap.
-    let codex_args = if codex_args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "resume" | "fork"))
-    {
-        strip_codex_developer_instructions(codex_args)
-    } else {
-        codex_args.to_vec()
-    };
-
-    let mut args = codex_args;
-
-    // 2. Inject the configured policy only as a default. An explicit user
-    // sandbox, approval, or bypass selector owns the complete Codex policy;
-    // appending hcom's profile would make clap's last-value-wins behavior
-    // silently override it.
-    if !has_explicit_sandbox_or_approval(&args) {
-        args.extend(get_sandbox_flags(sandbox_mode));
-    }
-
-    // Warn if mode is "none"
-    if sandbox_mode == "none" {
-        eprintln!(
-            "[hcom] Warning: Sandbox mode is 'none' - ~/.hcom writable-root injection disabled."
-        );
-        eprintln!("[hcom] hcom commands may fail unless HCOM_DIR is within workspace.");
-    }
-
-    // 3. Ensure ~/.hcom is a writable sandbox root (skips if mode="none")
-    args = ensure_hcom_writable(&args);
-
-    // 5. Add bootstrap to developer_instructions
-    args = add_codex_developer_instructions(&args, bootstrap_text);
-
-    args
+/// Add the state directory, terminal socket access and identity bootstrap.
+/// Codex's own config and CLI flags select sandbox and approval policy.
+pub fn preprocess_codex_args(codex_args: &[String], bootstrap_text: &str) -> Vec<String> {
+    let args = ensure_hcom_writable(codex_args);
+    let args = ensure_terminal_socket_access(&args);
+    add_codex_developer_instructions(&args, bootstrap_text)
 }
 
 #[cfg(test)]
@@ -391,39 +264,11 @@ mod tests {
         items.iter().map(|i| i.to_string()).collect()
     }
 
-    fn has_writable_roots(result: &[String]) -> bool {
+    fn has_hcom_writable_dir(result: &[String]) -> bool {
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
         result
-            .iter()
-            .any(|t| t.contains("sandbox_workspace_write.writable_roots"))
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe { std::env::remove_var(key) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(value) = self.original.as_ref() {
-                unsafe { std::env::set_var(self.key, value) };
-            } else {
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
+            .windows(2)
+            .any(|pair| pair[0] == "--add-dir" && pair[1] == hcom_dir)
     }
 
     fn init_config() {
@@ -432,97 +277,16 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_flags_workspace() {
-        let flags = get_sandbox_flags("workspace");
-        assert!(flags.contains(&"--sandbox".to_string()));
-        assert!(flags.contains(&"workspace-write".to_string()));
-        assert!(flags.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-    }
-
-    #[test]
-    fn test_sandbox_flags_retired_untrusted_is_workspace() {
-        // Codex 0.152 removed `-a untrusted`; passing it makes Codex exit.
-        let flags = get_sandbox_flags("untrusted");
-        assert_eq!(flags, get_sandbox_flags("workspace"));
-        assert!(!flags.contains(&"-a".to_string()));
-    }
-
-    #[test]
-    fn test_sandbox_flags_danger() {
-        let flags = get_sandbox_flags("danger-full-access");
-        assert_eq!(
-            flags,
-            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
-        );
-    }
-
-    #[test]
-    fn test_sandbox_flags_none() {
-        let flags = get_sandbox_flags("none");
-        assert!(flags.is_empty());
-    }
-
-    #[test]
-    fn test_sandbox_flags_unknown_defaults_to_workspace() {
-        let flags = get_sandbox_flags("bogus");
-        assert!(flags.contains(&"--sandbox".to_string()));
-        assert!(flags.contains(&"workspace-write".to_string()));
-    }
-
-    #[test]
     #[serial]
     fn test_ensure_hcom_writable_adds_writable_root() {
         init_config();
-        // --full-auto is still recognized as a sandbox-active marker for
-        // back-compat with user-provided args, even though hcom no longer emits it.
-        let tokens = s(&["--full-auto"]);
+        let tokens = s(&["--model", "gpt-6-luna"]);
         let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result[0], "--full-auto");
-        assert_eq!(result[result.len() - 2], "-c");
+        assert_eq!(&result[..tokens.len()], &tokens);
         assert!(
-            result[result.len() - 1].starts_with("sandbox_workspace_write.writable_roots=[\""),
-            "writable_roots override missing: {:?}",
-            result
+            has_hcom_writable_dir(&result),
+            "missing hcom directory: {result:?}"
         );
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_hcom_writable_toml_escapes_backslashes() {
-        init_config();
-        let tokens = s(&["--sandbox", "workspace-write"]);
-        let result = ensure_hcom_writable(&tokens);
-        let root = result.last().unwrap();
-        // The raw hcom dir path must not leak unescaped backslashes into the
-        // TOML string — codex would reject the value as an invalid escape.
-        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
-        if hcom_dir.contains('\\') {
-            assert!(root.contains(r"\\"), "backslashes must be escaped: {root}");
-            assert!(!root.contains(&format!("[\"{hcom_dir}\"]")));
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn test_ensure_hcom_writable_treats_yolo_as_sandbox_active() {
-        init_config();
-        let tokens = s(&["--yolo"]);
-        let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result[0], "--yolo");
-        assert!(
-            result[result.len() - 1].contains("writable_roots"),
-            "writable_roots override missing: {:?}",
-            result
-        );
-        assert!(result.contains(&"--yolo".to_string()));
-    }
-
-    #[test]
-    fn test_ensure_hcom_writable_skips_no_sandbox() {
-        // No sandbox flags → mode="none" → skip (doesn't use paths)
-        let tokens = s(&["-m", "o3"]);
-        let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result, tokens);
     }
 
     #[test]
@@ -530,7 +294,7 @@ mod tests {
     fn test_ensure_hcom_writable_respects_explicit_add_dir() {
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
-        let tokens = vec!["--full-auto".to_string(), "--add-dir".to_string(), hcom_dir];
+        let tokens = vec!["--add-dir".to_string(), hcom_dir];
         let result = ensure_hcom_writable(&tokens);
         assert_eq!(result, tokens, "explicit --add-dir must suppress injection");
     }
@@ -546,16 +310,15 @@ mod tests {
             r#"sandbox_workspace_write.writable_roots=["/my/dir"]"#,
         ]);
         let result = ensure_hcom_writable(&tokens);
-        assert_eq!(result, tokens, "user roots override must not be clobbered");
+        assert_eq!(&result[..tokens.len()], &tokens);
+        assert!(has_hcom_writable_dir(&result));
     }
 
     #[test]
     #[serial]
     fn test_ensure_codex_home_writable_probes_existing_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
-
-        ensure_codex_home_writable().unwrap();
+        ensure_codex_home_writable_at(dir.path(), true).unwrap();
 
         assert!(!dir.path().join(".hcom_writable_probe").exists());
     }
@@ -565,9 +328,7 @@ mod tests {
     fn test_ensure_codex_home_writable_skips_missing_explicit_home() {
         let dir = tempfile::tempdir().unwrap();
         let codex_home = dir.path().join("missing-codex-home");
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", codex_home.to_string_lossy().as_ref());
-
-        ensure_codex_home_writable().unwrap();
+        ensure_codex_home_writable_at(&codex_home, true).unwrap();
 
         assert!(!codex_home.exists());
         assert!(!dir.path().join(".hcom_writable_probe").exists());
@@ -579,10 +340,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        let _codex_home_guard = EnvGuard::remove("CODEX_HOME");
-        let _home_guard = EnvGuard::set("HOME", home.to_string_lossy().as_ref());
-
-        ensure_codex_home_writable().unwrap();
+        ensure_codex_home_writable_at(&home.join(".codex"), false).unwrap();
 
         assert!(!home.join(".codex").exists());
         assert!(!home.join(".hcom_writable_probe").exists());
@@ -718,45 +476,11 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_developer_instructions_space_syntax() {
-        let args = s(&["fork", "-c", "developer_instructions=OLD", "--model", "o3"]);
-        let result = strip_codex_developer_instructions(&args);
-        assert_eq!(result, s(&["fork", "--model", "o3"]));
-    }
-
-    #[test]
-    fn test_strip_developer_instructions_equals_syntax() {
-        let args = s(&[
-            "resume",
-            "--config=developer_instructions=OLD",
-            "--full-auto",
-        ]);
-        let result = strip_codex_developer_instructions(&args);
-        assert_eq!(result, s(&["resume", "--full-auto"]));
-    }
-
-    #[test]
-    #[serial]
-    fn test_preprocess_codex_args_full_pipeline() {
-        let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
-        init_config();
-        let args = s(&["-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        assert!(result.contains(&"--sandbox".to_string()));
-        assert!(result.contains(&"workspace-write".to_string()));
-        assert!(has_writable_roots(&result));
-        assert!(result.iter().any(|t| t.contains("developer_instructions=")));
-    }
-
-    #[test]
     #[serial]
     fn test_preprocess_resume_keeps_session_first() {
-        let dir = tempfile::tempdir().unwrap();
-        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         init_config();
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
+        let result = preprocess_codex_args(&args, "BOOTSTRAP");
         assert_eq!(result[0], "resume");
         assert_eq!(result[1], "thread-1");
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
@@ -764,122 +488,120 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_preprocess_user_sandbox_suppresses_hcom_policy_defaults() {
+    fn preprocessing_preserves_native_permission_flags() {
         init_config();
-        let args = s(&["--sandbox", "read-only", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        let sandbox_position = result.iter().position(|t| t == "--sandbox").unwrap();
-        assert_eq!(result[sandbox_position + 1], "read-only");
-        assert_eq!(result.iter().filter(|t| *t == "--sandbox").count(), 1);
-        assert!(!result.contains(&"workspace-write".to_string()));
-        assert!(has_writable_roots(&result));
-        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+        for args in [
+            s(&[]),
+            s(&["--sandbox", "read-only", "-a", "never"]),
+            s(&["--sandbox=workspace-write", "--ask-for-approval=on-request"]),
+            s(&["--yolo"]),
+            s(&[
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
+                "-c",
+                "approval_policy=\"never\"",
+            ]),
+        ] {
+            let result = preprocess_codex_args(&args, "BOOTSTRAP");
+            assert_eq!(&result[..args.len()], &args);
+            assert!(has_hcom_writable_dir(&result));
+            assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
+            for flag in [
+                "--sandbox",
+                "--ask-for-approval",
+                "-s",
+                "-a",
+                "--yolo",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ] {
+                assert_eq!(
+                    result.iter().filter(|arg| arg.as_str() == flag).count(),
+                    args.iter().filter(|arg| arg.as_str() == flag).count()
+                );
+            }
+        }
     }
 
     #[test]
     #[serial]
-    fn test_preprocess_yolo_suppresses_hcom_policy_defaults() {
+    fn explicit_network_overrides_survive_launch_resume_and_fork() {
         init_config();
-        let args = s(&["--yolo", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-
-        assert!(result.contains(&"--yolo".to_string()));
-        assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!result.contains(&"workspace-write".to_string()));
-        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(has_writable_roots(&result));
+        for prefix in [
+            s(&[]),
+            s(&["resume", "session-id"]),
+            s(&["fork", "session-id"]),
+        ] {
+            for override_args in [
+                s(&["-c", "sandbox_workspace_write.network_access=false"]),
+                s(&["--config", "sandbox_workspace_write.network_access=false"]),
+                s(&["-c=sandbox_workspace_write.network_access=false"]),
+                s(&["-csandbox_workspace_write.network_access=false"]),
+                s(&["--config=sandbox_workspace_write.network_access=false"]),
+                s(&["-c", "sandbox_workspace_write={network_access=false}"]),
+            ] {
+                let args = [prefix.clone(), override_args].concat();
+                let result = preprocess_codex_args(&args, "BOOTSTRAP");
+                assert_eq!(&result[..args.len()], &args);
+                assert!(
+                    !result.contains(&"sandbox_workspace_write.network_access=true".to_string())
+                );
+                assert!(has_hcom_writable_dir(&result));
+            }
+        }
     }
 
     #[test]
     #[serial]
-    fn test_preprocess_user_approval_suppresses_hcom_policy_defaults() {
-        init_config();
-        let args = s(&["-a", "on-request", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        let approval_position = result.iter().position(|t| t == "-a").unwrap();
-        assert_eq!(result[approval_position + 1], "on-request");
-        assert_eq!(result.iter().filter(|t| *t == "-a").count(), 1);
-        assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(!has_writable_roots(&result));
-    }
-
-    #[test]
-    #[serial]
-    fn test_preprocess_bypass_suppresses_hcom_policy_defaults() {
-        init_config();
-        let args = s(&["--dangerously-bypass-approvals-and-sandbox", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-
-        assert_eq!(
-            result
-                .iter()
-                .filter(|t| *t == "--dangerously-bypass-approvals-and-sandbox")
-                .count(),
-            1
-        );
-        assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!result.contains(&"-a".to_string()));
-        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-        assert!(has_writable_roots(&result));
-    }
-
-    #[test]
-    #[serial]
-    fn test_preprocess_equals_policy_flags_suppress_hcom_defaults() {
-        init_config();
-        let args = s(&["--sandbox=read-only", "-a=on-request", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-
-        assert!(result.contains(&"--sandbox=read-only".to_string()));
-        assert!(result.contains(&"-a=on-request".to_string()));
-        assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!result.contains(&"workspace-write".to_string()));
-        assert!(!result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
-    }
-
-    #[test]
-    fn test_preprocess_codex_args_none_mode() {
-        let args = s(&["-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "none");
-        assert!(!result.contains(&"--sandbox".to_string()));
-        assert!(!has_writable_roots(&result));
-        assert!(result.iter().any(|t| t.contains("developer_instructions=")));
-    }
-
-    #[test]
-    #[serial]
-    fn test_preprocess_strips_stale_on_resume() {
+    fn preprocessing_preserves_positional_prompt() {
         init_config();
         let args = s(&[
-            "resume",
-            "-c",
-            "developer_instructions=STALE_BOOTSTRAP",
-            "-m",
-            "o3",
+            "--",
+            "--sandbox=read-only",
+            "-c=developer_instructions=literal prompt",
         ]);
-        let result = preprocess_codex_args(&args, "FRESH", "workspace");
-        let di: Vec<&String> = result
-            .iter()
-            .filter(|t| t.starts_with("developer_instructions="))
-            .collect();
-        assert_eq!(di.len(), 1);
-        assert!(di[0].contains("FRESH"));
-        assert!(!di[0].contains("STALE"));
+        let result = preprocess_codex_args(&args, "BOOTSTRAP");
+        let separator = result.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(&result[separator..], &args);
+        assert!(
+            result[..separator]
+                .iter()
+                .any(|arg| arg.starts_with("developer_instructions="))
+        );
     }
 
     #[test]
     #[serial]
-    fn test_preprocess_preserves_user_instructions_on_fresh_launch() {
+    fn writable_directory_keeps_other_additional_directories() {
         init_config();
-        let args = s(&["-c", "developer_instructions=USER_NOTES", "-m", "o3"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
-        let di: Vec<&String> = result
-            .iter()
-            .filter(|t| t.starts_with("developer_instructions="))
-            .collect();
-        assert_eq!(di.len(), 1);
-        assert!(di[0].contains("BOOTSTRAP"));
-        assert!(di[0].contains("USER_NOTES"));
+        let args = s(&["--sandbox", "workspace-write", "--add-dir", "/user/root"]);
+        let result = ensure_hcom_writable(&args);
+        assert_eq!(&result[..args.len()], &args);
+        assert!(has_hcom_writable_dir(&result));
+    }
+
+    #[test]
+    #[serial]
+    fn resume_and_fork_preserve_user_developer_instructions() {
+        init_config();
+        for subcommand in ["resume", "fork"] {
+            let args = s(&[
+                subcommand,
+                "session-id",
+                "-c",
+                r#"developer_instructions="User notes\nwith quotes \"here\"""#,
+            ]);
+            let result = preprocess_codex_args(&args, "BOOTSTRAP");
+            assert_eq!(&result[..2], &args[..2]);
+            let encoded = result
+                .last()
+                .unwrap()
+                .strip_prefix("developer_instructions=")
+                .unwrap();
+            let decoded = encoded.parse::<toml::Value>().unwrap();
+            assert_eq!(
+                decoded.as_str(),
+                Some("BOOTSTRAP\n---\nUser notes\nwith quotes \"here\"")
+            );
+        }
     }
 }
