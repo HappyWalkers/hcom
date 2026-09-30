@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use support::claude_mock::{
     ClaudeStartupAnswers, ClaudeStartupGate, MODEL, claude_startup_gate, claude_text,
-    claude_tool_use, latest_user_turn, trust_accept_selected,
+    claude_tool_use, latest_user_turn, seed_claude_state, trust_accept_selected,
 };
 use support::mock_http::{MockHttp, RecordedRequest, Reply};
 use support::pins;
@@ -754,7 +754,10 @@ fn remote_term_screen_stdout(hcom_dir: &str, remote_name: &str) -> String {
 
 fn write_claude_mock_env(hcom_dir: &Path, base_url: &str) {
     let claude_home = hcom_dir.join("claude-home");
-    fs::create_dir_all(&claude_home).expect("create isolated Claude config dir");
+    // Remote launches run in the platform temp dir (see
+    // try_remote_launch_claude_headless); pre-trust it so startup screens don't
+    // each cost a delivery-start fallback. Relay, not trust, is under test here.
+    seed_claude_state(&claude_home, &[&std::env::temp_dir()]);
     let env = [
         ("ANTHROPIC_BASE_URL", base_url.to_string()),
         (
@@ -1026,13 +1029,18 @@ impl Drop for RelayGuard {
                 let _ = hcom_with_dir(&format!("kill {name}"), &d_str);
             }
         }
-        for d in [&self.dir_a, &self.dir_b].into_iter().flatten() {
-            let d_str = d.to_string_lossy();
-            let _ = hcom_with_dir("relay off", &d_str);
-            let _ = hcom_with_dir("relay daemon stop", &d_str);
-            kill_daemon(&d_str);
-            let _ = fs::remove_dir_all(d);
-        }
+        // Devices are independent; `relay off` blocks ~2-3s each on the worker.
+        thread::scope(|s| {
+            for d in [&self.dir_a, &self.dir_b].into_iter().flatten() {
+                s.spawn(move || {
+                    let d_str = d.to_string_lossy();
+                    let _ = hcom_with_dir("relay off", &d_str);
+                    let _ = hcom_with_dir("relay daemon stop", &d_str);
+                    kill_daemon(&d_str);
+                    let _ = fs::remove_dir_all(d);
+                });
+            }
+        });
     }
 }
 
