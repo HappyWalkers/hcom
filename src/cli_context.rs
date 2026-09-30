@@ -42,6 +42,7 @@ pub fn build_ctx_for_command(
         claude_actor::ensure_explicit_matches(db, actor, name)?;
     }
 
+    let had_verified_actor = verified_actor.is_some();
     let identity = if let Some(actor) = verified_actor {
         Some(actor)
     } else if let Some(name) = explicit_name {
@@ -63,11 +64,61 @@ pub fn build_ctx_for_command(
         identity::resolve_identity(db, None, None, None, process_id, codex_thread_id).ok()
     };
 
+    // Only an explicit --name can disagree with the shell's binding. A verified
+    // Claude actor is already the exact acting agent (and ensure_explicit_matches
+    // above hard-errors on conflict), so its process binding naming the parent
+    // row is not drift.
+    let identity_warning = match (&identity, explicit_name, had_verified_actor) {
+        (Some(resolved), Some(_), false) => drift_warning(db, resolved, process_id),
+        _ => None,
+    };
+
     Ok(CommandContext {
         explicit_name: explicit_name.map(|s| s.to_string()),
         identity,
         go,
+        identity_warning,
     })
+}
+
+/// Warn when an explicit `--name` names a different instance than the one this
+/// shell's process binding points at.
+///
+/// `--name` is what the agent knows itself to be, so on disagreement the binding
+/// is the stale side (session switch, resume, recovery). Hooks deliver by
+/// binding, so messages to the agent's name silently stop arriving until it
+/// reclaims the name.
+///
+/// Read-only: a plain binding lookup, never `resolve_identity`, whose Codex
+/// recovery path can rebind or retire rows.
+///
+/// Returns `None` when the shell is unbound, the two agree, or the named
+/// instance is a subagent of the bound row (subagents share the parent's shell).
+fn drift_warning(
+    db: &HcomDb,
+    resolved: &SenderIdentity,
+    process_id: Option<&str>,
+) -> Option<String> {
+    if !matches!(resolved.kind, SenderKind::Instance) {
+        return None;
+    }
+    let bound = db.get_process_binding(process_id?).ok()??;
+    if bound == resolved.name {
+        return None;
+    }
+    let parent = resolved
+        .instance_data
+        .as_ref()
+        .and_then(|d| d.get("parent_name"))
+        .and_then(|v| v.as_str());
+    if parent == Some(bound.as_str()) {
+        return None;
+    }
+    let name = &resolved.name;
+    Some(format!(
+        "[hcom] warning: --name '{name}' but this shell is bound to '{bound}'. \
+         If you are '{name}', run 'hcom start --as {name}'."
+    ))
 }
 
 /// Check identity gating for a CLI command.
@@ -701,6 +752,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("list", &ctx, false, false).is_ok());
     }
@@ -711,6 +763,7 @@ mod tests {
             explicit_name: Some("luna".to_string()),
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -721,6 +774,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, true, false).is_ok());
     }
@@ -731,6 +785,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         let err = check_identity_gate("send", &ctx, false, false).unwrap_err();
         assert!(err.contains("identity not found"));
@@ -747,6 +802,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert!(check_identity_gate("send", &ctx, false, false).is_ok());
     }
@@ -757,6 +813,7 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         let err = check_identity_gate("listen", &ctx, false, true).unwrap_err();
         assert!(err.contains("start --as"));
@@ -777,6 +834,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         // listen is in skip list — should not change status
         set_hookless_command_status(&db, "listen", &ctx);
@@ -798,6 +856,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -818,6 +877,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "events", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -838,6 +898,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("luna").unwrap().unwrap();
@@ -864,6 +925,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         set_hookless_command_status(&db, "send", &ctx);
         let data = db.get_instance_full("sub1").unwrap().unwrap();
@@ -1004,6 +1066,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, true), Ok(false));
     }
@@ -1020,6 +1083,7 @@ mod tests {
                 session_id: None,
             }),
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
     }
@@ -1031,7 +1095,143 @@ mod tests {
             explicit_name: None,
             identity: None,
             go: false,
+            identity_warning: None,
         };
         assert_eq!(maybe_deliver_pending_messages(&db, &ctx, false), Ok(false));
+    }
+
+    #[test]
+    fn build_ctx_warns_when_explicit_name_disagrees_with_this_shell() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("riko"), false, Some("pid-1"), None)
+                .unwrap();
+
+        let warning = ctx
+            .identity_warning
+            .expect("a --name that disagrees with this shell must warn");
+        assert!(
+            warning.contains("riko"),
+            "warning names the sender: {warning}"
+        );
+        assert!(
+            warning.contains("voni"),
+            "warning names this shell: {warning}"
+        );
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_when_explicit_name_matches_this_shell() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("voni"), false, Some("pid-1"), None)
+                .unwrap();
+        assert!(ctx.identity_warning.is_none());
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_when_this_shell_has_no_identity() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), Some("riko"), false, None, None).unwrap();
+        assert!(
+            ctx.identity_warning.is_none(),
+            "an unbound shell has nothing to disagree with"
+        );
+    }
+
+    #[test]
+    fn build_ctx_is_quiet_for_a_subagent_acting_under_its_own_row() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, parent_name, agent_id, status, created_at, tool)
+                 VALUES ('voni_task_1', 'voni', 'a6d9caf', 'active', ?1, 'claude')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("voni_task_1"),
+            false,
+            Some("pid-1"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            ctx.identity_warning.is_none(),
+            "a subagent legitimately differs from the parent row its shell resolves to"
+        );
+    }
+
+    #[test]
+    fn build_ctx_warns_for_a_subagent_of_another_parent() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        insert_instance(&db, "riko", "claude");
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, parent_name, agent_id, status, created_at, tool)
+                 VALUES ('riko_task_1', 'riko', 'a6d9caf', 'active', ?1, 'claude')",
+                rusqlite::params![now],
+            )
+            .unwrap();
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx = build_ctx_for_command(
+            &db,
+            Some("send"),
+            Some("riko_task_1"),
+            false,
+            Some("pid-1"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            ctx.identity_warning.is_some(),
+            "only the bound row's own subagents are exempt"
+        );
+    }
+
+    #[test]
+    fn build_ctx_skips_drift_check_without_explicit_name() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let ctx =
+            build_ctx_for_command(&db, Some("send"), None, false, Some("pid-1"), None).unwrap();
+        assert!(ctx.identity_warning.is_none());
+    }
+
+    #[test]
+    fn drift_warning_text_has_no_stray_whitespace() {
+        let (db, _dir) = make_test_db();
+        insert_instance(&db, "riko", "claude");
+        insert_instance(&db, "voni", "claude");
+        insert_process_binding(&db, "pid-1", "voni");
+
+        let resolved = identity::resolve_from_name(&db, "riko").unwrap();
+        let warning = drift_warning(&db, &resolved, Some("pid-1")).unwrap();
+        assert!(warning.contains("hcom start --as riko"), "{warning}");
+        assert!(
+            !warning.contains("  "),
+            "the warning is printed to a terminal; it must not carry a run of spaces: {warning:?}"
+        );
     }
 }

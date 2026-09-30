@@ -1674,3 +1674,87 @@ fn unknown_command_and_tool_suggest_corrections() {
         "stderr={stderr}"
     );
 }
+
+#[test]
+fn send_warns_when_name_disagrees_with_the_shell_identity() {
+    let h = Hcom::new();
+    let sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    // pid-sender's shell is bound to `sender`, but it sends under `other` —
+    // exactly the shape of an identity that drifted after a rebind or recovery.
+    let (code, stdout, stderr) =
+        h.run_as_process("pid-sender", ["send", "--name", &other, "--", "hi"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains(&sender) && stderr.contains(&other),
+        "expected a drift warning naming both identities, got stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_is_quiet_when_name_matches_the_shell_identity() {
+    let h = Hcom::new();
+    let sender = h.start_with_process_id("pid-sender");
+
+    let (code, stdout, stderr) =
+        h.run_as_process("pid-sender", ["send", "--name", &sender, "--", "hi"]);
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("warning"),
+        "a matching --name must not warn, got stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_with_from_skips_the_name_drift_warning() {
+    let h = Hcom::new();
+    let _sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    // With --from the sender is the external name, so --name disagreeing with
+    // the shell's binding says nothing about who is sending.
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--name", &other, "--from", "bigboss", "--", "hi"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("warning"),
+        "--from must suppress the drift warning, got stderr={stderr}"
+    );
+}
+
+#[test]
+fn from_in_message_text_does_not_suppress_the_name_drift_warning() {
+    let h = Hcom::new();
+    let sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--name", &other, "--", "use", "--from", "x"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains(&sender) && stderr.contains(&other),
+        "--from after -- is message text, got stderr={stderr}"
+    );
+}
+
+#[test]
+fn send_with_attached_from_skips_the_name_drift_warning() {
+    let h = Hcom::new();
+    let _sender = h.start_with_process_id("pid-sender");
+    let other = h.start_with_process_id("pid-other");
+
+    let (code, stdout, stderr) = h.run_as_process(
+        "pid-sender",
+        ["send", "--name", &other, "--from=bigboss", "--", "hi"],
+    );
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        !stderr.contains("warning"),
+        "--from=NAME must suppress the drift warning, got stderr={stderr}"
+    );
+}

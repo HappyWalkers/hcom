@@ -828,7 +828,11 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
         .ok()
         .filter(|s| !s.is_empty());
     let codex_thread_id = crate::shared::context::HcomContext::from_os().codex_thread_id;
-    let has_from_flag = cmd_argv.iter().any(|a| a == "--from" || a == "-b");
+    // Flags only: anything after `--` is message text.
+    let has_from_flag = cmd_argv
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a == "--from" || a.starts_with("--from=") || a == "-b");
     let is_inside_ai = crate::shared::is_inside_ai_tool();
     let ctx = match build_ctx_for_command(
         &db,
@@ -853,6 +857,15 @@ fn dispatch_native_command(cmd: &str, args: &[String]) -> i32 {
             return 1;
         }
     };
+
+    // --name disagrees with this shell's binding. Warn, don't refuse: --name is
+    // what the agent knows itself to be. With send --from, --name isn't the
+    // sender. (listen/events --from is a filter, so it still warns.)
+    if let Some(ref warning) = ctx.identity_warning
+        && !(cmd == "send" && has_from_flag)
+    {
+        eprintln!("{warning}");
+    }
 
     // Identity gating: block unregistered sessions from gated commands
     if let Err(e) = crate::cli_context::check_identity_gate(cmd, &ctx, has_from_flag, is_inside_ai)
