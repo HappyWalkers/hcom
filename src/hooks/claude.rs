@@ -4900,7 +4900,7 @@ mod tests {
             "pending message missing: {stdout}"
         );
         assert!(
-            stdout.contains("[hcom:nova]"),
+            stdout.contains("--name nova"),
             "bootstrap identity missing: {stdout}"
         );
         let ack = ack.expect("pending message must be acknowledged with the combined output");

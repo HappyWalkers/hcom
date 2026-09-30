@@ -834,7 +834,6 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
             "You are a fork of {display_name}, but your new hcom identity is now {child_display}.\n\
              Your hcom name is {child_name}.\n\
              Do not use {display_name}'s hcom identity anymore, even if it appears in inherited thread history.\n\
-             Use [hcom:{child_name}] in your first response only.\n\
              Use `hcom ... --name {child_name}` for all hcom commands.\n\
              If asked about your identity, answer exactly: {child_display}"
         );

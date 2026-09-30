@@ -2019,63 +2019,34 @@ fn test_relay_roundtrip() {
         baseline_event_b,
         Duration::from_secs(90),
     );
-    let resumed_screen =
-        wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
+    wait_for_screen_drawn(&path_b, &resumed_full_name, Duration::from_secs(30));
     logln!(
         log,
         "  OK: resumed instance PTY ready (life event + TUI drawn)"
     );
 
-    // After a bootstrapped resume, claude either sees the [hcom:name]
-    // marker injected into its first response/screen, OR the life event
-    // log records a "bootstrap" action. Either way counts as proof the
-    // resume actually rebooted claude, not just flipped a DB row.
-    let screen_lines = screen_lines_joined(&resumed_screen);
-    let screen_has_marker = screen_lines.contains("[hcom:");
+    // Evidence the resume actually rebooted claude into hcom, not just
+    // flipped a DB row: the life event log records a "bootstrap" action.
     let events_have_bootstrap = {
         let out = hcom_with_dir(
             &format!("events --agent {resumed_full_name} --last 40"),
             &path_b,
         );
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        stdout.contains("bootstrap") || stdout.contains("[hcom:")
+        String::from_utf8_lossy(&out.stdout).contains("bootstrap")
     };
-    // Claude --resume reuses the existing session JSONL, so the original
-    // [hcom:name] marker may already sit deep in claude's history rather
-    // than being redrawn on screen. Pull a large transcript window and
-    // look for it there.
-    let transcript_has_marker = {
-        ensure_relay_worker(&path_a);
-        let out = hcom_with_dir(
-            &format!("transcript {resumed_name}:{short_b} --last 50 --full"),
-            &path_a,
-        );
-        if out.status.success() {
-            let rpc = poll_rpc_result_on_device(&path_b, "transcript");
-            rpc["result"]["content"]
-                .as_str()
-                .map(|s| s.contains("[hcom:"))
-                .unwrap_or(false)
-        } else {
-            false
-        }
-    };
-    // Last-resort evidence: hcom's hooks flip hooks_bound=true on first
-    // daemon contact after a resume. If this is true, the rebind actually
-    // happened even if the textual marker ended up somewhere we don't
-    // scan.
+    // Fallback evidence: hcom's hooks flip hooks_bound=true on first
+    // daemon contact after a resume.
     let hooks_bound = find_instance_by_base(&path_b, &resumed_name)
         .and_then(|inst| inst["hooks_bound"].as_bool())
         .unwrap_or(false);
     assert!(
-        screen_has_marker || events_have_bootstrap || transcript_has_marker || hooks_bound,
+        events_have_bootstrap || hooks_bound,
         "no evidence of hcom rebind on resumed {resumed_full_name} \
-         (screen_marker={screen_has_marker}, events={events_have_bootstrap}, \
-          transcript_marker={transcript_has_marker}, hooks_bound={hooks_bound})"
+         (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
     );
     logln!(
         log,
-        "  OK: resumed instance is rebound to hcom (screen={screen_has_marker}, events={events_have_bootstrap}, transcript={transcript_has_marker}, hooks_bound={hooks_bound})"
+        "  OK: resumed instance is rebound to hcom (events={events_have_bootstrap}, hooks_bound={hooks_bound})"
     );
 
     let unexpected = claude_mock.unexpected();

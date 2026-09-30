@@ -40,7 +40,6 @@ const UNIVERSAL: &str = r#"[HCOM SESSION]
 You have access to the hcom cli communication tool.
 - Your name: {display_name}
 - Authority: Prioritize @{SENDER} over others{launched_by}
-- Important: Include this marker anywhere in your first response only: [hcom:{instance_name}]
 
 You run hcom commands on behalf of the human user. The human uses natural language with you.
 
@@ -62,14 +61,16 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
 - Message: send {target_name_s} [--intent request|inform|ack] [--reply-to <id>] [--thread <thread_name>] -- 'plain text'
   Or (for code/md/backticks) instead of --: --file <path> | --base64 <string> | pipe/heredoc
   Example: send {target_luna} {target_nova} --intent ack --reply-to 82 --name {instance_name} -- 'ok'
-- See who's active: list [-v] [--json] [--names] [--format '{{name}} {{status}}'] [name]
-- Read another's conversation: transcript [name] [N-M] [--last N] [--full] | transcript search 'text' [--all]
+- See who's active: list [name] [-v] [--json]
+- Read another's conversation: transcript [name] [N-M] [--last N] [--full] [--detailed (tools/io)] | transcript search 'text' [--all]
 - View events: events [--last N] [--all] [--sql EXPR] [filters]
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
-  Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
+  Get notified (watch agents, react): events sub [filters] [--once] | --help
+  Example: events sub --idle luna → <hcom> msg when luna goes idle
 - Handoff context: bundle prepare
 - Spawn agents: [num] <{launch_tools}> [--tag labelOrGroup] [--hcom-prompt 'task']
-  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'`
+  Example: `hcom 1 claude --tag cool --hcom-prompt 'task'` → <hcom> sends you result when done
+  Without --hcom-prompt: you get auto notify <hcom> when ready, then use hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
   each supports --help (set prompt, system, background, forward args, etc)
 - Run workflows: run <script> [args] [--help]
@@ -81,9 +82,9 @@ If unsure about syntax, always run `hcom <command> --help` FIRST. Do not guess.
 
 ## RULES
 
-1. No filler messages (greetings, thanks, congratulations).
+1. No filler messages (greetings, thanks, congrats).
 2. Use --intent on sends: request (want reply), inform (dont need reply), ack (responding).
-3. User says 'the gemini/claude/codex agent' or unclear → run `hcom list` to resolve name
+3. User says 'the pi/claude/codex agent' or unclear → run `hcom list` to resolve name
 4. Don't delegate to existing agents unless asked. Need help? Spawn your own agents.
 
 Agent names are 4-letter CVCV words. When user mentions one, they mean an agent.
@@ -95,7 +96,7 @@ const TAG_NOTICE: &str = r#"
 You are tagged '{tag}'. Message your group: send {target_tag} -- msg"#;
 
 const RELAY_NOTICE: &str = r#"
-Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in. Remote hcom events needs --remote-fetch --device BOXE. Remote events sub needs --device BOXE."#;
+Remote agents have suffix (e.g., `luna:BOXE`). @luna = local only; @luna:BOXE = remote. Remote event IDs 42:BOXE. Remote launch needs --device BOXE and --dir passed in. Remote hcom events needs --remote-fetch --device BOXE. Remote events sub needs --device BOXE. transcript, term, kill, r, f take name:BOXE."#;
 
 const HEADLESS_NOTICE: &str = r#"
 Headless mode: No one sees your chat, only hcom messages. Communicate via hcom send."#;
@@ -148,10 +149,10 @@ Messages instantly and automatically arrive via <hcom> tags — end your turn to
 
 ## WAITING RULES
 
-1. Never use `sleep [sec]` instead use `hcom listen [sec]`
-2. Only use `hcom listen` when you are waiting for something not related to hcom
+1. Never use `sleep [sec]` instead use `hcom listen [sec]` (returns early when msg arrives)
+2. Only use `hcom listen` when you are waiting for something not related to hcom and were going to use `sleep`
 - Waiting for hcom message → end your turn
-- Waiting for agent progress → `hcom events sub`, subscribe, end your turn"#;
+- Waiting for agent progress → `hcom events sub`, end your turn"#;
 
 const DELIVERY_ADHOC: &str = r#"## DELIVERY
 
@@ -392,8 +393,7 @@ fn build_context(
 }
 
 /// Apply string substitutions on template text.
-/// Replaces {key} patterns with context values, then unescapes {{ → { and }} → }
-/// (template uses {{name}} to produce literal {name}).
+/// Replaces {key} patterns with context values.
 fn render_template(template: &str, ctx: &BootstrapContext) -> String {
     template
         .replace("{display_name}", &ctx.display_name)
@@ -409,29 +409,24 @@ fn render_template(template: &str, ctx: &BootstrapContext) -> String {
         .replace("{target_luna}", &recipient_token("luna"))
         .replace("{target_nova}", &recipient_token("nova"))
         .replace("{target_tag}", &recipient_token(&format!("{}-", ctx.tag)))
-        .replace("{{", "{")
-        .replace("}}", "}")
 }
 
 static HCOM_WORD: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\bhcom\b").expect("valid regex"));
 
 /// Rewrite bare `hcom` command references to the alternate command (e.g.
-/// `uvx hcom`), leaving the identity marker and `<hcom>` tags untouched.
+/// `uvx hcom`), leaving `<hcom>` tags untouched.
 fn rewrite_hcom_command(text: &str, hcom_cmd: &str) -> String {
     const COMMAND: &str = "__HCOM_CMD__";
-    const MARKER: &str = "__HCOM_IDENTITY_MARKER__";
     const OPEN_TAG: &str = "__HCOM_OPEN_TAG__";
     const CLOSE_TAG: &str = "__HCOM_CLOSE_TAG__";
     let protected = text
         .replace(hcom_cmd, COMMAND)
-        .replace("[hcom:", MARKER)
         .replace("<hcom>", OPEN_TAG)
         .replace("</hcom>", CLOSE_TAG);
     HCOM_WORD
         .replace_all(&protected, hcom_cmd)
         .replace(COMMAND, hcom_cmd)
-        .replace(MARKER, "[hcom:")
         .replace(OPEN_TAG, "<hcom>")
         .replace(CLOSE_TAG, "</hcom>")
 }
@@ -730,8 +725,7 @@ mod tests {
         assert!(result.contains("--name luna"));
         assert!(result.contains("SUBAGENTS"));
         assert!(!result.contains("Headless mode"));
-        assert!(!result.contains("{{name}}"));
-        assert!(result.contains("{name}"));
+        assert!(!result.contains('{'), "unrendered placeholder: {result}");
         assert!(result.ends_with("</hcom_system_context>"));
     }
 
@@ -877,11 +871,11 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_hcom_command_keeps_marker_and_tags() {
-        let text = "run `hcom list`, marker [hcom:luna], <hcom>x</hcom>, already uvx hcom send";
+    fn test_rewrite_hcom_command_keeps_tags() {
+        let text = "run `hcom list`, <hcom>x</hcom>, already uvx hcom send";
         assert_eq!(
             rewrite_hcom_command(text, "uvx hcom"),
-            "run `uvx hcom list`, marker [hcom:luna], <hcom>x</hcom>, already uvx hcom send"
+            "run `uvx hcom list`, <hcom>x</hcom>, already uvx hcom send"
         );
     }
 

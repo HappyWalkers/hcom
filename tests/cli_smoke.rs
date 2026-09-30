@@ -707,7 +707,7 @@ fn antigravity_e2e_hook_dispatch() {
         .as_str()
         .expect("initial Antigravity bootstrap");
     assert!(first_context.contains("[HCOM SESSION]"));
-    assert!(first_context.contains(&format!("[hcom:{me}]")));
+    assert!(first_context.contains(&format!("--name {me}")));
 
     // Verify session_id binding matches in the DB via hcom list --json
     let (code, stdout, stderr) = h.run(["list", &me, "--json"]);
@@ -752,7 +752,7 @@ fn antigravity_e2e_hook_dispatch() {
         .as_str()
         .expect("recurring Antigravity bootstrap");
     assert!(repeated_context.contains("[HCOM SESSION]"));
-    assert!(repeated_context.contains(&format!("[hcom:{me}]")));
+    assert!(repeated_context.contains(&format!("--name {me}")));
 
     // 2. Now pipe PreToolUse to gemini-beforetool.
     // Since the session is bound, it should resolve the instance and execute successfully.
@@ -1190,8 +1190,8 @@ fn pi_e2e_hook_dispatch() {
     assert!(
         start["bootstrap"]
             .as_str()
-            .is_some_and(|text| text.contains(&format!("[hcom:{me}]"))),
-        "pi-start should return bootstrap with the hcom marker: {start}"
+            .is_some_and(|text| text.contains(&format!("--name {me}"))),
+        "pi-start should return bootstrap with the agent identity: {start}"
     );
 
     let (code, stdout, stderr) = h.run(["list", &me, "--json"]);

@@ -505,8 +505,8 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         .find(|body| body.contains(&ids.initial) && !case.is_followup_turn(body))
         .expect("mock did not receive the initial turn");
     assert!(
-        initial_request.contains(&format!("[hcom:{name}]")),
-        "fresh request did not contain the hcom bootstrap identity marker"
+        initial_request.contains(&format!("--name {name}")),
+        "fresh request did not contain the hcom bootstrap identity"
     );
     assert_eq!(
         h.instances_for_tool(tool).expect("list after bind").len(),
@@ -1041,7 +1041,7 @@ pub fn run_full_lifecycle<C: ToolCase>(case: C) {
         "resumed request must inherit parent history without fork-only history"
     );
     assert!(
-        resume_request.contains(&format!("[hcom:{name}]")),
+        resume_request.contains(&format!("--name {name}")),
         "resume request did not retain the original hcom identity bootstrap"
     );
     let rebound_parent = h
