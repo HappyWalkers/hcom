@@ -1042,6 +1042,14 @@ pub fn create_bash_script(
         }
     }
 
+    if background {
+        // Startup timeline marker for the background log; hcom.log carries the
+        // rest (startup.* events). macOS date has no sub-second format.
+        writeln!(
+            f,
+            "echo \"[hcom runner] starting PTY wrapper $(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+        )?;
+    }
     writeln!(f, "{}", final_command)?;
 
     if opens_new_window {

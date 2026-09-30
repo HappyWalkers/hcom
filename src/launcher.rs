@@ -1079,10 +1079,10 @@ fn create_runner_script_windows(
          Set-Location {cwd}\n\
          {unset_line}\n\
          {env_block}\n\
-         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] environment ready' }}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host \"[hcom runner] environment ready $((Get-Date).ToString('o'))\" }}\n\
          {sidecar_source}\n\
          {path_line}\n\
-         if ($env:HCOM_BACKGROUND) {{ Write-Host '[hcom runner] starting PTY wrapper' }}\n\
+         if ($env:HCOM_BACKGROUND) {{ Write-Host \"[hcom runner] starting PTY wrapper $((Get-Date).ToString('o'))\" }}\n\
          \n\
          {run_line}\n",
         cwd = terminal::ps_quote(cwd),

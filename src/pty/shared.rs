@@ -34,6 +34,137 @@ use super::screen::ScreenTracker;
 /// enables this for Claude.
 pub(super) const USER_ACTIVITY_COOLDOWN_MS: u64 = 500;
 
+/// A launch whose tool hasn't shown its ready pattern this long after spawn
+/// logs where startup got to, while it is still running.
+const STARTUP_NOT_READY_AFTER: Duration = Duration::from_secs(15);
+
+/// Output chunks after spawn that are logged individually with a preview.
+const STARTUP_TRACED_CHUNKS: usize = 8;
+
+/// Log the PTY child's spawn, the first entry of a launch's startup timeline.
+pub(super) fn log_spawned(
+    instance: Option<&str>,
+    child_pid: Option<u32>,
+    spawn_took: Duration,
+    command: &str,
+) {
+    log_info(
+        "pty",
+        "startup.spawned",
+        &format!(
+            "instance={} hcom_pid={} child_pid={} spawn_ms={} command={command}",
+            instance.unwrap_or("-"),
+            std::process::id(),
+            child_pid.map_or_else(|| "-".to_string(), |p| p.to_string()),
+            spawn_took.as_millis(),
+        ),
+    );
+}
+
+/// Startup timeline for a launched agent, logged to hcom.log so a launch that
+/// never binds shows how far it got: spawn, the first output chunks (with a
+/// preview, so terminal setup can be told apart from the tool's own output),
+/// and, if the ready pattern is slow to appear, where output stood by then.
+///
+/// On Windows the ConPTY's first output is its own cursor query (`ESC[6n`),
+/// which the reader answers when headless; that reply is logged too.
+pub(super) struct StartupTrace {
+    spawned_at: Instant,
+    instance: String,
+    chunks: usize,
+    bytes: usize,
+    last_output_ms: Option<u128>,
+    #[cfg(windows)]
+    dsr_answered: bool,
+    not_ready_logged: bool,
+}
+
+impl StartupTrace {
+    pub(super) fn new(spawned_at: Instant, instance: Option<&str>) -> Self {
+        Self {
+            spawned_at,
+            instance: instance.unwrap_or("-").to_string(),
+            chunks: 0,
+            bytes: 0,
+            last_output_ms: None,
+            #[cfg(windows)]
+            dsr_answered: false,
+            not_ready_logged: false,
+        }
+    }
+
+    fn ms(&self) -> u128 {
+        self.spawned_at.elapsed().as_millis()
+    }
+
+    pub(super) fn on_output(&mut self, data: &[u8]) {
+        self.chunks += 1;
+        self.bytes += data.len();
+        self.last_output_ms = Some(self.ms());
+        if self.chunks <= STARTUP_TRACED_CHUNKS {
+            log_info(
+                "pty",
+                "startup.output",
+                &format!(
+                    "instance={} ms={} chunk={} bytes={} preview={}",
+                    self.instance,
+                    self.ms(),
+                    self.chunks,
+                    data.len(),
+                    preview(data)
+                ),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn on_dsr_answered(&mut self) {
+        if !self.dsr_answered {
+            self.dsr_answered = true;
+            log_info(
+                "pty",
+                "startup.dsr_answered",
+                &format!("instance={} ms={}", self.instance, self.ms()),
+            );
+        }
+    }
+
+    /// Call while the ready pattern hasn't been seen; logs once.
+    pub(super) fn check_not_ready(&mut self) {
+        if self.not_ready_logged || self.spawned_at.elapsed() < STARTUP_NOT_READY_AFTER {
+            return;
+        }
+        self.not_ready_logged = true;
+        #[cfg(windows)]
+        let dsr = format!(" dsr_answered={}", self.dsr_answered);
+        #[cfg(not(windows))]
+        let dsr = "";
+        log_info(
+            "pty",
+            "startup.not_ready",
+            &format!(
+                "instance={} ms={} chunks={} bytes={} last_output_ms={}{dsr}",
+                self.instance,
+                self.ms(),
+                self.chunks,
+                self.bytes,
+                self.last_output_ms
+                    .map_or_else(|| "-".to_string(), |m| m.to_string()),
+            ),
+        );
+    }
+}
+
+/// First bytes of an output chunk, with control bytes escaped, for logs.
+fn preview(data: &[u8]) -> String {
+    const MAX: usize = 48;
+    let mut out = data[..data.len().min(MAX)].escape_ascii().to_string();
+    if data.len() > MAX {
+        out.push_str("...");
+    }
+    out
+}
+
 /// Update shared delivery state from screen tracker.
 ///
 /// `publish` is the caller's approval-status publisher (it owns the
@@ -997,6 +1128,13 @@ fn advance_pending_utf8(mut pending: u8, data: &[u8]) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn startup_preview_escapes_controls_and_truncates() {
+        assert_eq!(super::preview(b"\x1b[6n\x1b[m"), r"\x1b[6n\x1b[m");
+        let long = vec![b'a'; 60];
+        assert_eq!(super::preview(&long), format!("{}...", "a".repeat(48)));
+    }
+
     use super::*;
     use crate::shared::status_icon;
 

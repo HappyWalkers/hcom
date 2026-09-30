@@ -86,11 +86,15 @@ pub struct Proxy {
     /// runs. `None` if the child couldn't be assigned (falls back to the
     /// snapshot-based kill in `Drop`).
     _job: Option<job::KillOnDropJob>,
+    /// When the ConPTY child was spawned; the reader's startup trace measures
+    /// from here.
+    spawned_at: Instant,
 }
 
 impl Proxy {
     /// Spawn `command` under a ConPTY and prepare the proxy.
     pub fn spawn(command: &str, args: &[&str], config: ProxyConfig) -> Result<Self> {
+        let spawn_started = Instant::now();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
         let pty_system = native_pty_system();
@@ -139,6 +143,13 @@ impl Proxy {
             .slave
             .spawn_command(cmd)
             .context("ConPTY spawn failed")?;
+        let spawned_at = Instant::now();
+        shared::log_spawned(
+            config.instance_name.as_deref(),
+            child.process_id(),
+            spawned_at.duration_since(spawn_started),
+            command,
+        );
         // The parent does not need the slave handle once the child holds it.
         drop(pair.slave);
 
@@ -183,6 +194,7 @@ impl Proxy {
             last_tail: Arc::new(RwLock::new(None)),
             launch_failed: Arc::new(AtomicBool::new(false)),
             _job: job,
+            spawned_at,
         })
     }
 
@@ -481,6 +493,7 @@ impl Proxy {
         let screen_snapshot = self.screen_snapshot.clone();
         let writer = self.writer.clone();
         let (rows, cols) = (self.rows, self.cols);
+        let mut trace = shared::StartupTrace::new(self.spawned_at, instance.as_deref());
 
         // Producer: owns the ConPTY reader and blocks in read(), forwarding raw
         // chunks over a channel. This exists so the consumer loop below can wait
@@ -588,6 +601,9 @@ impl Proxy {
                                 &publish,
                             );
                         }
+                        if !ready_signaled.load(Ordering::Acquire) {
+                            trace.check_not_ready();
+                        }
                         screen.check_debug_flag();
                         screen.check_periodic_dump(
                             target.name(),
@@ -608,6 +624,7 @@ impl Proxy {
                     }
                     Ok(data) => {
                         let data = data.as_slice();
+                        trace.on_output(data);
                         // A genuine keystroke / injected answer flagged a pending
                         // approval for clearing; the reader owns the tracker.
                         if approval_clear_requested.swap(false, Ordering::AcqRel) {
@@ -641,6 +658,7 @@ impl Proxy {
                         {
                             let _ = w.write_all(b"\x1b[1;1R");
                             let _ = w.flush();
+                            trace.on_dsr_answered();
                         }
 
                         screen.process(data);

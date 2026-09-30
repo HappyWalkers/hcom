@@ -634,6 +634,8 @@ pub struct Proxy {
     title_notify_read: OwnedFd,
     /// Write side shared with the delivery thread's title wake callback.
     title_notify_write: Arc<OwnedFd>,
+    /// Startup timeline, measured from the child's spawn.
+    startup_trace: shared::StartupTrace,
 }
 
 #[cfg(unix)]
@@ -648,6 +650,7 @@ impl Proxy {
         terminal::setup_signal_handlers()?;
 
         // Spawn child process
+        let spawn_started = Instant::now();
         let slave_fd = pty.slave.as_raw_fd();
         let master_fd = pty.master.as_raw_fd();
 
@@ -701,6 +704,14 @@ impl Proxy {
                 .spawn()
                 .context("spawn failed")?
         };
+        let spawned_at = Instant::now();
+        shared::log_spawned(
+            config.instance_name.as_deref(),
+            Some(child.id()),
+            spawned_at.duration_since(spawn_started),
+            command,
+        );
+        let startup_trace = shared::StartupTrace::new(spawned_at, config.instance_name.as_deref());
 
         // Write PID and launch context to database for hcom kill
         if let Some(ref instance_name) = config.instance_name
@@ -769,6 +780,7 @@ impl Proxy {
             current_status,
             title_notify_read,
             title_notify_write: Arc::new(title_notify_write),
+            startup_trace,
         })
     }
 
@@ -910,6 +922,9 @@ impl Proxy {
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
+                    if !ready_signaled {
+                        self.startup_trace.check_not_ready();
+                    }
                     // Timeout - still update delivery state for time-based checks
                     if ready_signaled {
                         shared::update_delivery_state(
@@ -1072,6 +1087,7 @@ impl Proxy {
 
                     // Process raw chunks for screen tracking
                     for raw in &raw_chunks {
+                        self.startup_trace.on_output(raw);
                         self.screen.process(raw);
                     }
                     if !raw_chunks.is_empty() {
@@ -1089,6 +1105,9 @@ impl Proxy {
                                 self.inject_server.port(),
                                 "Ready pattern detected",
                             );
+                        }
+                        if !ready_signaled {
+                            self.startup_trace.check_not_ready();
                         }
                         if !delivery_started {
                             let should_start =
