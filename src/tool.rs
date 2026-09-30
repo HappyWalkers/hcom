@@ -27,9 +27,9 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// Ready-pattern bytes for PTY readiness detection.
-    pub fn ready_pattern(&self) -> &'static [u8] {
-        self.spec().ready_pattern
+    /// On-screen markers for PTY readiness detection (any one matches).
+    pub fn ready_patterns(&self) -> &'static [&'static str] {
+        self.spec().ready_patterns
     }
 
     /// Lowercase tool name used in DB, CLI output, and external interfaces.
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn antigravity_ready_pattern() {
-        assert_eq!(Tool::Antigravity.ready_pattern(), b"? for shortcuts");
+        assert_eq!(Tool::Antigravity.ready_patterns(), ["? for shortcuts"]);
     }
 
     #[test]

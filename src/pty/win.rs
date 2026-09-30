@@ -503,7 +503,7 @@ impl Proxy {
         let screen_state = self.screen_state.clone();
         let launch_phase = self.launch_phase_active.clone();
         let target = self.config.target.clone();
-        let ready_pattern = self.config.ready_pattern.clone();
+        let ready_patterns = self.config.ready_patterns.clone();
         let instance = self.config.instance_name.clone();
         let current_name = self.current_name.clone();
         let current_status = self.current_status.clone();
@@ -553,7 +553,7 @@ impl Proxy {
 
         Ok(thread::spawn(move || {
             let mut screen =
-                ScreenTracker::new_with_instance(rows, cols, &ready_pattern, instance.as_deref());
+                ScreenTracker::new_with_instance(rows, cols, &ready_patterns, instance.as_deref());
             let mut stdout = std::io::stdout();
             let mut filter = shared::OutputModeFilter::default();
             let mut scratch: Vec<u8> = Vec::with_capacity(8192);

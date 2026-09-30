@@ -3188,7 +3188,7 @@ mod tests {
         let (_dir, db) = open_ready_test_db();
         let config = ToolConfig::for_tool(tool);
         assert!(config.launch_ready_on_plugin_bind, "{tool:?}");
-        assert!(tool.ready_pattern().is_empty(), "{tool:?}");
+        assert!(tool.ready_patterns().is_empty(), "{tool:?}");
 
         let mut screen = safe_screen();
         screen.ready = true; // empty pattern => is_ready() always true

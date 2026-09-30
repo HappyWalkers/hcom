@@ -159,8 +159,14 @@ pub fn run_pty(args: &[String]) -> Result<()> {
 
     // Keep arbitrary commands explicit so they cannot inherit a known tool's
     // delivery behavior merely because parsing failed.
-    let (ready_pattern, target) = match tool::Tool::from_str(tool_str) {
-        Ok(tool) => (tool.ready_pattern().to_vec(), pty::PtyTarget::Known(tool)),
+    let (ready_patterns, target) = match tool::Tool::from_str(tool_str) {
+        Ok(tool) => (
+            tool.ready_patterns()
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
+            pty::PtyTarget::Known(tool),
+        ),
         Err(_) => (vec![], pty::PtyTarget::AdhocCommand(tool_str.to_string())),
     };
 
@@ -217,7 +223,7 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         &command,
         &full_args,
         pty::ProxyConfig {
-            ready_pattern,
+            ready_patterns,
             instance_name,
             target,
             env_vars: child_env,

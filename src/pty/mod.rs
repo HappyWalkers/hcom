@@ -579,8 +579,8 @@ extern "C" fn handle_sighup(_: libc::c_int) {
 
 /// Configuration for the PTY proxy
 pub struct ProxyConfig {
-    /// Pattern to detect when tool is ready (e.g., b"? for shortcuts")
-    pub ready_pattern: Vec<u8>,
+    /// Markers that the tool is ready (e.g. "? for shortcuts"); any one matches
+    pub ready_patterns: Vec<String>,
     /// Instance name for logging and database tracking
     pub instance_name: Option<String>,
     /// Known integration or explicit ad-hoc command.
@@ -593,7 +593,11 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            ready_pattern: b"? for shortcuts".to_vec(),
+            ready_patterns: Tool::Claude
+                .ready_patterns()
+                .iter()
+                .map(|p| p.to_string())
+                .collect(),
             instance_name: None,
             target: PtyTarget::Known(Tool::Claude),
             env_vars: vec![],
@@ -753,7 +757,7 @@ impl Proxy {
         let screen = ScreenTracker::new_with_instance(
             winsize.ws_row,
             winsize.ws_col,
-            &config.ready_pattern,
+            &config.ready_patterns,
             config.instance_name.as_deref(),
         );
 
@@ -938,6 +942,15 @@ impl Proxy {
             // full 10s for the listener to re-enter the poll set on the next iteration.
             if !include_listener {
                 poll_timeout = poll_timeout.min(100u16);
+            }
+            // A tool that draws a screen without its ready pattern and then goes
+            // quiet (a trust dialog, a footer variant) would otherwise only reach
+            // the delivery-start fallback on the next 10s poll timeout.
+            if !delivery_started {
+                poll_timeout = poll_timeout.min(delivery_start_poll_ms(
+                    delivery_start_timeout,
+                    startup_time.elapsed(),
+                ));
             }
             match poll(&mut poll_fds, PollTimeout::from(poll_timeout)) {
                 Ok(0) => {
@@ -1637,6 +1650,15 @@ fn nix_read<F: AsFd>(fd: &F, buf: &mut [u8]) -> Result<usize, Errno> {
     read(fd.as_fd(), buf)
 }
 
+/// Poll timeout (ms) that wakes the loop just past the delivery-start
+/// fallback. The start check is strict (`elapsed > timeout`), so wake 1ms late;
+/// never 0, which would make poll() busy-spin once the deadline has passed.
+#[cfg(unix)]
+fn delivery_start_poll_ms(timeout: Duration, elapsed: Duration) -> u16 {
+    let left = timeout.saturating_sub(elapsed).as_millis() + 1;
+    left.min(u16::MAX as u128) as u16
+}
+
 /// Initialize delivery components with dependency injection for testing
 ///
 /// Returns (db, notify) on success, Err on failure
@@ -1667,7 +1689,8 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        PtyTarget, initialize_delivery_components, prompt_submit_observed, strip_focus_events,
+        PtyTarget, delivery_start_poll_ms, initialize_delivery_components, prompt_submit_observed,
+        strip_focus_events,
     };
     use anyhow::anyhow;
     use rusqlite::Connection;
@@ -1704,6 +1727,23 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delivery_start_poll_wakes_just_past_the_fallback() {
+        use std::time::Duration;
+        let timeout = Duration::from_secs(5);
+        assert_eq!(delivery_start_poll_ms(timeout, Duration::ZERO), 5001);
+        assert_eq!(
+            delivery_start_poll_ms(timeout, Duration::from_millis(4200)),
+            801
+        );
+        // Past the deadline: short but nonzero, so poll() never spins.
+        assert_eq!(delivery_start_poll_ms(timeout, Duration::from_secs(9)), 1);
+        assert_eq!(
+            delivery_start_poll_ms(Duration::from_secs(600), Duration::ZERO),
+            u16::MAX
+        );
     }
 
     #[test]

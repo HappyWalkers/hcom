@@ -61,7 +61,7 @@ pub struct GatesSpec {
     pub block_on_approval: bool,
     pub launch_requires_ready: bool,
     /// Treat the plugin's extension bind (a `kind='plugin'` notify endpoint) as
-    /// launch readiness, in addition to the on-screen `ready_pattern`. For
+    /// launch readiness, in addition to the on-screen `ready_patterns`. For
     /// plugin-driven tools whose visible chrome is configurable (Pi: quiet or
     /// expanded header; OMP: status-line presets omit the pi glyph), the bind
     /// is the only rendering-independent proof the interactive TUI is up.
@@ -188,8 +188,9 @@ pub struct IntegrationSpec {
     pub adhoc_icon: Option<&'static str>,
     /// True if this tool is in the public `RELEASED_TOOLS` set.
     pub released: bool,
-    /// PTY ready-pattern bytes (empty for Adhoc).
-    pub ready_pattern: &'static [u8],
+    /// On-screen markers of an idle, input-ready TUI; any one visible means
+    /// ready. Empty disables pattern gating (Adhoc, plugin-bound tools).
+    pub ready_patterns: &'static [&'static str],
     pub pty: PtySpec,
     /// Environment variables specific to this tool's instance state that
     /// will corrupt a same-tool child if leaked (session IDs, sandbox modes,
@@ -422,7 +423,11 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     tui_prefix: "cla ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"? for shortcuts",
+    // Default mode shows "? for shortcuts"; every other permission mode
+    // (acceptEdits, plan, auto, dontAsk, bypassPermissions) replaces it with
+    // "<mode> on (<binding> to cycle)". The binding is configurable (shift+tab
+    // by default, meta+m on Windows without VT), so match only its tail.
+    ready_patterns: &["? for shortcuts", "to cycle)"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -476,7 +481,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "gem ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"Type your message",
+    ready_patterns: &["Type your message"],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
@@ -529,7 +534,8 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     tui_prefix: "cod ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: "\u{203A} ".as_bytes(),
+    // "» " is the Ultra composer prompt.
+    ready_patterns: &["\u{203A} ", "\u{BB} "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -583,7 +589,7 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     tui_prefix: "opc ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"ctrl+p commands",
+    ready_patterns: &["ctrl+p commands"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -643,7 +649,7 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     tui_prefix: "kil ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"ctrl+p commands",
+    ready_patterns: &["ctrl+p commands"],
     // Kilo namespaces OpenCode's run/role state under its own vars (see
     // kilocode packages/core/src/util/opencode-process.ts: KILO_RUN_ID /
     // KILO_PROCESS_ROLE are `??=`-assigned, so an inherited value is reused
@@ -702,7 +708,7 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     tui_prefix: "agy ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"? for shortcuts",
+    ready_patterns: &["? for shortcuts"],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -764,7 +770,7 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     released: true,
     // Cursor's input placeholder is styled rather than a stable ASCII footer.
     // Prompt-empty detection is the readiness signal for the MVP.
-    ready_pattern: b"",
+    ready_patterns: &[],
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
@@ -824,7 +830,7 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     tui_prefix: "kim ",
     adhoc_icon: None,
     released: true,
-    ready_pattern: b"> ",
+    ready_patterns: &["> "],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -895,7 +901,7 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     // before Pi enables its key/submit handlers. Pi fires session_start (our
     // bind) from rebindCurrentSession() after those handlers are set up, so
     // the bind is the earliest point at which the TUI reliably accepts input.
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -964,7 +970,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
     // the hcom extension's bind (`launch_ready_on_plugin_bind`), which is
     // rendering-independent. Empty pattern => is_ready() is always true, so it
     // never gates launch on scraped chrome; the plugin bind is authoritative.
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 5,
     },
@@ -985,7 +991,7 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         // preset/theme-configurable status line), so launch readiness is proven
         // by the hcom extension's bind (kind='plugin' notify endpoint) instead —
         // rendering-independent, and a dead extension correctly fails to bind and
-        // blocks. `ready_pattern` is empty; this is the authoritative signal.
+        // blocks. `ready_patterns` is empty; this is the authoritative signal.
         launch_ready_on_plugin_bind: true,
     },
     launch: LaunchSpec {
@@ -1033,7 +1039,7 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     // Copilot fires SessionStart twice: once at boot and again after it loads
     // hooks/instructions. Gate on "/ commands" footer text so delivery doesn't
     // inject during the loading window.
-    ready_pattern: b"/ commands",
+    ready_patterns: &["/ commands"],
     // Closed-source; unknown instance-state vars are a documented gap.
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
@@ -1087,7 +1093,7 @@ pub static GROK: IntegrationSpec = IntegrationSpec {
     released: true,
     // Delivery goes through Grok's prompt queue (delivery/grok.rs), never the
     // PTY, so there is no composer to parse and no ready footer to wait for.
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 10,
     },
@@ -1140,7 +1146,7 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     tui_prefix: "ah  ",
     adhoc_icon: Some("\u{25e6}"), // ◦ neutral dot
     released: false,
-    ready_pattern: b"",
+    ready_patterns: &[],
     pty: PtySpec {
         delivery_start_timeout_secs: 60,
     },
