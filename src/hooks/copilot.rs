@@ -597,16 +597,39 @@ fn handle_subagentstart(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -
     }
 }
 
+/// Only the instance's own session ends it (as in Claude's SessionEnd).
+/// Resolution prefers the process binding, so without this check any session
+/// the Copilot process ends would stop the instance. After `hcom r`, the new,
+/// still-running process sent SessionEnd `user_exit` ~15s in and the resumed
+/// instance was stopped. A PTY-launched instance whose session is not bound
+/// yet is still cleaned up by the PTY wrapper when Copilot exits.
 fn handle_sessionend(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Value {
-    if let Some(instance) = resolved_instance(db, ctx, payload) {
-        let reason = payload
-            .raw
-            .get("reason")
-            .or_else(|| payload.raw.get("stop_reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        common::finalize_session(db, &instance.name, reason, None);
+    let Some(instance) = resolve_instance(db, ctx, payload) else {
+        return json!({});
+    };
+    let reason = payload
+        .raw
+        .get("reason")
+        .or_else(|| payload.raw.get("stop_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let incoming = payload.session_id.as_deref().filter(|sid| !sid.is_empty());
+    if incoming.is_some() && incoming != instance.session_id.as_deref() {
+        log::log_warn(
+            "hooks",
+            "copilot.sessionend_ignored",
+            &format!(
+                "instance={} incoming_session_id={} bound_session_id={} reason={}",
+                instance.name,
+                incoming.unwrap_or(""),
+                instance.session_id.as_deref().unwrap_or(""),
+                reason
+            ),
+        );
+        return json!({});
     }
+    update_position(db, ctx, payload, &instance.name);
+    common::finalize_session(db, &instance.name, reason, None);
     json!({})
 }
 
@@ -697,6 +720,45 @@ mod tests {
             std::env::remove_var("COPILOT_HOME");
         }
         (dir, workspace, guard)
+    }
+
+    #[test]
+    fn sessionend_only_stops_the_instances_own_session() {
+        crate::config::Config::init();
+        let dir = tempfile::tempdir().unwrap();
+        let db = HcomDb::open_raw(&dir.path().join("test.db")).unwrap();
+        db.init_db().unwrap();
+        // A resumed instance: launched with the resumed session id and bound
+        // to the new Copilot process.
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, session_id)
+                 VALUES ('memo', 'copilot', 'listening', 'ready', 0, 0, 'resumed-sid')",
+                [],
+            )
+            .unwrap();
+        db.set_process_binding("proc-new", "resumed-sid", "memo")
+            .unwrap();
+        let env = [("HCOM_PROCESS_ID".to_string(), "proc-new".to_string())]
+            .into_iter()
+            .collect();
+        let ctx = HcomContext::from_env(&env, dir.path().to_path_buf());
+        let end = |sid: &str| {
+            let raw = json!({"sessionId": sid, "reason": "user_exit"});
+            handle_sessionend(
+                &db,
+                &ctx,
+                &HookPayload::from_copilot_native("SessionEnd", raw),
+            )
+        };
+
+        end("startup-sid");
+        let inst = db.get_instance_full("memo").unwrap().unwrap();
+        assert_eq!(inst.session_id.as_deref(), Some("resumed-sid"));
+        assert_eq!(inst.status, "listening");
+
+        end("resumed-sid");
+        assert!(db.get_instance_full("memo").unwrap().is_none());
     }
 
     #[test]
