@@ -198,38 +198,11 @@ const INSTANCE_KEYS: &[(&str, &str)] = &[
 
 /// Maps HCOM_ field name (lowercase, no prefix) to nested TOML dotted path.
 fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
-    match field_name {
-        "terminal" => Some("terminal.active"),
-        "title_mode" => Some("terminal.title_mode"),
-        "tag" => Some("launch.tag"),
-        "hints" => Some("launch.hints"),
-        "notes" => Some("launch.notes"),
-        "subagent_timeout" => Some("launch.subagent_timeout"),
-        "auto_subscribe" => Some("launch.auto_subscribe"),
-        "auto_trust_workspace" => Some("launch.auto_trust_workspace"),
-        "claude_args" => Some("launch.claude.args"),
-        "gemini_args" => Some("launch.gemini.args"),
-        "gemini_system_prompt" => Some("launch.gemini.system_prompt"),
-        "codex_args" => Some("launch.codex.args"),
-        "codex_sandbox_mode" => Some("launch.codex.sandbox_mode"),
-        "codex_system_prompt" => Some("launch.codex.system_prompt"),
-        "opencode_args" => Some("launch.opencode.args"),
-        "kilo_args" => Some("launch.kilo.args"),
-        "pi_args" => Some("launch.pi.args"),
-        "omp_args" => Some("launch.omp.args"),
-        "cursor_args" => Some("launch.cursor.args"),
-        "kimi_args" => Some("launch.kimi.args"),
-        "copilot_args" => Some("launch.copilot.args"),
-        "grok_args" => Some("launch.grok.args"),
-        "relay" => Some("relay.url"),
-        "relay_id" => Some("relay.id"),
-        "relay_token" => Some("relay.token"),
-        "relay_enabled" => Some("relay.enabled"),
-        "timeout" => Some("preferences.timeout"),
-        "auto_approve" => Some("preferences.auto_approve"),
-        "name_export" => Some("preferences.name_export"),
-        _ => None,
+    // relay_psk is set through `hcom relay`, not `hcom config`.
+    if field_name == "relay_psk" {
+        return None;
     }
+    crate::config::toml_path_for_field(field_name)
 }
 
 // ── Config File Operations ───────────────────────────────────────────────
@@ -2280,6 +2253,20 @@ fn update_auto_approve_permissions(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mapped_field_is_set_where_the_loader_reads_it() {
+        for (field, path) in crate::config::TOML_KEY_MAP {
+            if *field == "relay_psk" {
+                continue;
+            }
+            assert_eq!(
+                toml_path_for_key(field),
+                Some(*path),
+                "`hcom config {field}` must write {path}"
+            );
+        }
+    }
 
     #[test]
     fn test_normalize_key() {
