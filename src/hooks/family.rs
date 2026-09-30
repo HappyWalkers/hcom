@@ -27,11 +27,12 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
     if detail.file.contains(&tool_name) || is_notebook_edit {
         return tool_input
             .get("file_path")
+            .or_else(|| tool_input.get("filePath")) // opencode/kilo
             .or_else(|| tool_input.get("notebook_path")) // claude NotebookEdit
             .or_else(|| tool_input.get("TargetFile")) // antigravity
             .or_else(|| tool_input.get("path")) // cursor/copilot
             .and_then(|v| v.as_str())
-            .or_else(|| patch_first_file(tool_input)) // codex apply_patch
+            .or_else(|| patch_first_file(tool_input)) // apply_patch envelopes
             .unwrap_or("")
             .to_string();
     }
@@ -40,6 +41,7 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
             .get("prompt")
             .or_else(|| tool_input.get("task"))
             .or_else(|| tool_input.get("message")) // codex spawn_agent
+            .or_else(|| tool_input.get("description")) // kimi AgentSwarm
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -48,9 +50,14 @@ pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json:
     String::new()
 }
 
-/// Files a Codex `apply_patch` envelope (`{"command": patch}`) writes, in order.
+/// Files an `apply_patch` envelope writes, in order. Codex passes the patch as
+/// `{"command": patch}`, OpenCode/Kilo as `{"patchText": patch}`.
 pub fn patch_files(tool_input: &serde_json::Value) -> Vec<&str> {
-    let Some(patch) = tool_input.get("command").and_then(|v| v.as_str()) else {
+    let Some(patch) = tool_input
+        .get("command")
+        .or_else(|| tool_input.get("patchText"))
+        .and_then(|v| v.as_str())
+    else {
         return Vec::new();
     };
     patch
@@ -96,13 +103,13 @@ mod tests {
         let d = spec_for("gemini");
         assert!(d.bash.contains(&"run_shell_command"));
         assert!(d.file.contains(&"write_file"));
-        assert!(d.delegate.contains(&"delegate_to_agent"));
+        assert!(d.delegate.contains(&"invoke_agent"));
     }
 
     #[test]
     fn test_tool_name_mappings_codex() {
         let d = spec_for("codex");
-        assert!(d.bash.contains(&"execute_command"));
+        assert!(d.bash.contains(&"Bash"));
         assert!(d.file.contains(&"apply_patch"));
         assert!(d.delegate.contains(&"spawn_agent"));
     }
@@ -125,6 +132,44 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_tool_detail_opencode_family() {
+        for tool in ["opencode", "kilo"] {
+            let bash = serde_json::json!({"command": "cargo test", "description": "run tests"});
+            assert_eq!(extract_tool_detail(tool, "bash", &bash), "cargo test");
+            let edit = serde_json::json!({"filePath": "/src/main.rs", "oldString": "a"});
+            assert_eq!(extract_tool_detail(tool, "edit", &edit), "/src/main.rs");
+            let write = serde_json::json!({"filePath": "/src/lib.rs", "content": "x"});
+            assert_eq!(extract_tool_detail(tool, "write", &write), "/src/lib.rs");
+            let patch = serde_json::json!({
+                "patchText": "*** Begin Patch\n*** Add File: new.rs\n+x\n*** End Patch"
+            });
+            assert_eq!(extract_tool_detail(tool, "apply_patch", &patch), "new.rs");
+            let task = serde_json::json!({"description": "review", "prompt": "review the diff"});
+            assert_eq!(extract_tool_detail(tool, "task", &task), "review the diff");
+
+            // OpenCode 2 tool names and inputs.
+            assert_eq!(extract_tool_detail(tool, "shell", &bash), "cargo test");
+            let edit2 = serde_json::json!({"path": "/src/main.rs", "oldString": "a"});
+            assert_eq!(extract_tool_detail(tool, "edit", &edit2), "/src/main.rs");
+            assert_eq!(extract_tool_detail(tool, "patch", &patch), "new.rs");
+            let subagent = serde_json::json!({"agent": "general", "prompt": "review the diff"});
+            assert_eq!(
+                extract_tool_detail(tool, "subagent", &subagent),
+                "review the diff"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_tool_detail_kimi_swarm_uses_description() {
+        let swarm = serde_json::json!({"description": "audit modules", "items": ["a", "b"]});
+        assert_eq!(
+            extract_tool_detail("kimi", "AgentSwarm", &swarm),
+            "audit modules"
+        );
+    }
+
+    #[test]
     fn test_tool_name_mappings_antigravity() {
         let d = spec_for("antigravity");
         assert!(d.bash.contains(&"run_command"));
@@ -142,10 +187,7 @@ mod tests {
             extract_tool_detail("gemini", "run_shell_command", &input),
             "ls -la"
         );
-        assert_eq!(
-            extract_tool_detail("codex", "execute_command", &input),
-            "ls -la"
-        );
+        assert_eq!(extract_tool_detail("codex", "Bash", &input), "ls -la");
     }
 
     #[test]
@@ -238,10 +280,7 @@ mod tests {
 
         // Fallback to "task" field
         let input2 = serde_json::json!({"task": "do something"});
-        assert_eq!(
-            extract_tool_detail("gemini", "delegate_to_agent", &input2),
-            "do something"
-        );
+        assert_eq!(extract_tool_detail("omp", "task", &input2), "do something");
     }
 
     #[test]

@@ -46,7 +46,7 @@ const MESSAGE_FLAGS: &[&str] = &[
 const LIFE_FLAGS: &[&str] = &["action"];
 
 /// File-write tool contexts for SQL filters.
-pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit')";
+pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit', 'tool:patch')";
 
 /// SQL: `inner` event is within 30s of `outer`. The ISO-timestamp range lets
 /// SQLite walk `idx_timestamp` (callers write `+inner.type` so the planner does
@@ -78,6 +78,7 @@ pub const FILE_OP_CONTEXTS: &[&str] = &[
     "tool:create",
     "tool:search_replace",
     "tool:MultiEdit",
+    "tool:patch",
 ];
 
 /// Shell tool contexts.

@@ -516,7 +516,7 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     status_detail: StatusDetailSpec {
         bash: &["run_shell_command"],
         file: &["write_file", "replace"],
-        delegate: &["delegate_to_agent"],
+        delegate: &["invoke_agent"],
     },
 };
 
@@ -566,8 +566,9 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
         unique_examples: CODEX_HELP_EXAMPLES,
         extra_env: CODEX_HELP_EXTRA_ENV,
     },
+    // Codex hooks report every shell/exec tool as `Bash` (HookToolName::bash).
     status_detail: StatusDetailSpec {
-        bash: &["Bash", "execute_command", "shell", "shell_command"],
+        bash: &["Bash"],
         file: &["apply_patch"],
         delegate: &["spawn_agent"],
     },
@@ -624,10 +625,12 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         unique_examples: OPENCODE_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // Tool IDs from the plugin's execute.before hook: OpenCode 1 names first,
+    // then OpenCode 2's (shell/patch/subagent). Kilo shares the plugin.
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -684,9 +687,9 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
         extra_env: &[],
     },
     status_detail: StatusDetailSpec {
-        bash: &[],
-        file: &[],
-        delegate: &[],
+        bash: &["bash", "shell"],
+        file: &["edit", "write", "apply_patch", "patch"],
+        delegate: &["task", "subagent"],
     },
 };
 
@@ -867,13 +870,13 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         // advertising it here was a ghost.
         extra_env: &[],
     },
-    // Tool names verified against kimi-code 0.9.0 built-in tools
+    // Tool names from kimi-code's built-in tools
     // (docs/reference/tools.md): shell is `Bash`, file writes are `Write`/`Edit`,
-    // and the subagent tool is `Agent`.
+    // and the subagent tools are `Agent` and `AgentSwarm`.
     status_detail: StatusDetailSpec {
         bash: &["Bash"],
         file: &["Write", "Edit"],
-        delegate: &["Agent"],
+        delegate: &["Agent", "AgentSwarm"],
     },
 };
 
@@ -1009,10 +1012,12 @@ pub static OMP: IntegrationSpec = IntegrationSpec {
         unique_examples: OMP_HELP_EXAMPLES,
         extra_env: &[],
     },
+    // `ast_edit` is left out: it takes glob `paths`, not a file, which would
+    // make `--file` filters match patterns instead of paths.
     status_detail: StatusDetailSpec {
         bash: &["bash"],
         file: &["edit", "write"],
-        delegate: &[],
+        delegate: &["task"],
     },
 };
 
