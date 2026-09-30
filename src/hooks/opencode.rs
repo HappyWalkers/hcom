@@ -669,9 +669,12 @@ fn parse_caller_config(ctx: &LaunchCtx, env_var: &str) -> Result<Value> {
 
 fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     let (app, env_var) = family_runtime(ctx);
-    let path = runtime::publish_file(app, PLUGIN_FILENAME, PLUGIN_SOURCE.as_bytes())
+    // Published as a directory holding `index.ts`: OpenCode 2 rejects a plugin
+    // path that is a file ("configured plugin path must be a directory"), and
+    // OpenCode 1/Kilo resolve a directory without package.json to its index.
+    let dir = runtime::publish_dir(app, &[("index.ts", PLUGIN_SOURCE.as_bytes())])
         .with_context(|| format!("Cannot publish {app} runtime plugin"))?;
-    let plugin_url = runtime::file_url(&path);
+    let plugin_url = runtime::file_url(&dir);
     let mut config = parse_caller_config(ctx, env_var)?;
     let object = config
         .as_object_mut()
@@ -1078,7 +1081,10 @@ mod tests {
         let runtime = plugins[2].as_str().unwrap();
         assert!(runtime.starts_with("file://"));
         assert!(runtime.contains("/integrations/opencode/"));
-        assert!(runtime.ends_with("/hcom.ts"));
+        // A directory (OpenCode 2 rejects file plugin paths) with index.ts.
+        let dir = std::path::PathBuf::from(runtime.strip_prefix("file://").unwrap());
+        #[cfg(unix)]
+        assert!(dir.join("index.ts").is_file(), "{runtime}");
         // Decodes the URL, so Windows `file:///C:/…` compares as a native path.
         assert!(runtime::is_hcom_runtime_path(runtime), "{runtime}");
         assert!(runtime::integrations_dir().starts_with(&hcom));
