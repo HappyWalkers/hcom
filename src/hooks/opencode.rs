@@ -1094,9 +1094,11 @@ mod tests {
         assert!(runtime.starts_with("file://"));
         assert!(runtime.contains("/integrations/opencode/"));
         // A directory (OpenCode 2 rejects file plugin paths) with index.ts.
-        let dir = std::path::PathBuf::from(runtime.strip_prefix("file://").unwrap());
         #[cfg(unix)]
-        assert!(dir.join("index.ts").is_file(), "{runtime}");
+        {
+            let dir = std::path::PathBuf::from(runtime.strip_prefix("file://").unwrap());
+            assert!(dir.join("index.ts").is_file(), "{runtime}");
+        }
         // Decodes the URL, so Windows `file:///C:/…` compares as a native path.
         assert!(runtime::is_hcom_runtime_path(runtime), "{runtime}");
         assert!(runtime::integrations_dir().starts_with(&hcom));
