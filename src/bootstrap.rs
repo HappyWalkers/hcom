@@ -180,6 +180,8 @@ RIGHT: hcom listen --timeout [sec] (blocking)
 
 You are now registered with hcom."#;
 
+const INLINE_SEND_NOTICE: &str = "Read hcom command output fully; it can consume incoming mail.";
+
 const CLAUDE_ONLY: &str = r#"## SUBAGENTS
 
 Subagents can join hcom:
@@ -500,6 +502,10 @@ fn render_bootstrap(
         parts.push(DELIVERY_ADHOC);
     }
 
+    if tool == Tool::Adhoc {
+        parts.push(INLINE_SEND_NOTICE);
+    }
+
     if tool == Tool::Claude {
         parts.push(CLAUDE_ONLY);
     }
@@ -727,6 +733,31 @@ mod tests {
         assert!(!result.contains("Headless mode"));
         assert!(!result.contains('{'), "unrendered placeholder: {result}");
         assert!(result.ends_with("</hcom_system_context>"));
+    }
+
+    #[test]
+    fn inline_send_notice_only_for_inline_receivers() {
+        let (tmp, db) = setup_test_db();
+        assert!(render(&db, tmp.path(), "adhoc").contains(INLINE_SEND_NOTICE));
+        for tool in [
+            "claude",
+            "codex",
+            "gemini",
+            "cursor",
+            "copilot",
+            "antigravity",
+            "grok",
+            "kimi",
+            "pi",
+            "omp",
+            "opencode",
+            "kilo",
+        ] {
+            assert!(
+                !render(&db, tmp.path(), tool).contains(INLINE_SEND_NOTICE),
+                "{tool}"
+            );
+        }
     }
 
     /// Every integration launched through hcom gets automatic delivery; the

@@ -105,16 +105,6 @@ fn check_contiguous_prefix(tool: &str) {
 }
 
 #[test]
-fn contiguous_prefix_claude() {
-    check_contiguous_prefix("claude");
-}
-
-#[test]
-fn contiguous_prefix_codex() {
-    check_contiguous_prefix("codex");
-}
-
-#[test]
 fn contiguous_prefix_adhoc() {
     check_contiguous_prefix("adhoc");
 }
@@ -122,7 +112,7 @@ fn contiguous_prefix_adhoc() {
 /// Main and child senders cannot create holes in a shared cursor prefix.
 #[test]
 fn mixed_main_and_child_messages_share_one_batch_limit() {
-    let (h, db, sender, receiver) = setup("claude");
+    let (h, db, sender, receiver) = setup("adhoc");
     let child = h.start();
     db.execute(
         "UPDATE instances SET parent_name=? WHERE name=?",
@@ -152,24 +142,23 @@ fn mixed_main_and_child_messages_share_one_batch_limit() {
 /// Quiet sends leave pending receive data available to the next command.
 #[test]
 fn quiet_send_preserves_incoming_messages() {
-    for tool in ["claude", "codex", "adhoc"] {
-        let (h, db, sender, receiver) = setup(tool);
-        queue(&db, &sender, &receiver, "incoming-sentinel");
-        let before = cursor(&db, &receiver);
-        let (code, out, err) = h.run([
-            "send",
-            "--quiet",
-            "--name",
-            &receiver,
-            &format!("@{sender}"),
-            "--",
-            "reply",
-        ]);
-        assert_eq!(code, 0, "{err}");
-        assert!(out.is_empty(), "{tool}: {out}");
-        assert_eq!(cursor(&db, &receiver), before);
-        assert!(send(&h, &receiver, &sender, "reply2").contains("incoming-sentinel"));
-    }
+    let tool = "adhoc";
+    let (h, db, sender, receiver) = setup(tool);
+    queue(&db, &sender, &receiver, "incoming-sentinel");
+    let before = cursor(&db, &receiver);
+    let (code, out, err) = h.run([
+        "send",
+        "--quiet",
+        "--name",
+        &receiver,
+        &format!("@{sender}"),
+        "--",
+        "reply",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.is_empty(), "{tool}: {out}");
+    assert_eq!(cursor(&db, &receiver), before);
+    assert!(send(&h, &receiver, &sender, "reply2").contains("incoming-sentinel"));
 }
 
 /// A failed output write does not acknowledge the queued incoming message.
@@ -178,91 +167,89 @@ fn quiet_send_preserves_incoming_messages() {
 fn failed_stdout_write_preserves_incoming_messages() {
     use std::os::{fd::OwnedFd, unix::net::UnixStream};
     use std::process::Stdio;
-    for tool in ["claude", "codex", "adhoc"] {
-        let (h, db, sender, receiver) = setup(tool);
-        queue(&db, &sender, &receiver, "incoming-sentinel");
-        let before = cursor(&db, &receiver);
-        let (writer, reader) = UnixStream::pair().unwrap();
-        drop(reader);
-        let output = h
-            .cmd()
-            .args([
-                "send",
-                "--name",
-                &receiver,
-                &format!("@{sender}"),
-                "--",
-                "reply",
-            ])
-            .stdout(Stdio::from(OwnedFd::from(writer)))
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("Message sent, but incoming message output failed")
-        );
-        assert_eq!(cursor(&db, &receiver), before, "{tool}");
-        assert!(send(&h, &receiver, &sender, "reply2").contains("incoming-sentinel"));
-    }
+    let tool = "adhoc";
+    let (h, db, sender, receiver) = setup(tool);
+    queue(&db, &sender, &receiver, "incoming-sentinel");
+    let before = cursor(&db, &receiver);
+    let (writer, reader) = UnixStream::pair().unwrap();
+    drop(reader);
+    let output = h
+        .cmd()
+        .args([
+            "send",
+            "--name",
+            &receiver,
+            &format!("@{sender}"),
+            "--",
+            "reply",
+        ])
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Message sent, but incoming message output failed")
+    );
+    assert_eq!(cursor(&db, &receiver), before, "{tool}");
+    assert!(send(&h, &receiver, &sender, "reply2").contains("incoming-sentinel"));
 }
 
 /// An external outgoing name must not replace the invoking instance's inbox.
 #[test]
 fn external_sender_preserves_inline_receive_delivery() {
-    for tool in ["adhoc"] {
-        let (h, db, sender, receiver) = setup(tool);
-        queue(&db, &sender, &receiver, "external-incoming-sentinel");
-        let before = cursor(&db, &receiver);
-        for mode in ["--quiet", "--json"] {
-            let (code, out, err) = h.run([
-                "send",
-                "--name",
-                &receiver,
-                "--from",
-                "operator",
-                mode,
-                &format!("@{sender}"),
-                "--",
-                "control",
-            ]);
-            assert_eq!(code, 0, "{err}");
-            assert_eq!(cursor(&db, &receiver), before);
-            if mode == "--quiet" {
-                assert!(out.is_empty());
-            } else {
-                let _: serde_json::Value = serde_json::from_str(&out).unwrap();
-            }
-        }
+    let tool = "adhoc";
+    let (h, db, sender, receiver) = setup(tool);
+    queue(&db, &sender, &receiver, "external-incoming-sentinel");
+    let before = cursor(&db, &receiver);
+    for mode in ["--quiet", "--json"] {
         let (code, out, err) = h.run([
             "send",
             "--name",
             &receiver,
             "--from",
             "operator",
+            mode,
             &format!("@{sender}"),
-            "--intent",
-            "inform",
             "--",
-            "external-outgoing",
+            "control",
         ]);
         assert_eq!(code, 0, "{err}");
-        assert!(out.contains("external-incoming-sentinel"), "{tool}: {out}");
-        let (status, context): (String, String) = db
-            .query_row(
-                "SELECT status,status_context FROM instances WHERE name=?",
-                [&receiver],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(status, "inactive");
-        assert!(context.starts_with("deliver:"), "{context}");
-        let from: String = db.query_row(
-            "SELECT json_extract(data,'$.from') FROM events WHERE type='message' AND json_extract(data,'$.text')='external-outgoing'",
-            [], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(from, "operator");
+        assert_eq!(cursor(&db, &receiver), before);
+        if mode == "--quiet" {
+            assert!(out.is_empty());
+        } else {
+            let _: serde_json::Value = serde_json::from_str(&out).unwrap();
+        }
     }
+    let (code, out, err) = h.run([
+        "send",
+        "--name",
+        &receiver,
+        "--from",
+        "operator",
+        &format!("@{sender}"),
+        "--intent",
+        "inform",
+        "--",
+        "external-outgoing",
+    ]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("external-incoming-sentinel"), "{tool}: {out}");
+    let (status, context): (String, String) = db
+        .query_row(
+            "SELECT status,status_context FROM instances WHERE name=?",
+            [&receiver],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "inactive");
+    assert!(context.starts_with("deliver:"), "{context}");
+    let from: String = db.query_row(
+        "SELECT json_extract(data,'$.from') FROM events WHERE type='message' AND json_extract(data,'$.text')='external-outgoing'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(from, "operator");
 }
 
 /// Hold stdout mid-write, advance the cursor elsewhere, then release the writer.
@@ -276,7 +263,7 @@ fn late_send_cannot_rewind_a_newer_cursor() {
     };
     use std::process::Stdio;
     use std::time::Duration;
-    let (h, db, sender, receiver) = setup("claude");
+    let (h, db, sender, receiver) = setup("adhoc");
     for i in 0..51 {
         let data = serde_json::json!({"from":sender,"text":format!("sentinel-{i:03}-{}", "x".repeat(8192)),"scope":"mentions","mentions":[receiver],"delivered_to":[receiver],"sender_kind":"instance","intent":"inform"});
         db.execute("INSERT INTO events(timestamp,type,instance,data) VALUES(datetime('now'),'message',?,?)", params![sender,data.to_string()]).unwrap();
@@ -338,8 +325,8 @@ fn late_send_cannot_rewind_a_newer_cursor() {
 /// Relay references are reply IDs; only the cursor uses local database IDs.
 #[test]
 fn relay_reply_ids_survive_inline_receive() {
-    // --from receives inline only for adhoc; codex gets messages via hooks.
-    for (tool, external) in [("codex", false), ("adhoc", false), ("adhoc", true)] {
+    // --from receives inline only for adhoc; other tools use their automatic channel.
+    for (tool, external) in [("adhoc", false), ("adhoc", true)] {
         {
             let (h, db, sender, receiver) = setup(tool);
             for count in [1, 2] {
@@ -351,9 +338,13 @@ fn relay_reply_ids_survive_inline_receive() {
                 )
                 .unwrap();
                 let base: i64 = db
-                    .query_row("SELECT COALESCE(MAX(id),0)+100 FROM events", [], |r| {
-                        r.get(0)
-                    })
+                    // Deleted message rows retain FTS entries; never reuse an
+                    // event ID from a previous iteration of this fixture.
+                    .query_row(
+                        "SELECT seq+100 FROM sqlite_sequence WHERE name='events'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .unwrap();
                 for i in 0..count {
                     let data = serde_json::json!({
@@ -500,29 +491,48 @@ fn message_arriving_mid_send_is_noticed() {
     assert!(cursor(&db, &receiver) < late);
 }
 
-/// Codex has delivery hooks, so other commands and --from sends leave its
-/// messages for the hooks instead of consuming them inline.
+/// All automatic-delivery tools leave their inbox for that channel on send.
 #[test]
-fn codex_messages_are_left_for_hooks() {
-    let (h, db, sender, receiver) = setup("codex");
-    let before = cursor(&db, &receiver);
-    queue(&db, &sender, &receiver, "hook-sentinel");
-    let (code, out, err) = h.run(["list", "--name", &receiver]);
-    assert_eq!(code, 0, "{err}");
-    assert!(!out.contains("hook-sentinel"), "{out}");
-    let (code, out, err) = h.run([
-        "send",
-        "--name",
-        &receiver,
-        "--from",
-        "operator",
-        &format!("@{sender}"),
-        "--",
-        "external-outgoing",
-    ]);
-    assert_eq!(code, 0, "{err}");
-    assert!(!out.contains("hook-sentinel"), "{out}");
-    assert_eq!(cursor(&db, &receiver), before);
+fn automatic_delivery_tools_preserve_inbox_on_send() {
+    for tool in [
+        "claude",
+        "codex",
+        "gemini",
+        "cursor",
+        "copilot",
+        "antigravity",
+        "grok",
+        "kimi",
+        "pi",
+        "omp",
+        "opencode",
+        "kilo",
+    ] {
+        let (h, db, sender, receiver) = setup(tool);
+        let before = cursor(&db, &receiver);
+        let id = queue(&db, &sender, &receiver, "hook-sentinel");
+        let (code, out, err) = h.run(["list", "--name", &receiver]);
+        assert_eq!(code, 0, "{tool}: {err}");
+        assert!(!out.contains("hook-sentinel"), "{tool}: {out}");
+        for external in [false, true] {
+            let target = format!("@{sender}");
+            let mut args = vec!["send", "--name", &receiver];
+            if external {
+                args.extend(["--from", "operator"]);
+            }
+            args.extend([&target, "--", "outgoing"]);
+            let (code, out, err) = h.run(args);
+            assert_eq!(code, 0, "{tool}/{external}: {err}");
+            assert!(out.contains("Sent"), "{tool}/{external}: {out}");
+            assert!(!out.contains("hook-sentinel"), "{tool}/{external}: {out}");
+            assert_eq!(cursor(&db, &receiver), before, "{tool}/{external}");
+        }
+        // Preserving mail must leave it available to an explicit receive too.
+        let (code, out, err) = h.run(["listen", "--name", &receiver, "--timeout", "1"]);
+        assert_eq!(code, 0, "{tool}: {err}");
+        assert!(out.contains("hook-sentinel"), "{tool}: {out}");
+        assert_eq!(cursor(&db, &receiver), id, "{tool}");
+    }
 }
 
 /// Other adhoc commands deliver a capped prefix after their output.

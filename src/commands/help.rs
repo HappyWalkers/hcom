@@ -296,6 +296,10 @@ const SEND_HELP: &[HelpEntry] = &[
     ("  -b", "Shorthand for --from bigboss"),
     ("  --name <name>", "Your identity (agent name or UUID)"),
     ("", ""),
+    ("Output:", ""),
+    ("  --json", "JSON receipt; leaves mail unread"),
+    ("  --quiet", "No output; leaves mail unread"),
+    ("", ""),
     ("Inline bundle (attach structured context):", ""),
     ("  --title <text>", "Create and attach bundle inline"),
     (

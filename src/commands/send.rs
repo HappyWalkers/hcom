@@ -101,11 +101,11 @@ pub struct SendArgs {
     #[arg(short = 'b')]
     pub bigboss: bool,
 
-    /// Suppress output
+    /// No output; leaves mail unread
     #[arg(long)]
     pub quiet: bool,
 
-    /// Print result as a single-line JSON object instead of human-readable output
+    /// JSON receipt; leaves mail unread
     #[arg(long)]
     pub json: bool,
 
@@ -1154,26 +1154,11 @@ pub fn cmd_send(db: &HcomDb, args: &SendArgs, ctx: Option<&CommandContext>) -> i
             .filter(|_| preview_delivery.is_thread_resolved),
     );
 
-    // Deliver the receiver's unread messages inline. With --from the outgoing
-    // author is external, but an invoking adhoc instance still receives.
-    // The router skips its own delivery for send, so --quiet leaves messages unread.
-    // Not Grok: hcom queues each batch as a Grok prompt, possibly already
-    // (not yet running), so showing it here too would deliver it twice. Its
-    // messages arrive once, as prompts.
-    let queue_delivered = sender_identity
-        .instance_data
-        .as_ref()
-        .and_then(|data| data.get("tool"))
-        .and_then(|tool| tool.as_str())
-        == Some(crate::tool::Tool::Grok.as_str());
-    let receiver = if queue_delivered {
-        None
-    } else if matches!(sender_identity.kind, SenderKind::Instance) {
-        Some((&sender_identity, false))
-    } else {
-        ctx.and_then(crate::cli_context::inline_receiver)
-            .map(|actor| (actor, true))
-    };
+    // Use the same adhoc-only receive policy as other commands. With --from,
+    // the invoking instance receives while the outgoing author stays external.
+    let receiver = ctx
+        .and_then(crate::cli_context::inline_receiver)
+        .map(|actor| (actor, !matches!(sender_identity.kind, SenderKind::Instance)));
     let batch = receiver.and_then(|(r, _)| InlineBatch::take(db, &r.name));
     let noted_remaining = batch.as_ref().is_some_and(|b| b.remaining > 0);
     if let (Some((receiver, set_status)), Some(batch)) = (receiver, batch) {

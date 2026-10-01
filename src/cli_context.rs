@@ -241,8 +241,6 @@ pub fn claim_inline_delivery() {
 /// Only adhoc instances: they have no hooks, so command output is their only
 /// delivery path while working. Hooked tools (including codex, via
 /// UserPromptSubmit/PostToolUse) get messages from their hooks instead.
-/// Exception: `hcom send` shows the sending instance's own unread messages
-/// inline for every tool.
 pub fn inline_receiver(ctx: &CommandContext) -> Option<&SenderIdentity> {
     let identity = ctx.identity.as_ref()?;
     let tool = identity.instance_data.as_ref()?.get("tool")?.as_str()?;
