@@ -2260,8 +2260,11 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &instance_env,
                     );
 
-                    effective_args =
-                        codex_preprocessing::preprocess_codex_args(&effective_args, &bootstrap);
+                    effective_args = codex_preprocessing::preprocess_codex_args(
+                        &effective_args,
+                        &bootstrap,
+                        codex_home.as_ref().map(|(path, _)| path.as_path()),
+                    );
 
                     instances::update_instance_position(
                         db,
@@ -3431,7 +3434,7 @@ mod tests {
 
         let bootstrap = build_codex_bootstrap(&db, hcom_dir.path(), "luna", false, &instance_env);
 
-        let args = crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap);
+        let args = crate::tools::codex_preprocessing::preprocess_codex_args(&[], &bootstrap, None);
 
         // Locate the `-c developer_instructions=<TOML>` value and decode it.
         // Other per-run config overrides may precede it, so match by prefix rather

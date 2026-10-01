@@ -7,9 +7,13 @@ use anyhow::{Result, bail};
 
 use crate::paths;
 
-/// Add ~/.hcom as a writable sandbox root without replacing Codex's
-/// configured roots. Current Codex accepts `--add-dir` in workspace-write.
-pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
+/// Add the hcom dir to Codex's workspace-write roots. A `-c` override is
+/// ignored outside workspace-write, whereas `--add-dir` is fatal at startup
+/// when the effective sandbox is read-only (e.g. workspace-write on Windows
+/// without the Windows sandbox). The override replaces the whole list, so it
+/// carries the user's roots from the CLI or `config.toml`.
+pub fn ensure_hcom_writable(tokens: &[String], codex_home: Option<&Path>) -> Vec<String> {
+    const ROOTS_KEY: &str = "sandbox_workspace_write.writable_roots";
     let end = tokens
         .iter()
         .position(|token| token == "--")
@@ -17,25 +21,76 @@ pub fn ensure_hcom_writable(tokens: &[String]) -> Vec<String> {
     let options = &tokens[..end];
     let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
 
-    for (i, token) in options.iter().enumerate() {
+    let mut cli_roots = None;
+    let mut i = 0;
+    while i < options.len() {
+        let token = options[i].as_str();
         // Respect an explicit --add-dir for the hcom dir.
-        if token == "--add-dir" && i + 1 < options.len() && options[i + 1] == hcom_dir {
-            return tokens.to_vec();
-        }
-        if token
-            .strip_prefix("--add-dir=")
-            .is_some_and(|value| value == hcom_dir)
+        if (token == "--add-dir" && options.get(i + 1) == Some(&hcom_dir))
+            || token.strip_prefix("--add-dir=") == Some(hcom_dir.as_str())
         {
             return tokens.to_vec();
         }
+        let raw = if matches!(token, "-c" | "--config") {
+            i += 1;
+            options.get(i).map(String::as_str)
+        } else {
+            token
+                .strip_prefix("--config=")
+                .or_else(|| token.strip_prefix("-c="))
+                .or_else(|| token.strip_prefix("-c"))
+        };
+        if let Some((key, value)) = raw.and_then(|raw| raw.split_once('='))
+            && key.trim() == ROOTS_KEY
+        {
+            match parse_roots(value) {
+                Some(roots) => cli_roots = Some(roots),
+                // Codex rejects a malformed override itself.
+                None => return tokens.to_vec(),
+            }
+        }
+        i += 1;
     }
 
+    let mut roots = cli_roots
+        .or_else(|| codex_home.and_then(config_writable_roots))
+        .unwrap_or_default();
+    if roots.contains(&hcom_dir) {
+        return tokens.to_vec();
+    }
+    roots.push(hcom_dir);
+    let value = toml::Value::Array(roots.into_iter().map(toml::Value::String).collect());
     let mut result = tokens.to_vec();
+    // Later overrides win, so this replaces any user override above.
     crate::hooks::runtime::insert_before_separator(
         &mut result,
-        ["--add-dir".to_string(), hcom_dir],
+        ["-c".to_string(), format!("{ROOTS_KEY}={value}")],
     );
     result
+}
+
+fn parse_roots(value: &str) -> Option<Vec<String>> {
+    let table: toml::Table = toml::from_str(&format!("x = {value}")).ok()?;
+    string_array(table.get("x")?)
+}
+
+fn string_array(value: &toml::Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+/// Top-level `sandbox_workspace_write.writable_roots` from `config.toml`.
+fn config_writable_roots(codex_home: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(codex_home.join("config.toml")).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    string_array(
+        table
+            .get("sandbox_workspace_write")?
+            .get("writable_roots")?,
+    )
 }
 
 /// Resolve the Codex state directory from the effective child launch
@@ -249,8 +304,12 @@ fn ensure_terminal_socket_access(args: &[String]) -> Vec<String> {
 
 /// Add the state directory, terminal socket access and identity bootstrap.
 /// Codex's own config and CLI flags select sandbox and approval policy.
-pub fn preprocess_codex_args(codex_args: &[String], bootstrap_text: &str) -> Vec<String> {
-    let args = ensure_hcom_writable(codex_args);
+pub fn preprocess_codex_args(
+    codex_args: &[String],
+    bootstrap_text: &str,
+    codex_home: Option<&Path>,
+) -> Vec<String> {
+    let args = ensure_hcom_writable(codex_args, codex_home);
     let args = ensure_terminal_socket_access(&args);
     add_codex_developer_instructions(&args, bootstrap_text)
 }
@@ -264,11 +323,19 @@ mod tests {
         items.iter().map(|i| i.to_string()).collect()
     }
 
+    /// Roots from the last `-c sandbox_workspace_write.writable_roots=...`.
+    fn injected_roots(result: &[String]) -> Vec<String> {
+        result
+            .iter()
+            .rev()
+            .find_map(|arg| arg.strip_prefix("sandbox_workspace_write.writable_roots="))
+            .and_then(parse_roots)
+            .unwrap_or_default()
+    }
+
     fn has_hcom_writable_dir(result: &[String]) -> bool {
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
-        result
-            .windows(2)
-            .any(|pair| pair[0] == "--add-dir" && pair[1] == hcom_dir)
+        injected_roots(result).contains(&hcom_dir)
     }
 
     fn init_config() {
@@ -281,7 +348,7 @@ mod tests {
     fn test_ensure_hcom_writable_adds_writable_root() {
         init_config();
         let tokens = s(&["--model", "gpt-6-luna"]);
-        let result = ensure_hcom_writable(&tokens);
+        let result = ensure_hcom_writable(&tokens, None);
         assert_eq!(&result[..tokens.len()], &tokens);
         assert!(
             has_hcom_writable_dir(&result),
@@ -295,7 +362,7 @@ mod tests {
         init_config();
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
         let tokens = vec!["--add-dir".to_string(), hcom_dir];
-        let result = ensure_hcom_writable(&tokens);
+        let result = ensure_hcom_writable(&tokens, None);
         assert_eq!(result, tokens, "explicit --add-dir must suppress injection");
     }
 
@@ -309,8 +376,40 @@ mod tests {
             "-c",
             r#"sandbox_workspace_write.writable_roots=["/my/dir"]"#,
         ]);
-        let result = ensure_hcom_writable(&tokens);
+        let result = ensure_hcom_writable(&tokens, None);
         assert_eq!(&result[..tokens.len()], &tokens);
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        assert_eq!(
+            injected_roots(&result),
+            vec!["/my/dir".to_string(), hcom_dir]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_keeps_config_roots() {
+        init_config();
+        let codex_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[sandbox_workspace_write]\nwritable_roots = [\"C:\\\\work\"]\n",
+        )
+        .unwrap();
+        let result = ensure_hcom_writable(&[], Some(codex_home.path()));
+        let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
+        assert_eq!(
+            injected_roots(&result),
+            vec![r"C:\work".to_string(), hcom_dir]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_never_adds_add_dir() {
+        // `--add-dir` is fatal when Codex's effective sandbox is read-only.
+        init_config();
+        let result = ensure_hcom_writable(&s(&["-s", "read-only"]), None);
+        assert!(!result.iter().any(|arg| arg.starts_with("--add-dir")));
         assert!(has_hcom_writable_dir(&result));
     }
 
@@ -480,7 +579,7 @@ mod tests {
     fn test_preprocess_resume_keeps_session_first() {
         init_config();
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP");
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", None);
         assert_eq!(result[0], "resume");
         assert_eq!(result[1], "thread-1");
         assert!(result.iter().any(|t| t.contains("developer_instructions=")));
@@ -502,7 +601,7 @@ mod tests {
                 "approval_policy=\"never\"",
             ]),
         ] {
-            let result = preprocess_codex_args(&args, "BOOTSTRAP");
+            let result = preprocess_codex_args(&args, "BOOTSTRAP", None);
             assert_eq!(&result[..args.len()], &args);
             assert!(has_hcom_writable_dir(&result));
             assert!(result.contains(&"sandbox_workspace_write.network_access=true".to_string()));
@@ -540,7 +639,7 @@ mod tests {
                 s(&["-c", "sandbox_workspace_write={network_access=false}"]),
             ] {
                 let args = [prefix.clone(), override_args].concat();
-                let result = preprocess_codex_args(&args, "BOOTSTRAP");
+                let result = preprocess_codex_args(&args, "BOOTSTRAP", None);
                 assert_eq!(&result[..args.len()], &args);
                 assert!(
                     !result.contains(&"sandbox_workspace_write.network_access=true".to_string())
@@ -559,7 +658,7 @@ mod tests {
             "--sandbox=read-only",
             "-c=developer_instructions=literal prompt",
         ]);
-        let result = preprocess_codex_args(&args, "BOOTSTRAP");
+        let result = preprocess_codex_args(&args, "BOOTSTRAP", None);
         let separator = result.iter().position(|arg| arg == "--").unwrap();
         assert_eq!(&result[separator..], &args);
         assert!(
@@ -574,7 +673,7 @@ mod tests {
     fn writable_directory_keeps_other_additional_directories() {
         init_config();
         let args = s(&["--sandbox", "workspace-write", "--add-dir", "/user/root"]);
-        let result = ensure_hcom_writable(&args);
+        let result = ensure_hcom_writable(&args, None);
         assert_eq!(&result[..args.len()], &args);
         assert!(has_hcom_writable_dir(&result));
     }
@@ -590,7 +689,7 @@ mod tests {
                 "-c",
                 r#"developer_instructions="User notes\nwith quotes \"here\"""#,
             ]);
-            let result = preprocess_codex_args(&args, "BOOTSTRAP");
+            let result = preprocess_codex_args(&args, "BOOTSTRAP", None);
             assert_eq!(&result[..2], &args[..2]);
             let encoded = result
                 .last()
