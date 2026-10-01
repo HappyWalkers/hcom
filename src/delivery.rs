@@ -2013,7 +2013,10 @@ pub fn run_delivery_loop(
                             let screen = state.screen.read().unwrap();
                             screen.approval
                         };
-                        if !approval_showing && gate.reason == "not_idle" {
+                        // Codex Stop/Interrupt hooks own idle status; quiet
+                        // terminal output can still mean active work.
+                        if config.tool != "codex" && !approval_showing && gate.reason == "not_idle"
+                        {
                             // Stability-based recovery: if status stuck "active" but output stable 10s,
                             // or stale PTY approval was left behind after the PTY cleared,
                             // flip back to listening.
