@@ -11,7 +11,9 @@ use crate::paths;
 /// ignored outside workspace-write, whereas `--add-dir` is fatal at startup
 /// when the effective sandbox is read-only (e.g. workspace-write on Windows
 /// without the Windows sandbox). The override replaces the whole list, so it
-/// carries the user's roots from the CLI or `config.toml`.
+/// carries the user's roots from the CLI or `$CODEX_HOME/config.toml`; roots
+/// set only in project or system config are dropped. `[permissions]` profiles
+/// ignore these legacy roots, so there the hcom dir is not made writable.
 pub fn ensure_hcom_writable(tokens: &[String], codex_home: Option<&Path>) -> Vec<String> {
     const ROOTS_KEY: &str = "sandbox_workspace_write.writable_roots";
     let end = tokens
@@ -40,7 +42,12 @@ pub fn ensure_hcom_writable(tokens: &[String], codex_home: Option<&Path>) -> Vec
                 .or_else(|| token.strip_prefix("-c="))
                 .or_else(|| token.strip_prefix("-c"))
         };
-        if let Some((key, value)) = raw.and_then(|raw| raw.split_once('='))
+        let override_kv = raw.and_then(|raw| raw.split_once('='));
+        // A whole-table override would be replaced by the dotted one below.
+        if override_kv.is_some_and(|(key, _)| key.trim() == "sandbox_workspace_write") {
+            return tokens.to_vec();
+        }
+        if let Some((key, value)) = override_kv
             && key.trim() == ROOTS_KEY
         {
             match parse_roots(value) {
@@ -86,10 +93,17 @@ fn string_array(value: &toml::Value) -> Option<Vec<String>> {
 fn config_writable_roots(codex_home: &Path) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(codex_home.join("config.toml")).ok()?;
     let table: toml::Table = toml::from_str(&text).ok()?;
-    string_array(
+    let roots = string_array(
         table
             .get("sandbox_workspace_write")?
             .get("writable_roots")?,
+    )?;
+    // Codex resolves these against the config file; a CLI override would not.
+    Some(
+        roots
+            .into_iter()
+            .map(|root| codex_home.join(root).to_string_lossy().into_owned())
+            .collect(),
     )
 }
 
@@ -390,17 +404,43 @@ mod tests {
     fn test_ensure_hcom_writable_keeps_config_roots() {
         init_config();
         let codex_home = tempfile::tempdir().unwrap();
+        let root = codex_home
+            .path()
+            .join("work")
+            .to_string_lossy()
+            .into_owned();
+        let roots = toml::Value::Array(vec![toml::Value::String(root.clone())]);
         std::fs::write(
             codex_home.path().join("config.toml"),
-            "[sandbox_workspace_write]\nwritable_roots = [\"C:\\\\work\"]\n",
+            format!("[sandbox_workspace_write]\nwritable_roots = {roots}\n"),
         )
         .unwrap();
         let result = ensure_hcom_writable(&[], Some(codex_home.path()));
         let hcom_dir = paths::hcom_dir().to_string_lossy().to_string();
-        assert_eq!(
-            injected_roots(&result),
-            vec![r"C:\work".to_string(), hcom_dir]
-        );
+        assert_eq!(injected_roots(&result), vec![root, hcom_dir]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_resolves_relative_config_roots() {
+        init_config();
+        let codex_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            codex_home.path().join("config.toml"),
+            "[sandbox_workspace_write]\nwritable_roots = [\"rel\"]\n",
+        )
+        .unwrap();
+        let result = ensure_hcom_writable(&[], Some(codex_home.path()));
+        let expected = codex_home.path().join("rel").to_string_lossy().into_owned();
+        assert_eq!(injected_roots(&result)[0], expected);
+    }
+
+    #[test]
+    #[serial]
+    fn test_ensure_hcom_writable_leaves_table_override() {
+        init_config();
+        let tokens = s(&["-c", r#"sandbox_workspace_write={writable_roots=["/x"]}"#]);
+        assert_eq!(ensure_hcom_writable(&tokens, None), tokens);
     }
 
     #[test]
@@ -644,7 +684,9 @@ mod tests {
                 assert!(
                     !result.contains(&"sandbox_workspace_write.network_access=true".to_string())
                 );
-                assert!(has_hcom_writable_dir(&result));
+                // A whole-table override owns writable_roots too.
+                let table = args.iter().any(|arg| arg.contains("={"));
+                assert_eq!(has_hcom_writable_dir(&result), !table);
             }
         }
     }
