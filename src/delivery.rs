@@ -1779,11 +1779,14 @@ pub fn run_delivery_loop(
 
             // Heartbeat + port re-registration
             refresh_liveness(db, &current_name);
-            if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-            }
-            if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+            if let Err(e) =
+                db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
+            {
+                log_warn(
+                    "native",
+                    "delivery.register_endpoints_fail",
+                    &format!("{}", e),
+                );
             }
         }
     } else {
@@ -1872,11 +1875,14 @@ pub fn run_delivery_loop(
                     // Heartbeat (also re-asserts tcp_mode=true) + wake state.
                     refresh_liveness(db, &current_name);
                     // Re-register endpoints (self-heals after DB reset/instance recreation)
-                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-                    }
-                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    if let Err(e) =
+                        db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
+                    {
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{}", e),
+                        );
                     }
 
                     // Check for pending messages
@@ -2493,11 +2499,14 @@ pub fn run_delivery_loop(
 
                     db.reconnect_if_stale();
                     refresh_liveness(db, &current_name);
-                    if let Err(e) = db.register_notify_port(&current_name, notify.port()) {
-                        log_warn("native", "delivery.register_notify_fail", &format!("{}", e));
-                    }
-                    if let Err(e) = db.register_inject_port(&current_name, state.inject_port) {
-                        log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
+                    if let Err(e) =
+                        db.refresh_pty_endpoints(&current_name, notify.port(), state.inject_port)
+                    {
+                        log_warn(
+                            "native",
+                            "delivery.register_endpoints_fail",
+                            &format!("{}", e),
+                        );
                     }
 
                     let current_cursor = db.get_cursor(&current_name);

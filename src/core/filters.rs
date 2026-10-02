@@ -48,6 +48,11 @@ const LIFE_FLAGS: &[&str] = &["action"];
 /// File-write tool contexts for SQL filters.
 pub const FILE_WRITE_CONTEXTS: &str = "('tool:Write', 'tool:Edit', 'tool:NotebookEdit', 'tool:write_file', 'tool:replace', 'tool:apply_patch', 'tool:write', 'tool:edit', 'tool:write_to_file', 'tool:replace_file_content', 'tool:multi_replace_file_content', 'tool:StrReplace', 'tool:create', 'tool:search_replace', 'tool:MultiEdit', 'tool:patch')";
 
+/// Whether `context` is listed in [`FILE_WRITE_CONTEXTS`].
+pub fn is_file_write_context(context: &str) -> bool {
+    FILE_WRITE_CONTEXTS.contains(&format!("'{context}'"))
+}
+
 /// SQL: `inner` event is within 30s of `outer`. The ISO-timestamp range lets
 /// SQLite walk `idx_timestamp` (callers write `+inner.type` so the planner does
 /// not pick the far less selective `idx_type`); ABS keeps the exact window.
@@ -784,6 +789,15 @@ mod tests {
         assert!(sql.contains("EXISTS"));
         assert!(sql.contains("ABS(strftime"));
         assert!(sql.contains("+e.type = 'status'"));
+    }
+
+    #[test]
+    fn test_is_file_write_context() {
+        assert!(is_file_write_context("tool:Edit"));
+        assert!(is_file_write_context("tool:apply_patch"));
+        assert!(!is_file_write_context("tool:Bash"));
+        assert!(!is_file_write_context("tool:Edi"));
+        assert!(!is_file_write_context(""));
     }
 
     fn sql_context_list_contains(list: &str, operation: &str) -> bool {

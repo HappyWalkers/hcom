@@ -55,6 +55,38 @@ impl HcomDb {
         Ok(())
     }
 
+    /// Re-register a PTY's `pty` + `inject` endpoints only while its instance
+    /// row exists, so a delivery loop waking on its own stop can't recreate them.
+    pub fn refresh_pty_endpoints(
+        &self,
+        name: &str,
+        notify_port: u16,
+        inject_port: u16,
+    ) -> Result<()> {
+        let now = now_epoch_f64();
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO notify_endpoints (instance, kind, port, updated_at)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM instances WHERE name = ?1)
+             ON CONFLICT(instance, kind) DO UPDATE SET
+                 port = excluded.port,
+                 updated_at = excluded.updated_at",
+        )?;
+        stmt.execute(params![name, "pty", notify_port as i64, now])?;
+        stmt.execute(params![name, "inject", inject_port as i64, now])?;
+        Ok(())
+    }
+
+    /// Delete PTY endpoints of missing instances not refreshed within `grace_secs`.
+    pub fn prune_orphan_endpoints(&self, grace_secs: f64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM notify_endpoints
+             WHERE kind IN ('pty', 'inject')
+               AND updated_at < ?
+               AND instance NOT IN (SELECT name FROM instances)",
+            params![now_epoch_f64() - grace_secs],
+        )?)
+    }
+
     /// Delete a specific notify endpoint by instance and kind.
     pub fn delete_notify_endpoint(&self, name: &str, kind: &str) -> Result<()> {
         self.conn.execute(
@@ -141,6 +173,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+
+        cleanup_test_db(db_path);
+    }
+
+    #[test]
+    fn test_refresh_pty_endpoints_skips_missing_instance_and_prune_clears_orphans() {
+        let (db, db_path) = setup_full_test_db();
+        let count = |name: &str| -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM notify_endpoints WHERE instance = ?",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // A stopped instance's delivery loop must not resurrect its endpoints.
+        db.refresh_pty_endpoints("gone", 5555, 5556).unwrap();
+        assert_eq!(count("gone"), 0);
+
+        db.conn
+            .execute(
+                "INSERT INTO instances (name, created_at) VALUES ('live', 1000.0)",
+                [],
+            )
+            .unwrap();
+        db.refresh_pty_endpoints("live", 6665, 6666).unwrap();
+        assert_eq!(count("live"), 2);
+
+        // Pre-existing orphans: pruned only once past the grace window, and
+        // only PTY kinds.
+        db.register_notify_port("orphan", 7777).unwrap();
+        db.upsert_notify_endpoint("orphan", "listen", 7778).unwrap();
+        assert_eq!(db.prune_orphan_endpoints(60.0).unwrap(), 0);
+        assert_eq!(db.prune_orphan_endpoints(-1.0).unwrap(), 1);
+        assert_eq!(count("orphan"), 1);
+        assert_eq!(count("live"), 2);
 
         cleanup_test_db(db_path);
     }

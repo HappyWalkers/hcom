@@ -649,84 +649,109 @@ pub fn set_status(
     } = upd;
     let writer = std::panic::Location::caller();
 
-    let current_data = match db.get_instance_full(instance_name) {
-        Ok(data) => data,
-        Err(e) => {
-            eprintln!("[hcom] warn: set_status DB read failed for {instance_name}: {e}");
-            None
+    // Row update and status event commit together: one write lock and sync
+    // per hook instead of two. Wake and subscriptions run after commit so
+    // woken readers see both.
+    let committed = db.with_write_scope(|| {
+        let current_data = match db.get_instance_full(instance_name) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("[hcom] warn: set_status DB read failed for {instance_name}: {e}");
+                None
+            }
+        };
+        let now = now_epoch_i64();
+        let mut updates = serde_json::Map::new();
+        updates.insert("status".into(), serde_json::json!(status));
+        updates.insert("status_time".into(), serde_json::json!(now));
+        updates.insert("status_context".into(), serde_json::json!(context));
+        updates.insert("status_detail".into(), serde_json::json!(detail));
+
+        if status == ST_LISTENING {
+            updates.insert("last_stop".into(), serde_json::json!(now));
         }
-    };
-    let now = now_epoch_i64();
-    let mut updates = serde_json::Map::new();
-    updates.insert("status".into(), serde_json::json!(status));
-    updates.insert("status_time".into(), serde_json::json!(now));
-    updates.insert("status_context".into(), serde_json::json!(context));
-    updates.insert("status_detail".into(), serde_json::json!(detail));
 
-    if status == ST_LISTENING {
-        updates.insert("last_stop".into(), serde_json::json!(now));
-    }
+        let old_status = current_data.as_ref().map(|d| d.status.as_str());
+        let status_changed = old_status != Some(status);
+        let status_event_changed = current_data.as_ref().is_none_or(|d| {
+            d.status != status || d.status_context != context || d.status_detail != detail
+        });
 
-    let old_status = current_data.as_ref().map(|d| d.status.as_str());
-    let status_changed = old_status != Some(status);
-    let status_event_changed = current_data.as_ref().is_none_or(|d| {
-        d.status != status || d.status_context != context || d.status_detail != detail
+        crate::instances::update_instance_position(db, instance_name, &updates);
+
+        // The pi-family plugins (pi, and its fork omp) structurally double-write tool
+        // status: the extension's tool_call handler calls reportStatus (omp/pi-status)
+        // AND the Rust beforetool hook calls update_tool_status, both with the same
+        // tool:<name>+detail. Suppress the redundant unchanged event for this family so
+        // it doesn't emit duplicate status events (~30% of events for omp otherwise).
+        let is_pi_family = matches!(
+            current_data.as_ref().map(|d| d.tool.as_str()),
+            Some("pi") | Some("omp")
+        );
+        if is_pi_family && !status_event_changed && msg_ts.is_empty() {
+            return Ok((status_changed, None));
+        }
+
+        let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
+        let mut data = serde_json::json!({
+            "status": status,
+            "context": context,
+            "position": position,
+        });
+        if !detail.is_empty() {
+            data["detail"] = serde_json::json!(detail);
+        }
+        if !msg_ts.is_empty() {
+            data["msg_ts"] = serde_json::json!(msg_ts);
+        }
+        // old_* differs from the prior status event when set_gate_status() touched
+        // the row without logging (tui:* gate context churns silently).
+        data["old_status"] = serde_json::json!(old_status);
+        data["old_context"] =
+            serde_json::json!(current_data.as_ref().map(|d| d.status_context.as_str()));
+        data["old_detail"] =
+            serde_json::json!(current_data.as_ref().map(|d| d.status_detail.as_str()));
+        data["new_status"] = serde_json::json!(status);
+        data["new_context"] = serde_json::json!(context);
+        data["new_detail"] = serde_json::json!(detail);
+        data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
+        if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
+            data["session"] = serde_json::json!(session_id);
+        }
+        if let Some(agent_id) = current_data.as_ref().and_then(|d| d.agent_id.as_deref()) {
+            data["agent_id"] = serde_json::json!(agent_id);
+        }
+        if !tool_name.is_empty() {
+            data["tool_name"] = serde_json::json!(tool_name);
+        }
+        if !tool_use_id.is_empty() {
+            data["tool_use_id"] = serde_json::json!(tool_use_id);
+        }
+        // Best-effort like the row update: a failed event must not roll it back.
+        let event = db
+            .insert_event_row("status", instance_name, &data, None)
+            .ok()
+            .map(|id| (id, data));
+        Ok((status_changed, event))
     });
 
-    crate::instances::update_instance_position(db, instance_name, &updates);
-
+    let (status_changed, event) = match committed {
+        Ok(v) => v,
+        Err(e) => {
+            crate::log::log_error(
+                "core",
+                "db.error",
+                &format!("set_status: {instance_name} - {e}"),
+            );
+            return;
+        }
+    };
     if status_changed {
         crate::notify::wake(db, instance_name, crate::notify::WakeKind::DELIVERY_LOOPS);
     }
-
-    // The pi-family plugins (pi, and its fork omp) structurally double-write tool
-    // status: the extension's tool_call handler calls reportStatus (omp/pi-status)
-    // AND the Rust beforetool hook calls update_tool_status, both with the same
-    // tool:<name>+detail. Suppress the redundant unchanged event for this family so
-    // it doesn't emit duplicate status events (~30% of events for omp otherwise).
-    let is_pi_family = matches!(
-        current_data.as_ref().map(|d| d.tool.as_str()),
-        Some("pi") | Some("omp")
-    );
-    if is_pi_family && !status_event_changed && msg_ts.is_empty() {
-        return;
+    if let Some((event_id, data)) = event {
+        db.after_event_logged(event_id, "status", instance_name, &data);
     }
-
-    let position = current_data.as_ref().map(|d| d.last_event_id).unwrap_or(0);
-    let mut data = serde_json::json!({
-        "status": status,
-        "context": context,
-        "position": position,
-    });
-    if !detail.is_empty() {
-        data["detail"] = serde_json::json!(detail);
-    }
-    if !msg_ts.is_empty() {
-        data["msg_ts"] = serde_json::json!(msg_ts);
-    }
-    // old_* differs from the prior status event when set_gate_status() touched
-    // the row without logging (tui:* gate context churns silently).
-    data["old_status"] = serde_json::json!(old_status);
-    data["old_context"] =
-        serde_json::json!(current_data.as_ref().map(|d| d.status_context.as_str()));
-    data["old_detail"] = serde_json::json!(current_data.as_ref().map(|d| d.status_detail.as_str()));
-    data["new_status"] = serde_json::json!(status);
-    data["new_context"] = serde_json::json!(context);
-    data["new_detail"] = serde_json::json!(detail);
-    data["writer"] = serde_json::json!(format!("{}:{}", writer.file(), writer.line()));
-    if let Some(session_id) = current_data.as_ref().and_then(|d| d.session_id.as_deref()) {
-        data["session"] = serde_json::json!(session_id);
-    }
-    if let Some(agent_id) = current_data.as_ref().and_then(|d| d.agent_id.as_deref()) {
-        data["agent_id"] = serde_json::json!(agent_id);
-    }
-    if !tool_name.is_empty() {
-        data["tool_name"] = serde_json::json!(tool_name);
-    }
-    if !tool_use_id.is_empty() {
-        data["tool_use_id"] = serde_json::json!(tool_use_id);
-    }
-    let _ = db.log_event("status", instance_name, &data);
 }
 
 /// Delete placeholder instances that have been launching too long.
@@ -758,6 +783,7 @@ pub fn cleanup_stale_placeholders(db: &HcomDb) -> i32 {
 /// [`reap_dead_processes_throttled`]).
 const DEAD_PROCESS_SWEEP_INTERVAL_SECS: f64 = 30.0;
 const DEAD_PROCESS_SWEEP_KV: &str = "_dead_process_sweep_at";
+const ORPHAN_ENDPOINT_GRACE_SECS: f64 = 60.0;
 
 /// If `data`'s tracked process is verifiably gone (its PID is dead or now
 /// belongs to a different process incarnation), stop the row and return
@@ -841,6 +867,7 @@ pub fn reap_dead_processes_throttled(db: &HcomDb) -> i32 {
         // Enumeration failed: leave the stamp so the next command retries.
         return 0;
     };
+    let _ = db.prune_orphan_endpoints(ORPHAN_ENDPOINT_GRACE_SECS);
     // Stamp only a completed sweep; an interrupted one is retried next time.
     // Concurrent duplicate sweeps are harmless (every stop is guarded).
     let _ = db.kv_set(DEAD_PROCESS_SWEEP_KV, Some(&now.to_string()));

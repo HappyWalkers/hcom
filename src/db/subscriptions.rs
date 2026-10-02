@@ -582,6 +582,25 @@ pub(crate) fn process_logged_event(
             continue;
         }
 
+        // The collision clause needs a file-write status event; checking that
+        // here skips one SQL query per agent for every other event.
+        if sub
+            .get("filters")
+            .and_then(|f| f.get("collision"))
+            .is_some()
+            && !(event_type == "status"
+                && data
+                    .get("context")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(crate::core::filters::is_file_write_context)
+                && data
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|d| !d.is_empty()))
+        {
+            continue;
+        }
+
         let sql = sub.get("sql").and_then(|v| v.as_str()).unwrap_or("");
         if !sql.is_empty() {
             let filter_query = format!("SELECT 1 FROM events_v WHERE id = ? AND ({})", sql);
@@ -1588,6 +1607,52 @@ mod tests {
         let stored: serde_json::Value =
             serde_json::from_str(&db.kv_get("events_sub:sub-raw").unwrap().unwrap()).unwrap();
         assert_eq!(stored["sql"], legacy);
+        cleanup_test_db(path);
+    }
+
+    #[test]
+    fn test_collision_subscription_fires_on_edit_and_skips_other_events() {
+        let (db, path) = setup_full_test_db();
+        for name in ["luna", "nova"] {
+            db.conn
+                .execute(
+                    "INSERT INTO instances (name, created_at) VALUES (?, 1000.0)",
+                    params![name],
+                )
+                .unwrap();
+        }
+        let mut filters = crate::core::filters::FilterMap::new();
+        filters.insert("collision".into(), vec!["true".into()]);
+        let sql = format!(
+            "({}) AND {}",
+            build_sql_from_flags(&filters).unwrap(),
+            collision_self_relevance_sql("luna")
+        );
+        let sub = json!({"id": "sub-col", "caller": "luna", "sql": sql, "last_id": 0,
+            "filters": {"collision": ["true"]}});
+        db.kv_set("events_sub:sub-col", Some(&sub.to_string()))
+            .unwrap();
+        let notices = || -> i64 {
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events_v WHERE type = 'message' AND msg_from = '[hcom-events]'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        db.log_status_event("luna", "active", "tool:Bash", Some("src/a.rs"), None)
+            .unwrap();
+        db.log_status_event("nova", "active", "tool:Bash", Some("src/a.rs"), None)
+            .unwrap();
+        assert_eq!(notices(), 0);
+
+        db.log_status_event("luna", "active", "tool:Edit", Some("src/a.rs"), None)
+            .unwrap();
+        db.log_status_event("nova", "active", "tool:Edit", Some("src/a.rs"), None)
+            .unwrap();
+        assert_eq!(notices(), 1);
         cleanup_test_db(path);
     }
 

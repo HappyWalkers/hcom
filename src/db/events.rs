@@ -487,6 +487,20 @@ impl HcomDb {
         data: &serde_json::Value,
         timestamp: Option<&str>,
     ) -> Result<i64> {
+        let event_id = self.insert_event_row(event_type, instance, data, timestamp)?;
+        self.after_event_logged(event_id, event_type, instance, data);
+        Ok(event_id)
+    }
+
+    /// Insert the event row only. Callers inside a write scope must run
+    /// [`Self::after_event_logged`] once their transaction commits.
+    pub(crate) fn insert_event_row(
+        &self,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+        timestamp: Option<&str>,
+    ) -> Result<i64> {
         let ts = match timestamp {
             Some(t) => t.to_string(),
             None => chrono_now_iso(),
@@ -497,8 +511,17 @@ impl HcomDb {
             "INSERT INTO events (timestamp, type, instance, data) VALUES (?, ?, ?, ?)",
             params![ts, event_type, instance, data_str],
         )?;
-        let event_id = self.conn.last_insert_rowid();
+        Ok(self.conn.last_insert_rowid())
+    }
 
+    /// Side effects of a logged event: launch-waiter wakes and subscriptions.
+    pub(crate) fn after_event_logged(
+        &self,
+        event_id: i64,
+        event_type: &str,
+        instance: &str,
+        data: &serde_json::Value,
+    ) {
         // Wake launch confirmations only for changes they can observe. The
         // usual autocommit INSERT is visible before the listener re-queries.
         // Writes inside an outer transaction remain covered by fallback polling.
@@ -525,8 +548,6 @@ impl HcomDb {
 
         // Check event subscriptions inline.
         subscriptions::process_logged_event(self, event_id, event_type, instance, data);
-
-        Ok(event_id)
     }
 
     /// Diagnostic-only: `writer` field of the most recent "status" event
