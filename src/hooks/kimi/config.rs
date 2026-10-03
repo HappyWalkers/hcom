@@ -58,7 +58,7 @@ pub(crate) fn kimi_config_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    crate::runtime_env::tool_config_root().join(".kimi-code")
+    crate::runtime_env::tool_home().join(".kimi-code")
 }
 
 pub fn get_kimi_settings_path() -> PathBuf {
@@ -315,16 +315,24 @@ fn verify_hooks_at(path: &Path) -> bool {
     })
 }
 
+/// Cleans ~/.kimi-code, $KIMI_CODE_HOME and legacy `<HCOM_DIR parent>/.kimi-code`.
 pub fn remove_kimi_hooks() -> bool {
-    let path = get_kimi_settings_path();
+    crate::runtime_env::tool_config_cleanup_dirs(".kimi-code", "KIMI_CODE_HOME")
+        .iter()
+        .filter(|dir| !remove_kimi_hooks_at(&dir.join("config.toml")))
+        .count()
+        == 0
+}
+
+fn remove_kimi_hooks_at(path: &Path) -> bool {
     if !path.exists() {
         return true;
     }
-    match read_toml_document(&path) {
+    match read_toml_document(path) {
         Ok(mut doc) => {
             remove_hcom_hooks(&mut doc);
             remove_hcom_permissions(&mut doc);
-            write_toml(&path, &doc).is_ok()
+            write_toml(path, &doc).is_ok()
         }
         Err(_) => false,
     }

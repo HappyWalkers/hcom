@@ -724,11 +724,7 @@ fn discovery_roots(ctx: &LaunchCtx) -> Vec<std::path::PathBuf> {
             ),
             _ => unreachable!("OpenCode discovery used for {}", ctx.tool.as_str()),
         };
-    let home = ctx
-        .var("HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_default();
+    let home = ctx.home();
     let config_home = ctx
         .path_var("XDG_CONFIG_HOME")
         .unwrap_or_else(|| home.join(".config"));
@@ -788,20 +784,12 @@ fn xdg_config_home() -> String {
         .into_owned()
 }
 
-/// Get the canonical plugin install directory for an OpenCode-family app.
-///
-/// Uses the XDG global plugin dir in the default HOME-backed case, and a
-/// project-local `.<app>/plugins/` dir when HCOM_DIR points at a project root.
+/// The XDG global plugin dir for an OpenCode-family app, where older hcom
+/// installed its plugin.
 fn plugin_dir_for_app(app: &str) -> std::path::PathBuf {
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root == home {
-        std::path::PathBuf::from(xdg_config_home())
-            .join(app)
-            .join("plugins")
-    } else {
-        tool_root.join(format!(".{app}")).join("plugins")
-    }
+    std::path::PathBuf::from(xdg_config_home())
+        .join(app)
+        .join("plugins")
 }
 
 #[cfg(test)]
@@ -851,10 +839,8 @@ fn remove_plugin(app: &str) -> std::io::Result<()> {
             }
         }
     }
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root != home {
-        let tool_base = tool_root.join(format!(".{app}"));
+    if let Some(root) = crate::runtime_env::legacy_tool_config_root() {
+        let tool_base = root.join(format!(".{app}"));
         for sub in &["plugin", "plugins"] {
             let p = tool_base.join(sub).join(PLUGIN_FILENAME);
             if !paths.contains(&p) {
@@ -1251,50 +1237,41 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn test_project_local_kilo_plugin_path_uses_kilo_dir() {
-        let _guard = EnvGuard::new();
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        let hcom_dir = workspace.join(".hcom");
-        let home = dir.path().join("home");
-        std::fs::create_dir_all(&hcom_dir).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        unsafe {
-            std::env::set_var("HCOM_DIR", &hcom_dir);
-            std::env::set_var("HOME", &home);
-        }
-
-        assert_eq!(
-            get_kilo_plugin_path(),
-            workspace.join(".kilo").join("plugins").join("hcom.ts")
-        );
-    }
-
-    #[test]
     fn test_plugin_filename_constant() {
         assert_eq!(PLUGIN_FILENAME, "hcom.ts");
     }
 
     #[test]
     #[serial]
-    fn test_project_local_plugin_path_uses_hcom_dir_parent() {
+    fn test_project_local_hcom_dir_keeps_global_plugin_dir_and_cleans_legacy() {
         let _guard = EnvGuard::new();
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         let hcom_dir = workspace.join(".hcom");
         let home = dir.path().join("home");
+        let xdg = dir.path().join("xdg");
         std::fs::create_dir_all(&hcom_dir).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         unsafe {
             std::env::set_var("HCOM_DIR", &hcom_dir);
             std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_CONFIG_HOME", &xdg);
+            std::env::remove_var("KILO_CONFIG_DIR");
         }
 
         assert_eq!(
-            get_opencode_plugin_path(),
-            workspace.join(".opencode").join("plugins").join("hcom.ts")
+            get_kilo_plugin_path(),
+            xdg.join("kilo").join("plugins").join(PLUGIN_FILENAME)
         );
+
+        let legacy = workspace
+            .join(".kilo")
+            .join("plugins")
+            .join(PLUGIN_FILENAME);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, PLUGIN_SOURCE).unwrap();
+        remove_kilo_plugin().unwrap();
+        assert!(!legacy.exists());
     }
 
     #[test]

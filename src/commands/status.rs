@@ -262,7 +262,6 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
 
     // Paths
     let hcom_dir_override = std::env::var("HCOM_DIR").is_ok();
-    let project_root = crate::paths::get_project_root();
 
     if json_mode {
         let log_summary = crate::log::get_log_summary(1.0);
@@ -279,7 +278,6 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
             "hcom_dir_override": hcom_dir_override,
             "hcom_exists": dir_exists,
             "hcom_writable": dir_writable,
-            "project_root": project_root.to_string_lossy(),
             "config_valid": config_valid,
             "config_errors": config_errors,
             "tools": tool_statuses_json(&tools),

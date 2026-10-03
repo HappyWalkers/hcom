@@ -71,7 +71,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 
 fn per_run_home(ctx: &LaunchCtx) -> PathBuf {
     ctx.path_var("CODEX_HOME")
-        .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".codex"))
+        .unwrap_or_else(|| ctx.home().join(".codex"))
 }
 
 fn parse_override(raw: &str) -> AnyResult<(String, toml::Value)> {
@@ -352,7 +352,15 @@ fn ensure_per_run_permissions(ctx: &LaunchCtx) -> AnyResult<()> {
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> AnyResult<()> {
     let home = per_run_home(ctx);
-    cleanup_codex_hooks_in_dir(&home)
+    let legacy = crate::runtime_env::legacy_tool_config_root()
+        .map(|root| root.join(".codex"))
+        .filter(|path| *path != home);
+    runtime::collect_errors(
+        std::iter::once(home)
+            .chain(legacy)
+            .filter_map(|path| cleanup_codex_hooks_in_dir(&path).err())
+            .collect(),
+    )
 }
 
 /// Remove a legacy install: hcom's handlers in hooks.json, the config.toml
@@ -1064,14 +1072,15 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
 
 /// Resolve the Codex config directory.
 ///
-/// Priority: CODEX_HOME env var → tool_config_root()/.codex
+/// Priority: CODEX_HOME env var → ~/.codex
+#[cfg(test)]
 fn codex_config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("CODEX_HOME")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
-    crate::runtime_env::tool_config_root().join(".codex")
+    crate::runtime_env::tool_home().join(".codex")
 }
 
 /// Get path to Codex config.toml.
@@ -1606,29 +1615,14 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
 
 /// Remove hcom hooks from Codex config.
 ///
-/// Cleans the default (~/.codex), env-var (CODEX_HOME), and active HCOM_DIR-local paths.
+/// Cleans the default (~/.codex), env-var (CODEX_HOME), and legacy
+/// `<HCOM_DIR parent>/.codex` paths.
 pub fn remove_codex_hooks() -> bool {
-    let default_dir = dirs::home_dir()
-        .map(|h| h.join(".codex"))
-        .unwrap_or_default();
-    let env_dir = std::env::var("CODEX_HOME")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from);
-    let local_dir = codex_config_dir();
-
-    let default_ok = remove_codex_hooks_from_dir(&default_dir);
-    let env_ok = match env_dir {
-        Some(ref d) if *d != default_dir => remove_codex_hooks_from_dir(d),
-        _ => true,
-    };
-    let local_ok = if local_dir != default_dir && Some(&local_dir) != env_dir.as_ref() {
-        remove_codex_hooks_from_dir(&local_dir)
-    } else {
-        true
-    };
-
-    default_ok && env_ok && local_ok
+    crate::runtime_env::tool_config_cleanup_dirs(".codex", "CODEX_HOME")
+        .iter()
+        .filter(|dir| !remove_codex_hooks_from_dir(dir))
+        .count()
+        == 0
 }
 
 #[cfg(test)]
@@ -2036,6 +2030,31 @@ mod tests {
     fn test_remove_codex_noop_when_no_hooks_json() {
         let (_tmp, _hcom_dir, _home, _guard) = isolated_test_env();
         assert!(remove_codex_hooks());
+    }
+
+    #[test]
+    #[serial]
+    fn per_run_cleanup_removes_project_local_legacy_hooks() {
+        let (_tmp, _hcom_dir, home, _guard) = isolated_test_env();
+        let workspace = home.join("workspace");
+        let legacy_dir = workspace.join(".codex");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        unsafe { std::env::set_var("HCOM_DIR", workspace.join(".hcom")) };
+        let mut hooks = build_expected_hook_json();
+        hooks["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"hooks": [{"type": "command", "command": "user-hook"}]}));
+        std::fs::write(
+            legacy_dir.join("hooks.json"),
+            serde_json::to_string_pretty(&hooks).unwrap(),
+        )
+        .unwrap();
+
+        cleanup_legacy_per_run(&per_run_ctx(&[], &home.join(".codex"))).unwrap();
+        let content = std::fs::read_to_string(legacy_dir.join("hooks.json")).unwrap();
+        assert!(content.contains("user-hook"));
+        assert!(!content.contains("codex-sessionstart"));
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn copilot_config_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    crate::runtime_env::tool_config_root().join(".copilot")
+    crate::runtime_env::tool_home().join(".copilot")
 }
 
 /// Copilot stores its permanently trusted directories in the automatically

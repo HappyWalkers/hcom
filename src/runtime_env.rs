@@ -30,15 +30,47 @@ pub(crate) fn get_hcom_prefix() -> Vec<String> {
     HCOM_PREFIX.clone()
 }
 
-/// Get the base directory for tool config files (e.g. .codex/, .gemini/).
-pub(crate) fn tool_config_root() -> std::path::PathBuf {
+/// Base directory for each tool's default config dir (`.claude/`, `.codex/`, ...)
+/// when the tool's own env override is unset. HCOM_DIR only isolates hcom state;
+/// it never relocates tool config.
+pub(crate) fn tool_home() -> std::path::PathBuf {
+    user_home().unwrap_or_default()
+}
+
+/// Parent of a non-default HCOM_DIR. Older hcom versions installed tool hooks,
+/// plugins and config under `<this>/.<tool>/`; only legacy cleanup looks here.
+pub(crate) fn legacy_tool_config_root() -> Option<std::path::PathBuf> {
     let env: std::collections::HashMap<String, String> = std::env::vars().collect();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (hcom_dir, _) = crate::paths::resolve_hcom_dir_from_env(&env, &cwd);
-    hcom_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default())
+    let root = hcom_dir.parent()?.to_path_buf();
+    let canonical = |p: &std::path::Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let root_canonical = canonical(&root);
+    let is_home = [user_home(), dirs::home_dir()]
+        .into_iter()
+        .flatten()
+        .any(|home| canonical(&home) == root_canonical);
+    (!is_home).then_some(root)
+}
+
+/// Every dir that may hold an hcom install for a tool, deduplicated: the
+/// default `~/<dirname>`, `$<env_var>`, and the legacy `<HCOM_DIR parent>/<dirname>`.
+pub(crate) fn tool_config_cleanup_dirs(dirname: &str, env_var: &str) -> Vec<std::path::PathBuf> {
+    let candidates = [
+        Some(tool_home().join(dirname)),
+        std::env::var(env_var)
+            .ok()
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from),
+        legacy_tool_config_root().map(|root| root.join(dirname)),
+    ];
+    let mut dirs = Vec::new();
+    for dir in candidates.into_iter().flatten() {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Build hcom command string for prompts, config, and hook commands.
@@ -53,7 +85,25 @@ pub(crate) fn gemini_family_config_dir() -> std::path::PathBuf {
     {
         return std::path::PathBuf::from(dir).join(".gemini");
     }
-    tool_config_root().join(".gemini")
+    tool_home().join(".gemini")
+}
+
+/// Every `.gemini` dir that may hold an hcom install: `~/.gemini`,
+/// `$GEMINI_CLI_HOME/.gemini`, and the legacy `<HCOM_DIR parent>/.gemini`.
+pub(crate) fn gemini_family_cleanup_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![tool_home().join(".gemini")];
+    for dir in [
+        Some(gemini_family_config_dir()),
+        legacy_tool_config_root().map(|r| r.join(".gemini")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// User home directory, honoring an explicit `HOME` override before falling back
@@ -206,7 +256,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn tool_config_root_uses_home_when_hcom_dir_has_no_parent() {
+    fn legacy_tool_config_root_none_for_default_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
@@ -214,21 +264,22 @@ mod tests {
 
         unsafe {
             std::env::set_var("HOME", &home);
-            std::env::set_var("HCOM_DIR", "/");
+            std::env::set_var("HCOM_DIR", home.join(".hcom"));
         }
+        assert_eq!(super::legacy_tool_config_root(), None);
 
-        assert_eq!(super::tool_config_root(), home);
+        unsafe { std::env::set_var("HCOM_DIR", "/") };
+        assert_eq!(super::legacy_tool_config_root(), None);
     }
 
     #[test]
     #[serial]
-    fn tool_config_root_uses_parent_of_resolved_hcom_dir() {
+    fn tool_home_ignores_project_local_hcom_dir() {
         let _guard = EnvGuard::new();
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let home = temp.path().join("home");
         let sandbox = workspace.join(".sandbox");
-        std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&sandbox).unwrap();
 
@@ -239,11 +290,13 @@ mod tests {
             std::env::set_var("HCOM_DIR", ".sandbox/.hcom");
         }
 
-        let root = super::tool_config_root();
+        let tool_home = super::tool_home();
+        let legacy = super::legacy_tool_config_root();
         let expected = sandbox.canonicalize().unwrap();
 
         std::env::set_current_dir(prev_cwd).unwrap();
-        assert_eq!(root, expected);
+        assert_eq!(tool_home, home);
+        assert_eq!(legacy, Some(expected));
     }
 
     #[test]

@@ -23,14 +23,14 @@ use super::shared::{
     read_file_lossy, truncate_str,
 };
 
-/// `$GROK_HOME` if set, else `<tool_config_root>/.grok`.
+/// `$GROK_HOME` if set, else `~/.grok`.
 pub(crate) fn grok_config_dir() -> PathBuf {
     std::env::var("GROK_HOME")
         .ok()
         .map(|home| home.trim().to_string())
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::runtime_env::tool_config_root().join(".grok"))
+        .unwrap_or_else(|| crate::runtime_env::tool_home().join(".grok"))
 }
 
 /// `urlencoding::encode`, which Grok uses for the cwd component of session

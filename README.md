@@ -353,8 +353,8 @@ HCOM_TAG=dev hcom 3 claude                    # per-launch env
 ### Per-project isolation
 
 ```bash
-export HCOM_DIR="$PWD/.hcom"    # isolate state + hooks to this folder
-hcom hooks remove && rm -rf "$HCOM_DIR"
+export HCOM_DIR="$PWD/.hcom"    # isolate hcom state (db, logs) to this folder
+rm -rf "$HCOM_DIR"              # clean up
 ```
 
 Run `hcom config <key> --info` or `hcom run docs --config` for the full per-key reference.

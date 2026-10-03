@@ -177,17 +177,6 @@ pub fn hcom_path(parts: &[&str]) -> PathBuf {
     path
 }
 
-/// Get project root (parent of hcom_dir). Used for anchoring tool config files.
-///
-/// Uses cached Config — for test-friendly env-reactive resolution, use
-/// `runtime_env::tool_config_root()` instead.
-pub fn get_project_root() -> PathBuf {
-    hcom_dir()
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("/"))
-}
-
 /// Get the database path (hcom_dir/hcom.db)
 pub fn db_path() -> PathBuf {
     hcom_dir().join("hcom.db")
@@ -487,17 +476,6 @@ mod tests {
         assert_eq!(
             read_flag_file(&tmp.path().join(FLAGS_DIR).join("other_flag")),
             0
-        );
-    }
-
-    #[test]
-    fn test_get_project_root_logic() {
-        // get_project_root returns parent of hcom_dir
-        // Test the logic directly without relying on global Config
-        let base = Path::new("/home/test/.hcom");
-        assert_eq!(
-            base.parent().unwrap().to_path_buf(),
-            PathBuf::from("/home/test")
         );
     }
 

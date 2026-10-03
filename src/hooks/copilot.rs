@@ -98,33 +98,20 @@ pub enum SetupError {
     },
 }
 
-fn copilot_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("COPILOT_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
-    }
-    crate::runtime_env::tool_config_root().join(".copilot")
-}
-
-fn tool_config_root_for_ctx(ctx: &LaunchCtx) -> PathBuf {
-    let (hcom_dir, _) = paths::resolve_hcom_dir_from_env(&ctx.env, &ctx.cwd);
-    hcom_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .or_else(|| ctx.var("HOME").map(PathBuf::from))
-        .unwrap_or_default()
+fn hcom_hooks_file(copilot_home: PathBuf) -> PathBuf {
+    copilot_home.join("hooks").join("hcom.json")
 }
 
 fn copilot_hooks_path_for_ctx(ctx: &LaunchCtx) -> PathBuf {
-    ctx.path_var("COPILOT_HOME")
-        .unwrap_or_else(|| tool_config_root_for_ctx(ctx).join(".copilot"))
-        .join("hooks")
-        .join("hcom.json")
+    hcom_hooks_file(
+        ctx.path_var("COPILOT_HOME")
+            .unwrap_or_else(|| ctx.home().join(".copilot")),
+    )
 }
 
-pub fn get_copilot_hooks_path() -> PathBuf {
-    copilot_config_dir().join("hooks").join("hcom.json")
+/// Older hcom used `<HCOM_DIR parent>/.copilot` under a project-local HCOM_DIR.
+fn project_local_legacy_path() -> Option<PathBuf> {
+    crate::runtime_env::legacy_tool_config_root().map(|root| hcom_hooks_file(root.join(".copilot")))
 }
 
 /// Relative paths (e.g. a relative `COPILOT_HOME`) resolve against the
@@ -140,21 +127,9 @@ fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn copilot_hooks_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = crate::runtime_env::user_home() {
-        push_unique(
-            &mut paths,
-            home.join(".copilot").join("hooks").join("hcom.json"),
-        );
+    for dir in crate::runtime_env::tool_config_cleanup_dirs(".copilot", "COPILOT_HOME") {
+        push_unique(&mut paths, hcom_hooks_file(dir));
     }
-    if let Ok(dir) = std::env::var("COPILOT_HOME")
-        && !dir.is_empty()
-    {
-        push_unique(
-            &mut paths,
-            PathBuf::from(dir).join("hooks").join("hcom.json"),
-        );
-    }
-    push_unique(&mut paths, get_copilot_hooks_path());
     paths
 }
 
@@ -320,7 +295,14 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    remove_hooks_at(&copilot_hooks_path_for_ctx(ctx))
+    let effective = copilot_hooks_path_for_ctx(ctx);
+    let legacy = project_local_legacy_path().filter(|path| *path != effective);
+    runtime::collect_errors(
+        std::iter::once(effective)
+            .chain(legacy)
+            .filter_map(|path| remove_hooks_at(&path).err())
+            .collect(),
+    )
 }
 
 /// Strip hcom's entries from a legacy `hooks/hcom.json`. When that removed

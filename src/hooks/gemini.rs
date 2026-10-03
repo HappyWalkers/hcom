@@ -954,9 +954,7 @@ fn gemini_config_dir() -> PathBuf {
 
 /// Get path to Gemini policies directory.
 ///
-/// Respects GEMINI_CLI_HOME env var, then falls back to:
-/// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
-/// Otherwise uses global (~/.gemini/policies/).
+/// `$GEMINI_CLI_HOME/.gemini/policies/`, else `~/.gemini/policies/`.
 fn get_gemini_policies_path() -> PathBuf {
     gemini_config_dir().join("policies")
 }
@@ -1025,9 +1023,7 @@ fn remove_policy_from_path(policies_dir: &Path) -> bool {
 
 /// Get path to Gemini settings file.
 ///
-/// Respects GEMINI_CLI_HOME env var, then falls back to:
-/// If HCOM_DIR is set (sandbox), uses HCOM_DIR parent.
-/// Otherwise uses global (~/.gemini/settings.json).
+/// `$GEMINI_CLI_HOME/.gemini/settings.json`, else `~/.gemini/settings.json`.
 pub fn get_gemini_settings_path() -> PathBuf {
     gemini_config_dir().join("settings.json")
 }
@@ -1520,53 +1516,16 @@ fn verify_hooks_at(settings_path: &Path, check_permissions: bool) -> Result<(), 
     Ok(())
 }
 
-/// Remove hcom hooks from Gemini settings (global + local).
-///
-/// Removes hooks from settings.json and policy file from policies/.
+/// Remove hcom hooks from Gemini settings and the policy file from policies/,
+/// in every dir an install may live in.
 pub fn remove_gemini_hooks() -> bool {
-    let global_path = dirs::home_dir()
-        .map(|h| h.join(".gemini").join("settings.json"))
-        .unwrap_or_default();
-    let env_path = std::env::var("GEMINI_CLI_HOME")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| PathBuf::from(d).join(".gemini").join("settings.json"));
-    let local_path = get_gemini_settings_path();
-
-    let global_ok = remove_hooks_from_path(&global_path);
-    let env_ok = match env_path {
-        Some(ref p) if *p != global_path => remove_hooks_from_path(p),
-        _ => true,
-    };
-    let local_ok = if local_path != global_path && Some(&local_path) != env_path.as_ref() {
-        remove_hooks_from_path(&local_path)
-    } else {
-        true
-    };
-
-    // Remove policy files
-    let global_policies = dirs::home_dir()
-        .map(|h| h.join(".gemini").join("policies"))
-        .unwrap_or_default();
-    let env_policies = std::env::var("GEMINI_CLI_HOME")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| PathBuf::from(d).join(".gemini").join("policies"));
-    let local_policies = get_gemini_policies_path();
-
-    let global_policy_ok = remove_policy_from_path(&global_policies);
-    let env_policy_ok = match env_policies {
-        Some(ref p) if *p != global_policies => remove_policy_from_path(p),
-        _ => true,
-    };
-    let local_policy_ok =
-        if local_policies != global_policies && Some(&local_policies) != env_policies.as_ref() {
-            remove_policy_from_path(&local_policies)
-        } else {
-            true
-        };
-
-    global_ok && env_ok && local_ok && global_policy_ok && env_policy_ok && local_policy_ok
+    crate::runtime_env::gemini_family_cleanup_dirs()
+        .iter()
+        .fold(true, |ok, dir| {
+            let hooks_ok = remove_hooks_from_path(&dir.join("settings.json"));
+            let policy_ok = remove_policy_from_path(&dir.join("policies"));
+            hooks_ok && policy_ok && ok
+        })
 }
 
 fn remove_hooks_from_path(path: &Path) -> bool {
@@ -1964,15 +1923,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_setup_and_verify_gemini_hooks() {
-        let dir = tempfile::tempdir().unwrap();
-        let hcom_dir = dir.path().join(".hcom");
-        std::fs::create_dir_all(&hcom_dir).unwrap();
-        let settings_dir = dir.path().join(".gemini");
-        std::fs::create_dir_all(&settings_dir).unwrap();
-
-        // Redirect paths via HCOM_DIR
-        let saved = std::env::var("HCOM_DIR").ok();
-        unsafe { std::env::set_var("HCOM_DIR", &hcom_dir) };
+        let (_dir, test_home, settings_path, _guard) = gemini_test_env();
 
         let success = setup_gemini_hooks(true);
         assert!(success, "setup should succeed");
@@ -1980,34 +1931,19 @@ mod tests {
         let verified = verify_gemini_hooks_installed(true);
         assert!(verified, "verify should pass after setup");
 
-        // Check settings file was written
-        let settings_path = dir.path().join(".gemini").join("settings.json");
         assert!(settings_path.exists());
         let content = std::fs::read_to_string(&settings_path).unwrap();
         assert!(content.contains("hcom-sessionstart"));
         assert!(content.contains("hcom-beforeagent"));
         assert!(content.contains("enableHooks"));
 
-        // Check policy file was written
-        let policy_path = dir
-            .path()
-            .join(".gemini")
-            .join("policies")
-            .join("hcom.toml");
+        let policy_path = test_home.join(".gemini").join("policies").join("hcom.toml");
         assert!(policy_path.exists(), "policy file should be created");
 
-        // Remove hooks
         let remove_ok = remove_hooks_from_path(&settings_path);
         assert!(remove_ok);
         let verify_after_remove = verify_hooks_at(&settings_path, false).is_ok();
         assert!(!verify_after_remove, "verify should fail after remove");
-
-        // Restore
-        if let Some(v) = saved {
-            unsafe { std::env::set_var("HCOM_DIR", v) };
-        } else {
-            unsafe { std::env::remove_var("HCOM_DIR") };
-        }
     }
 
     use crate::hooks::test_helpers::{EnvGuard, isolated_test_env};

@@ -38,11 +38,7 @@ fn active_profile(ctx: &LaunchCtx) -> Option<String> {
 }
 
 fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
-    let home = ctx
-        .var("HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)
-        .unwrap_or_default();
+    let home = ctx.home();
     let config_name = ctx.var("PI_CONFIG_DIR").unwrap_or(".omp");
     let profile = active_profile(ctx);
     let agent_dir = match profile {
@@ -73,13 +69,10 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
 }
 
 /// Under a project-local HCOM_DIR the old installer wrote to
-/// `<tool root>/.omp/extensions/` instead of the agent dir.
+/// `<HCOM_DIR parent>/.omp/extensions/` instead of the agent dir.
 fn project_local_legacy_path() -> Option<std::path::PathBuf> {
-    let root = crate::runtime_env::tool_config_root();
-    let home = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default());
-    (root != home).then(|| root.join(".omp").join("extensions").join(PLUGIN_FILENAME))
+    crate::runtime_env::legacy_tool_config_root()
+        .map(|root| root.join(".omp").join("extensions").join(PLUGIN_FILENAME))
 }
 
 fn remove_owned(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Result<()> {

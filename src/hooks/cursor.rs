@@ -62,23 +62,15 @@ pub enum SetupError {
     PermissionsSetupFailed(PathBuf),
 }
 
-fn cursor_config_dir() -> PathBuf {
-    crate::runtime_env::tool_config_root().join(".cursor")
-}
-
 fn default_cursor_config_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".cursor")
+    crate::runtime_env::tool_home().join(".cursor")
 }
 
 pub fn get_cursor_hooks_path() -> PathBuf {
-    cursor_config_dir().join("hooks.json")
+    default_cursor_config_dir().join("hooks.json")
 }
 
 pub fn get_cursor_permissions_path() -> PathBuf {
-    let root = crate::runtime_env::tool_config_root();
-    if dirs::home_dir().as_deref() != Some(root.as_path()) {
-        return root.join(".cursor").join("cli.json");
-    }
     if let Ok(dir) = std::env::var("CURSOR_CONFIG_DIR")
         && !dir.is_empty()
     {
@@ -368,20 +360,20 @@ fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 fn cursor_hooks_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        push_unique(&mut paths, home.join(".cursor").join("hooks.json"));
-    }
     push_unique(&mut paths, get_cursor_hooks_path());
+    if let Some(root) = crate::runtime_env::legacy_tool_config_root() {
+        push_unique(&mut paths, root.join(".cursor").join("hooks.json"));
+    }
     paths
 }
 
 fn cursor_permissions_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        push_unique(&mut paths, home.join(".cursor").join("cli-config.json"));
-    }
-    let root = crate::runtime_env::tool_config_root();
-    if dirs::home_dir().as_deref() != Some(root.as_path()) {
+    push_unique(
+        &mut paths,
+        default_cursor_config_dir().join("cli-config.json"),
+    );
+    if let Some(root) = crate::runtime_env::legacy_tool_config_root() {
         push_unique(&mut paths, root.join(".cursor").join("cli.json"));
     }
     if let Ok(dir) = std::env::var("CURSOR_CONFIG_DIR")
@@ -707,8 +699,8 @@ mod tests {
     #[test]
     #[serial]
     fn setup_is_idempotent_and_preserves_existing_hooks() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,
@@ -737,14 +729,14 @@ mod tests {
                 .iter()
                 .any(|hook| hook["command"] == "./custom-start.sh")
         );
-        assert!(!workspace.join(".cursor/cli.json").exists());
+        assert!(!dir.path().join("home/.cursor/cli-config.json").exists());
     }
 
     #[test]
     #[serial]
-    fn permissions_are_project_local_and_cleanup_preserves_other_rules() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let permissions_path = workspace.join(".cursor/cli.json");
+    fn permissions_cleanup_preserves_other_rules() {
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let permissions_path = dir.path().join("home/.cursor/cli-config.json");
         std::fs::create_dir_all(permissions_path.parent().unwrap()).unwrap();
         std::fs::write(
             &permissions_path,
@@ -764,15 +756,13 @@ mod tests {
         let root: Value =
             serde_json::from_str(&std::fs::read_to_string(permissions_path).unwrap()).unwrap();
         assert_eq!(root["permissions"]["allow"], json!(["Shell(custom)"]));
-        assert!(root.get("version").is_none());
-        assert!(root.get("editor").is_none());
     }
 
     #[test]
     #[serial]
     fn setup_replaces_legacy_prefixes_with_scoped_permissions() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let permissions_path = workspace.join(".cursor/cli.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let permissions_path = dir.path().join("home/.cursor/cli-config.json");
         std::fs::create_dir_all(permissions_path.parent().unwrap()).unwrap();
         std::fs::write(
             &permissions_path,
@@ -808,8 +798,8 @@ mod tests {
     #[test]
     #[serial]
     fn setup_removes_stale_hook_prefixes() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,
@@ -872,15 +862,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn isolated_mode_permissions_ignore_global_override() {
-        let (dir, workspace, _guard) = cursor_test_env();
-        unsafe {
-            std::env::set_var("CURSOR_CONFIG_DIR", dir.path().join("cursor-override"));
-        }
+    fn project_local_hcom_dir_does_not_move_cursor_config() {
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let home = dir.path().join("home");
 
+        assert_eq!(get_cursor_hooks_path(), home.join(".cursor/hooks.json"));
         assert_eq!(
             get_cursor_permissions_path(),
-            workspace.join(".cursor/cli.json")
+            home.join(".cursor/cli-config.json")
         );
     }
 
@@ -913,8 +902,8 @@ mod tests {
     #[test]
     #[serial]
     fn remove_preserves_unrelated_hooks() {
-        let (_dir, workspace, _guard) = cursor_test_env();
-        let hooks_path = workspace.join(".cursor/hooks.json");
+        let (dir, _workspace, _guard) = cursor_test_env();
+        let hooks_path = dir.path().join("home/.cursor/hooks.json");
         std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
         std::fs::write(
             &hooks_path,

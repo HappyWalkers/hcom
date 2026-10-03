@@ -2658,7 +2658,7 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 
 fn effective_settings_path(ctx: &LaunchCtx) -> PathBuf {
     ctx.path_var("CLAUDE_CONFIG_DIR")
-        .unwrap_or_else(|| paths::get_project_root().join(".claude"))
+        .unwrap_or_else(|| ctx.home().join(".claude"))
         .join("settings.json")
 }
 
@@ -2759,8 +2759,19 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
+/// Older hcom wrote hooks into the effective settings.json, or into
+/// `<HCOM_DIR parent>/.claude/settings.json` under a project-local HCOM_DIR.
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    remove_hooks_at(&effective_settings_path(ctx))
+    let effective = effective_settings_path(ctx);
+    let legacy = crate::runtime_env::legacy_tool_config_root()
+        .map(|root| root.join(".claude").join("settings.json"))
+        .filter(|path| *path != effective);
+    runtime::collect_errors(
+        std::iter::once(effective)
+            .chain(legacy)
+            .filter_map(|path| remove_hooks_at(&path).err())
+            .collect(),
+    )
 }
 
 // Static regexes for hot-path hook command detection
@@ -2778,27 +2789,6 @@ static RE_HCOM_PY_COMMANDS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(r#"hcom\.py["']?\s+({})\b"#, pattern)).unwrap()
 });
 static RE_SH_HCOM: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"sh\s+-c.*hcom").unwrap());
-
-/// Resolve the Claude config directory.
-///
-/// Priority: CLAUDE_CONFIG_DIR env var → tool_config_root()/.claude
-fn claude_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
-    }
-    paths::get_project_root().join(".claude")
-}
-
-/// Get path to Claude settings.json.
-///
-/// Respects CLAUDE_CONFIG_DIR env var, then falls back to:
-/// - HCOM_DIR set → project_root is HCOM_DIR parent → {parent}/.claude/settings.json
-/// - Otherwise → ~/.hcom parent = ~ → ~/.claude/settings.json
-pub fn get_claude_settings_path() -> PathBuf {
-    claude_config_dir().join("settings.json")
-}
 
 /// Build a hook command that silently exits 0 when hcom is not installed.
 ///
@@ -3097,30 +3087,14 @@ fn remove_hooks_from_settings_path(path: &Path) -> bool {
 
 /// Remove hcom hooks from Claude settings.
 ///
-/// Cleans both global (~/.claude/settings.json) and local (HCOM_DIR-based) paths.
+/// Cleans ~/.claude, $CLAUDE_CONFIG_DIR and legacy `<HCOM_DIR parent>/.claude`.
 /// Only removes hcom-specific hooks, not the whole file.
 pub fn remove_claude_hooks() -> bool {
-    let global_path = dirs::home_dir()
-        .map(|h| h.join(".claude").join("settings.json"))
-        .unwrap_or_default();
-    let env_path = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|d| PathBuf::from(d).join("settings.json"));
-    let local_path = get_claude_settings_path();
-
-    let global_ok = remove_hooks_from_settings_path(&global_path);
-    let env_ok = match env_path {
-        Some(ref p) if *p != global_path => remove_hooks_from_settings_path(p),
-        _ => true,
-    };
-    let local_ok = if local_path != global_path && Some(&local_path) != env_path.as_ref() {
-        remove_hooks_from_settings_path(&local_path)
-    } else {
-        true
-    };
-
-    global_ok && env_ok && local_ok
+    crate::runtime_env::tool_config_cleanup_dirs(".claude", "CLAUDE_CONFIG_DIR")
+        .iter()
+        .filter(|dir| !remove_hooks_from_settings_path(&dir.join("settings.json")))
+        .count()
+        == 0
 }
 
 #[cfg(test)]

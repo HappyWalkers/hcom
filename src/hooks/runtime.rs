@@ -75,6 +75,16 @@ impl LaunchCtx {
     pub fn path_var(&self, key: &str) -> Option<PathBuf> {
         self.var(key).map(|value| self.cwd.join(value))
     }
+
+    /// The child's home dir: default parent of every tool config dir.
+    pub fn home(&self) -> PathBuf {
+        let home = self.var("HOME");
+        #[cfg(windows)]
+        let home = home.or_else(|| self.var("USERPROFILE"));
+        home.map(PathBuf::from)
+            .or_else(dirs::home_dir)
+            .unwrap_or_default()
+    }
 }
 
 /// What a per-run launch adds.
@@ -683,6 +693,23 @@ fn strip_flag_values_where(args: &mut Vec<String>, flags: &[&str], managed: impl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_home_honors_explicit_home_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let ctx = LaunchCtx {
+            tool: Tool::Pi,
+            env: HashMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                ("USERPROFILE".into(), "other-home".into()),
+            ]),
+            cwd: dir.path().to_path_buf(),
+            args: Vec::new(),
+            auto_approve: false,
+        };
+        assert_eq!(ctx.home(), home);
+    }
 
     fn sv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

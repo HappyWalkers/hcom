@@ -2810,8 +2810,8 @@ mod tests {
     fn test_find_session_on_disk_attributes_shared_agent_dir_by_path_marker() {
         // The genuinely-shared PI_CODING_AGENT_DIR: attribution must key on the
         // path's product marker (.pi vs .omp), not on which tool's root list or
-        // probe order found it. hcom isolates managed configs as <root>/.pi and
-        // <root>/.omp, so the marker is present.
+        // probe order found it. Agent dirs conventionally sit under .pi or
+        // .omp, so the marker is present.
         let (_dir, _hcom, _home, _guard) = crate::hooks::test_helpers::isolated_test_env();
         let base = tempfile::tempdir().unwrap();
         unsafe {
@@ -3651,7 +3651,7 @@ mod tests {
         assert!(err.contains("UUID directly"), "got: {err}");
     }
 
-    /// Point claude_config_dir() at `dir` for the duration of `f` by setting
+    /// Point Claude's config dir at `dir` for the duration of `f` by setting
     /// CLAUDE_CONFIG_DIR. Restored on exit. serial_test required.
     fn with_claude_config_dir<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();

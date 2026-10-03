@@ -327,40 +327,23 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
     strip_legacy_args: None,
 };
 
-fn current_home_dir() -> std::path::PathBuf {
-    std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default())
-}
-
-fn pi_plugin_dir() -> std::path::PathBuf {
-    let tool_root = crate::runtime_env::tool_config_root();
-    let home = current_home_dir();
-    if tool_root == home {
-        if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR")
-            && !dir.is_empty()
-        {
-            return std::path::PathBuf::from(dir).join("extensions");
-        }
-        home.join(".pi").join("agent").join("extensions")
-    } else {
-        tool_root.join(".pi").join("extensions")
-    }
-}
-
+/// Ambient plugin path: `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, plus
+/// `extensions/hcom.ts`.
 pub fn get_pi_plugin_path() -> std::path::PathBuf {
-    pi_plugin_dir().join(PLUGIN_FILENAME)
+    effective_plugin_path(&LaunchCtx::ambient(crate::tool::Tool::Pi, false))
+}
+
+/// Older hcom installed to `<HCOM_DIR parent>/.pi/extensions/` under a
+/// project-local HCOM_DIR.
+fn project_local_legacy_path() -> Option<std::path::PathBuf> {
+    crate::runtime_env::legacy_tool_config_root()
+        .map(|root| root.join(".pi").join("extensions").join(PLUGIN_FILENAME))
 }
 
 fn effective_plugin_path(ctx: &LaunchCtx) -> std::path::PathBuf {
-    let agent_dir = ctx.path_var("PI_CODING_AGENT_DIR").unwrap_or_else(|| {
-        ctx.var("HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(dirs::home_dir)
-            .unwrap_or_default()
-            .join(".pi")
-            .join("agent")
-    });
+    let agent_dir = ctx
+        .path_var("PI_CODING_AGENT_DIR")
+        .unwrap_or_else(|| ctx.home().join(".pi").join("agent"));
     agent_dir.join("extensions").join(PLUGIN_FILENAME)
 }
 
@@ -378,14 +361,10 @@ fn prepare_per_run(ctx: &LaunchCtx) -> Result<RuntimeInjection> {
     })
 }
 
-/// Legacy installs went to the launch's agent dir, or to `<tool root>/.pi/`
-/// under a project-local HCOM_DIR ([`get_pi_plugin_path`]); check both.
+/// Legacy installs went to the launch's agent dir, or to `<HCOM_DIR parent>/.pi/`
+/// under a project-local HCOM_DIR; check both.
 fn cleanup_legacy_per_run(ctx: &LaunchCtx) -> Result<()> {
-    let mut paths = vec![effective_plugin_path(ctx)];
-    let installer_path = get_pi_plugin_path();
-    if !paths.contains(&installer_path) {
-        paths.push(installer_path);
-    }
+    let paths = std::iter::once(effective_plugin_path(ctx)).chain(project_local_legacy_path());
     crate::hooks::runtime::remove_owned_files(paths, is_hcom_owned)
 }
 
@@ -399,9 +378,10 @@ pub fn is_hcom_owned(path: &std::path::Path) -> std::io::Result<bool> {
 
 /// Remove hcom's plugin file. A user file with the same name is left alone.
 pub fn remove_pi_plugin() -> std::io::Result<()> {
-    let path = get_pi_plugin_path();
-    if is_hcom_owned(&path)? {
-        std::fs::remove_file(path)?;
+    for path in std::iter::once(get_pi_plugin_path()).chain(project_local_legacy_path()) {
+        if is_hcom_owned(&path)? {
+            std::fs::remove_file(path)?;
+        }
     }
     Ok(())
 }

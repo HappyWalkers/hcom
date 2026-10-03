@@ -123,12 +123,7 @@ pub(crate) fn resolve_codex_home_from_env(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir);
-    resolve_codex_home_from_env_with(
-        env,
-        launch_dir,
-        default_home.or_else(|| Some(crate::runtime_env::tool_config_root())),
-        cfg!(windows),
-    )
+    resolve_codex_home_from_env_with(env, launch_dir, default_home, cfg!(windows))
 }
 
 fn resolve_codex_home_from_env_with(

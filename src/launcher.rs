@@ -515,27 +515,6 @@ fn run_here_env_strip_set() -> std::collections::HashSet<String> {
     strip
 }
 
-fn isolated_tool_config_dir(tool: &LaunchTool) -> Option<std::path::PathBuf> {
-    let root = crate::runtime_env::tool_config_root();
-    if dirs::home_dir().as_deref() == Some(root.as_path()) {
-        return None;
-    }
-    let dirname = match tool.tool() {
-        crate::tool::Tool::Claude => ".claude",
-        crate::tool::Tool::Gemini | crate::tool::Tool::Antigravity => ".gemini",
-        crate::tool::Tool::Codex => ".codex",
-        crate::tool::Tool::Kilo => ".kilo",
-        crate::tool::Tool::Pi => ".pi",
-        crate::tool::Tool::Omp => ".omp",
-        crate::tool::Tool::Cursor => ".cursor",
-        crate::tool::Tool::Kimi => ".kimi",
-        crate::tool::Tool::Copilot => ".copilot",
-        crate::tool::Tool::Grok => ".grok",
-        crate::tool::Tool::OpenCode | crate::tool::Tool::Adhoc => return None,
-    };
-    Some(root.join(dirname))
-}
-
 /// Insert an environment override using the target platform's key semantics.
 /// Windows environment names are case-insensitive, while `HashMap` keys are
 /// not; remove an earlier spelling so the child receives one authoritative
@@ -585,13 +564,6 @@ fn ensure_tool_config_env(tool: &LaunchTool, env: &mut HashMap<String, String>) 
         .filter(|value| !value.is_empty())
     {
         insert_effective_env(env, env_var.to_string(), value, case_insensitive);
-    } else if let Some(config_dir) = isolated_tool_config_dir(tool) {
-        insert_effective_env(
-            env,
-            env_var.to_string(),
-            config_dir.to_string_lossy().to_string(),
-            case_insensitive,
-        );
     }
 }
 
@@ -3176,6 +3148,24 @@ mod tests {
             env.get("CODEX_HOME").map(String::as_str),
             Some("/isolated/codex-home")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_project_local_hcom_dir_does_not_redirect_tool_config() {
+        let _guard = EnvVarGuard::remove(vec![
+            "HCOM_DIR".to_string(),
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "CODEX_HOME".to_string(),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HCOM_DIR", dir.path().join(".hcom")) };
+
+        for tool in [LaunchTool::Claude, LaunchTool::Codex] {
+            let mut env = HashMap::new();
+            ensure_tool_config_env(&tool, &mut env);
+            assert!(env.is_empty(), "{tool:?} got {env:?}");
+        }
     }
 
     #[test]

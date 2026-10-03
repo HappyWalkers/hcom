@@ -608,9 +608,6 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
         args_env: Some("HCOM_OPENCODE_ARGS"),
         // OPENCODE_CONFIG_DIR is read by the plugin install/verify/remove path
         // in hooks/opencode.rs; surface it for the launch diagnostic dump.
-        // This does NOT enable launcher config-isolation: isolated_tool_config_dir
-        // returns None for OpenCode (it isolates via OPENCODE_RUN_ID/_PROCESS_ROLE),
-        // so the auto-isolation arm in launcher.rs stays a no-op for this tool.
         config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         initial_prompt: InitialPromptShape::Flag("--prompt"),
         uses_pty_default: true,
