@@ -296,6 +296,21 @@ mod tests {
         assert_eq!(server.client_count(), 1);
     }
 
+    /// Poll `f` until it returns true or a second passes; under load the
+    /// loopback connect and its bytes are not visible to the server instantly.
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if f() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn screen_queries_bypass_input_backpressure() {
@@ -303,31 +318,27 @@ mod tests {
         let mut text = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
         text.write_all(b"queued").unwrap();
         text.shutdown(Shutdown::Write).unwrap();
-        assert!(server.accept().unwrap());
-        assert!(matches!(
-            server.read_client_with_budget(0, 3).unwrap(),
-            InjectResult::Pending
-        ));
+        assert!(eventually(|| server.accept().unwrap()));
+        assert!(eventually(|| {
+            assert!(matches!(
+                server.read_client_with_budget(0, 3).unwrap(),
+                InjectResult::Pending
+            ));
+            server.clients[0].1.len() == 3
+        }));
         assert_eq!(server.clients[0].1, b"que");
         assert!(server.pollable_clients(0).is_empty());
 
         let mut query = TcpStream::connect(("127.0.0.1", server.port())).unwrap();
-        assert!(server.accept().unwrap());
+        assert!(eventually(|| server.accept().unwrap()));
         // Unclassified connections remain polled even before their first byte.
         assert_eq!(server.pollable_clients(0).len(), 1);
         query.write_all(b"\0SCREEN\n").unwrap();
         query.shutdown(Shutdown::Write).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            if matches!(
-                server.read_client_with_budget(1, 0).unwrap(),
-                InjectResult::Query(_)
-            ) {
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert!(eventually(|| matches!(
+            server.read_client_with_budget(1, 0).unwrap(),
+            InjectResult::Query(_)
+        )));
         assert!(
             matches!(server.read_client_with_budget(0, 6).unwrap(), InjectResult::Inject(text) if text == "queued")
         );
