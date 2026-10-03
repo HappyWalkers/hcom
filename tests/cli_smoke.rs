@@ -137,6 +137,19 @@ fn status_json_in_fresh_dir() {
 }
 
 #[test]
+fn status_clean_logs_displays_path() {
+    let h = Hcom::new();
+    let (code, stdout, _stderr) = h.run(["status"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("logs:      ✓ ok"));
+    let log_path = h.path().join(".tmp/logs/hcom.log");
+    assert!(
+        stdout.contains(&log_path.display().to_string()),
+        "stdout should contain log path: {stdout}"
+    );
+}
+
+#[test]
 fn list_json_empty() {
     let h = Hcom::new();
     let (code, stdout, _stderr) = h.run(["list", "--json"]);

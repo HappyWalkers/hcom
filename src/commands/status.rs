@@ -503,6 +503,7 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
         .get("warn_count")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
+    let log_path = hcom_dir.join(".tmp/logs/hcom.log");
     if error_count == 0 && warn_count == 0 {
         println!("logs:      \u{2713} ok");
     } else {
@@ -519,34 +520,33 @@ pub fn cmd_status(db: &HcomDb, args: &StatusArgs, _ctx: Option<&CommandContext>)
                 if warn_count != 1 { "s" } else { "" }
             ));
         }
-        let log_path = hcom_dir.join(".tmp/logs/hcom.log");
         if show_logs {
             println!("logs:      {} (1h)", parts.join(", "));
         } else {
             println!("logs:      {} (1h)  (hcom status --logs)", parts.join(", "));
         }
-        println!("           {}", log_path.display());
-        if show_logs {
-            let entries = crate::log::get_recent_logs(1.0, &["ERROR", "WARN"], 20);
-            for entry in &entries {
-                let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-                let level = entry
-                    .get("level")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("INFO");
-                let subsystem = entry
-                    .get("subsystem")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                if level == "ERROR" || level == "WARN" {
-                    let ts_short = if ts.len() > 8 {
-                        &ts[ts.len() - 8..]
-                    } else {
-                        ts
-                    };
-                    println!("           {ts_short} [{level:<5}] {subsystem}.{event}");
-                }
+    }
+    println!("           {}", log_path.display());
+    if show_logs {
+        let entries = crate::log::get_recent_logs(1.0, &["ERROR", "WARN"], 20);
+        for entry in &entries {
+            let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+            let level = entry
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("INFO");
+            let subsystem = entry
+                .get("subsystem")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            if level == "ERROR" || level == "WARN" {
+                let ts_short = if ts.len() > 8 {
+                    &ts[ts.len() - 8..]
+                } else {
+                    ts
+                };
+                println!("           {ts_short} [{level:<5}] {subsystem}.{event}");
             }
         }
     }
