@@ -163,7 +163,7 @@ fn is_block_border(line: &str) -> bool {
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
-    // Rewrites output sequences vt100 ignores (REP, HPA) before parsing.
+    // Rewrites output sequences vt100 ignores (REP, HPA, CHT, CBT) before parsing.
     vt_compat: super::vt_compat::VtCompat,
     // Current terminal dimensions, tracked independently of the parser so a
     // panicked parser can be rebuilt from scratch at the right size (see
@@ -317,9 +317,8 @@ impl ScreenTracker {
         // in an inconsistent state, so rebuild it from scratch rather than
         // keep using it — this drops the current screen contents, but the
         // next output chunk repopulates it.
-        let normalized = self.vt_compat.normalize(data);
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.parser.process(&normalized);
+            self.vt_compat.feed(&mut self.parser, data);
         }))
         .is_err()
         {

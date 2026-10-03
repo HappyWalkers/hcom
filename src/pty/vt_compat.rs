@@ -9,6 +9,10 @@
 //!
 //! - HPA `CSI n \`` (horizontal position absolute) → CHA `CSI n G`
 //! - REP `CSI n b` (repeat preceding graphic character) → the character n times
+//! - CHT `CSI n I` (cursor forward tabulation) → n HT
+//! - CBT `CSI n Z` (cursor backward tabulation) → CHA to the n-th earlier tab
+//!   stop, computed from the parser's cursor at that point (vt100 and the
+//!   tools both use fixed 8-column stops; agy resets them with `CSI ? 5 W`)
 
 /// Upper bound on a single REP expansion, so a hostile or corrupt count can't
 /// balloon memory. Far wider than any real terminal row.
@@ -16,6 +20,17 @@ const MAX_REPEAT: usize = 4096;
 
 /// Longest CSI sequence buffered before giving up and passing it through.
 const MAX_CSI_LEN: usize = 64;
+
+/// vt100's fixed tab stop interval.
+const TAB_WIDTH: u16 = 8;
+
+/// Rewritten output: bytes for the parser, or a backward tab that needs the
+/// parser's cursor position at that point.
+#[derive(Debug, PartialEq, Eq)]
+enum Chunk {
+    Bytes(Vec<u8>),
+    BackTab(u16),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -45,7 +60,23 @@ impl VtCompat {
         }
     }
 
-    pub(crate) fn normalize(&mut self, data: &[u8]) -> Vec<u8> {
+    /// Rewrite `data` and feed it to `parser`.
+    pub(crate) fn feed(&mut self, parser: &mut vt100::Parser, data: &[u8]) {
+        for chunk in self.rewrite(data) {
+            match chunk {
+                Chunk::Bytes(bytes) => parser.process(&bytes),
+                Chunk::BackTab(count) => {
+                    let (_, col) = parser.screen().cursor_position();
+                    let target = (0..count)
+                        .fold(col, |col, _| col.saturating_sub(1) / TAB_WIDTH * TAB_WIDTH);
+                    parser.process(format!("\x1b[{}G", target + 1).as_bytes());
+                }
+            }
+        }
+    }
+
+    fn rewrite(&mut self, data: &[u8]) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
         let mut out = Vec::with_capacity(data.len());
         for &b in data {
             match self.state {
@@ -88,7 +119,10 @@ impl VtCompat {
                 State::Csi => {
                     self.csi.push(b);
                     if (0x40..=0x7e).contains(&b) {
-                        self.finish_csi(&mut out);
+                        if let Some(count) = self.finish_csi(&mut out) {
+                            chunks.push(Chunk::Bytes(std::mem::take(&mut out)));
+                            chunks.push(Chunk::BackTab(count));
+                        }
                         self.state = State::Ground;
                     } else if self.csi.len() >= MAX_CSI_LEN {
                         out.extend_from_slice(b"\x1b[");
@@ -115,12 +149,24 @@ impl VtCompat {
             }
         }
         // A trailing partial CSI stays buffered in `self.csi` for the next call.
-        out
+        chunks.push(Chunk::Bytes(out));
+        chunks.retain(|c| *c != Chunk::Bytes(Vec::new()));
+        chunks
     }
 
-    fn finish_csi(&mut self, out: &mut Vec<u8>) {
+    /// Write the rewritten sequence to `out`, or return a backward-tab count
+    /// for the caller to resolve against the cursor.
+    fn finish_csi(&mut self, out: &mut Vec<u8>) -> Option<u16> {
         let (params, final_byte) = self.csi.split_at(self.csi.len() - 1);
         let plain = params.iter().all(|b| b.is_ascii_digit());
+        let count = || {
+            std::str::from_utf8(params)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1)
+                .min(MAX_REPEAT)
+        };
         match final_byte[0] {
             b'`' if plain => {
                 out.extend_from_slice(b"\x1b[");
@@ -128,21 +174,18 @@ impl VtCompat {
                 out.push(b'G');
             }
             b'b' if plain => {
-                let count = std::str::from_utf8(params)
-                    .ok()
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(1)
-                    .min(MAX_REPEAT);
-                for _ in 0..count {
+                for _ in 0..count() {
                     out.extend_from_slice(&self.last_char);
                 }
             }
+            b'I' if plain => out.extend(std::iter::repeat_n(b'\t', count())),
+            b'Z' if plain => return Some(count().min(u16::MAX as usize) as u16),
             _ => {
                 out.extend_from_slice(b"\x1b[");
                 out.extend_from_slice(&self.csi);
             }
         }
+        None
     }
 }
 
@@ -150,9 +193,57 @@ impl VtCompat {
 mod tests {
     use super::*;
 
+    /// Rewritten bytes, with back-tabs rendered as `<CBTn>`.
     fn norm(chunks: &[&[u8]]) -> Vec<u8> {
         let mut c = VtCompat::new();
-        chunks.iter().flat_map(|d| c.normalize(d)).collect()
+        let mut out = Vec::new();
+        for d in chunks {
+            for chunk in c.rewrite(d) {
+                match chunk {
+                    Chunk::Bytes(b) => out.extend(b),
+                    Chunk::BackTab(n) => out.extend(format!("<CBT{n}>").bytes()),
+                }
+            }
+        }
+        out
+    }
+
+    fn screen_after(rows: u16, cols: u16, data: &[u8]) -> (String, (u16, u16)) {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        VtCompat::new().feed(&mut parser, data);
+        let screen = parser.screen();
+        (screen.contents(), screen.cursor_position())
+    }
+
+    #[test]
+    fn splits_cbt_and_expands_cht() {
+        assert_eq!(norm(&[b"ab\x1b[5Zc\x1b[2Id"]), b"ab<CBT5>c\t\td");
+        assert_eq!(norm(&[b"\x1b[Z"]), b"<CBT1>");
+        assert_eq!(norm(&[b"\x1b[?2Z"]), b"\x1b[?2Z");
+    }
+
+    #[test]
+    fn backtab_moves_to_earlier_tab_stops() {
+        // From column 48: five stops back is column 8.
+        let (_, cursor) = screen_after(3, 69, b"\x1b[49G\x1b[5Z");
+        assert_eq!(cursor, (0, 8));
+        // From between stops, the first back-tab lands on the stop at or before.
+        let (_, cursor) = screen_after(3, 69, b"\x1b[13G\x1b[Z");
+        assert_eq!(cursor, (0, 8));
+        let (_, cursor) = screen_after(3, 69, b"\x1b[3G\x1b[9Z");
+        assert_eq!(cursor, (0, 0));
+    }
+
+    #[test]
+    fn agy_wake_echo_with_backtab_renders_in_place() {
+        // agy 1.2.16 echoing an injected wake: it repaints the model label two
+        // rows down, then returns with CUU + CBT instead of CUB.
+        let data = b"> <hcom>\n\n\x1b[38C\x1b[1K G\x1b[2A\x1b[5Z[inform #1] a -> b</hcom>";
+        let (contents, _) = screen_after(4, 69, data);
+        assert_eq!(
+            contents.lines().next(),
+            Some("> <hcom>[inform #1] a -> b</hcom>")
+        );
     }
 
     #[test]
