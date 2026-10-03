@@ -163,6 +163,8 @@ fn is_block_border(line: &str) -> bool {
 /// Screen tracker with vt100 emulation
 pub struct ScreenTracker {
     parser: vt100::Parser,
+    // Rewrites output sequences vt100 ignores (REP, HPA) before parsing.
+    vt_compat: super::vt_compat::VtCompat,
     // Current terminal dimensions, tracked independently of the parser so a
     // panicked parser can be rebuilt from scratch at the right size (see
     // `process`/`resize`).
@@ -226,6 +228,7 @@ impl ScreenTracker {
 
         let mut tracker = Self {
             parser: vt100::Parser::new(rows, cols, 0),
+            vt_compat: super::vt_compat::VtCompat::new(),
             rows,
             cols,
             ready_patterns: ready_patterns.to_vec(),
@@ -314,8 +317,9 @@ impl ScreenTracker {
         // in an inconsistent state, so rebuild it from scratch rather than
         // keep using it — this drops the current screen contents, but the
         // next output chunk repopulates it.
+        let normalized = self.vt_compat.normalize(data);
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.parser.process(data);
+            self.parser.process(&normalized);
         }))
         .is_err()
         {
@@ -452,11 +456,22 @@ impl ScreenTracker {
     }
 
     /// Antigravity-specific approval detection: the agy TUI renders permission
-    /// prompts as plain text in the prompt area ("Requesting permission for: …"
-    /// with a "1. Yes / 4. No" menu). No OSC9 fires, so scrape the screen.
-    /// Requires both the marker and either the question or the control footer
-    /// to avoid flipping on stray occurrences of the marker in scrollback.
+    /// prompts as plain text in the prompt area ("Requesting permission for: …",
+    /// a per-kind question such as "Run this command?", a "1. Yes … 4. No" menu
+    /// and a navigation footer). No OSC9 fires, so scrape the screen. Requires
+    /// the marker plus a question line or the dialog footer so a stray marker
+    /// in input, agent output or scrollback can't flip status to blocked.
     pub fn is_antigravity_approval_visible(&self) -> bool {
+        /// Question lines agy 1.2.x renders under the marker, by permission kind.
+        const QUESTIONS: &[&str] = &[
+            "Do you want to proceed?",
+            "Run this command?",
+            "Allow calling this tool?",
+            "Allow creation of this file?",
+            "Allow access to this file?",
+            "Allow administrator elevation?",
+            "Allow remote debugging?",
+        ];
         let screen = self.parser.screen();
         let (_rows, cols) = screen.size();
         let mut has_marker = false;
@@ -466,10 +481,10 @@ impl ScreenTracker {
             if line.contains("Requesting permission for:") {
                 has_marker = true;
             }
-            if line.contains("Do you want to proceed?") {
+            if QUESTIONS.contains(&line.trim()) {
                 has_question = true;
             }
-            if line.contains("tab Amend") && line.contains("edit command") {
+            if line.contains("tab Amend") || line.contains("\u{2191}/\u{2193} Navigate") {
                 has_footer = true;
             }
         }
@@ -1254,6 +1269,7 @@ mod tests {
     fn make_tracker_with(rows: u16, cols: u16, ready_patterns: &[&str]) -> ScreenTracker {
         ScreenTracker {
             parser: vt100::Parser::new(rows, cols, 0),
+            vt_compat: crate::pty::vt_compat::VtCompat::new(),
             rows,
             cols,
             ready_patterns: ready_patterns.iter().map(|p| p.to_string()).collect(),
@@ -1491,6 +1507,40 @@ mod tests {
             b"Requesting permission for: rm -rf /tmp/x\r\n  1. Yes\r\n  2. No\r\n  tab Amend . e edit command\r\n",
         );
         assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_run_command_dialog() {
+        // agy 1.2.16 run_command prompt, as rendered in a 69-column pane.
+        let mut t = make_tracker(21, 69, "");
+        t.process(
+            "Requesting permission for:\r\n   env | grep -E x\r\n\r\nRun this command?\r\n> 1. Yes, run command\r\n  4. No, cancel\r\n".as_bytes(),
+        );
+        assert!(t.is_antigravity_approval_visible());
+
+        let mut t = make_tracker(21, 69, "");
+        t.process(
+            "Requesting permission for:\r\n  ls\r\n  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command\r\n".as_bytes(),
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_question_in_chatter_does_not_trigger() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"Requesting permission for: x was mentioned. Run this command? maybe\r\n");
+        assert!(!t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn rep_and_hpa_keep_tracker_in_sync_with_terminal() {
+        // agy draws runs with REP and positions with HPA; vt100 ignores both, so
+        // without normalization the relative moves that follow land elsewhere.
+        let mut t = make_tool_tracker(4, 30, crate::tool::Tool::Antigravity);
+        t.process("\u{2500}\x1b[29b\r\n> \x1b[20`label\x1b[16`x\x1b[3D<\r\n".as_bytes());
+        let lines = t.get_screen_lines();
+        assert_eq!(lines[0], "\u{2500}".repeat(30));
+        assert_eq!(lines[1], ">            < x   label");
     }
 
     // ---- Cursor approval detection ----

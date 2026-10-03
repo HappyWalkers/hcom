@@ -15,6 +15,7 @@ pub mod screen;
 mod shared;
 #[cfg(unix)]
 mod terminal;
+mod vt_compat;
 #[cfg(windows)]
 mod win;
 
