@@ -251,6 +251,8 @@ const CODEX_HOOKS: &[&str] = &[
     "codex-sessionstart",
     "codex-userpromptsubmit",
     "codex-pretooluse",
+    // Unregistered; still routed so sessions launched before its removal
+    // get a no-op instead of a hook error.
     "codex-permissionrequest",
     "codex-posttooluse",
     "codex-stop",

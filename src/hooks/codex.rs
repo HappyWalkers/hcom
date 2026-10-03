@@ -38,11 +38,12 @@ const HCOM_TRIGGER: &str = "<hcom>";
 // `fork` is its own SessionStart source since Codex 0.155 (earlier releases
 // reported forks as `startup`); without it a forked session never binds hooks.
 //
-// PermissionRequest fires for every tool that asks for approval, so PostToolUse
-// must match every tool too, or an approved apply_patch/MCP call would leave the
-// row blocked until the next shell call. PreToolUse only feeds status detail.
-// A denied or aborted approval skips PostToolUse; Stop, Interrupt, and the next
-// PreToolUse clear it instead.
+// No PermissionRequest hook: it fires before Codex picks a reviewer, so under
+// auto-review it marked rows blocked while nobody was asked. The PTY's
+// "Action Required" title scrape owns approval state; it shows only for dialogs
+// a user must answer. PostToolUse matches every tool so an approved
+// apply_patch/MCP call still clears a block the PTY falling edge missed, and
+// delivers mid-turn. PreToolUse only feeds status detail.
 const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
     (
         "SessionStart",
@@ -55,7 +56,6 @@ const CODEX_HOOK_COMMANDS: &[(&str, &str, Option<&str>)] = &[
         "codex-pretooluse",
         Some("Bash|apply_patch|spawn_agent"),
     ),
-    ("PermissionRequest", "codex-permissionrequest", None),
     ("PostToolUse", "codex-posttooluse", None),
     ("Stop", "codex-stop", None),
     ("Interrupt", "codex-interrupt", None),
@@ -859,43 +859,9 @@ fn handle_pretooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> H
     hook_noop()
 }
 
-/// Approval blocks set by PermissionRequest or by the PTY's approval scrape.
+/// Approval blocks set by the PTY's approval scrape.
 fn is_approval_block(instance: &InstanceRow) -> bool {
-    instance.status == ST_BLOCKED
-        && matches!(
-            instance.status_context.as_str(),
-            "approval" | "pty:approval"
-        )
-}
-
-/// Observe an approval prompt without deciding it: no output means Codex falls
-/// through to its reviewer or the user.
-fn handle_permissionrequest(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
-    let instance = match resolve_and_update_codex_instance(db, ctx, payload) {
-        Some(instance) => instance,
-        None => return hook_noop(),
-    };
-
-    // Keep the PTY's context when it saw the prompt first, so its falling edge
-    // still owns the release.
-    let context = if instance.status == ST_BLOCKED && instance.status_context == "pty:approval" {
-        "pty:approval"
-    } else {
-        "approval"
-    };
-    let detail = family::extract_tool_detail("codex", &payload.tool_name, &payload.tool_input);
-    lifecycle::set_status(
-        db,
-        &instance.name,
-        ST_BLOCKED,
-        context,
-        lifecycle::StatusUpdate {
-            detail: &detail,
-            tool_name: &payload.tool_name,
-            ..Default::default()
-        },
-    );
-    hook_noop()
+    instance.status == ST_BLOCKED && instance.status_context == "pty:approval"
 }
 
 fn handle_posttooluse(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> HookResult {
@@ -954,7 +920,6 @@ fn get_codex_handler(hook_name: &str) -> Option<CodexHookHandler> {
         "codex-sessionstart" => Some(handle_sessionstart),
         "codex-userpromptsubmit" => Some(handle_userpromptsubmit),
         "codex-pretooluse" => Some(handle_pretooluse),
-        "codex-permissionrequest" => Some(handle_permissionrequest),
         "codex-posttooluse" => Some(handle_posttooluse),
         "codex-stop" => Some(handle_stop),
         "codex-interrupt" => Some(handle_interrupt),
