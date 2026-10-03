@@ -70,8 +70,9 @@ pub static PER_RUN: PerRunAdapter = PerRunAdapter {
 };
 
 fn per_run_home(ctx: &LaunchCtx) -> PathBuf {
-    ctx.path_var("CODEX_HOME")
-        .unwrap_or_else(|| ctx.home().join(".codex"))
+    crate::tools::codex_preprocessing::resolve_codex_home_from_env(&ctx.env, &ctx.cwd)
+        .map(|(path, _)| path)
+        .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
 fn parse_override(raw: &str) -> AnyResult<(String, toml::Value)> {
@@ -1040,12 +1041,7 @@ pub fn dispatch_codex_hook_native(hook_name: &str) -> i32 {
 /// Priority: CODEX_HOME env var → ~/.codex
 #[cfg(test)]
 fn codex_config_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("CODEX_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
-    }
-    crate::runtime_env::tool_home().join(".codex")
+    per_run_home(&LaunchCtx::ambient(crate::tool::Tool::Codex, false))
 }
 
 /// Get path to Codex config.toml.
@@ -1583,8 +1579,17 @@ fn remove_codex_hooks_from_dir(base: &std::path::Path) -> bool {
 /// Cleans the default (~/.codex), env-var (CODEX_HOME), and legacy
 /// `<HCOM_DIR parent>/.codex` paths.
 pub fn remove_codex_hooks() -> bool {
-    crate::runtime_env::tool_config_cleanup_dirs(".codex", "CODEX_HOME")
-        .iter()
+    let mut dirs = crate::runtime_env::tool_config_cleanup_dirs(".codex", "CODEX_HOME");
+    // Codex uses the platform profile on Windows, unlike HOME-preferring tools.
+    // Keep the old HOME path in the cleanup list for installs made by older hcom.
+    let mut ctx = LaunchCtx::ambient(crate::tool::Tool::Codex, false);
+    ctx.env
+        .retain(|key, _| !key.eq_ignore_ascii_case("CODEX_HOME"));
+    let default_dir = per_run_home(&ctx);
+    if !dirs.contains(&default_dir) {
+        dirs.push(default_dir);
+    }
+    dirs.iter()
         .filter(|dir| !remove_codex_hooks_from_dir(dir))
         .count()
         == 0
@@ -1608,6 +1613,18 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             auto_approve: false,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn per_run_default_home_ignores_msys_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = per_run_ctx(&[], dir.path());
+        ctx.env = HashMap::from([(
+            "HOME".to_string(),
+            dir.path().join("msys-home").to_string_lossy().into_owned(),
+        )]);
+        assert_eq!(per_run_home(&ctx), dirs::home_dir().unwrap().join(".codex"));
     }
 
     #[test]
