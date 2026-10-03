@@ -298,6 +298,7 @@ mod tests {
 
     /// Poll `f` until it returns true or a second passes; under load the
     /// loopback connect and its bytes are not visible to the server instantly.
+    #[cfg(unix)]
     fn eventually(mut f: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
