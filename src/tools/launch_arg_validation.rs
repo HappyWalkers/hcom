@@ -49,6 +49,24 @@ pub(crate) const KIMI_REJECTED_ARGS: &[RejectedArg] = &[
     },
 ];
 
+pub(crate) const QODER_REJECTED_ARGS: &[RejectedArg] = &[
+    RejectedArg {
+        token: "-p",
+        reason: "runs one prompt non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--print",
+        reason: "runs one prompt non-interactively and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--acp",
+        reason: "starts an ACP server instead of the interactive TUI",
+        kind: RejectedArgKind::Flag,
+    },
+];
+
 pub(crate) const OPENCODE_REJECTED_ARGS: &[RejectedArg] = &[
     RejectedArg {
         token: "run",
@@ -227,6 +245,7 @@ mod tests {
     fn benign_flags_pass() {
         for (tool, invocation, rejected) in [
             ("Kimi", "hcom kimi", KIMI_REJECTED_ARGS),
+            ("Qoder", "hcom qoder", QODER_REJECTED_ARGS),
             ("OpenCode", "hcom opencode", OPENCODE_REJECTED_ARGS),
             ("Kilo", "hcom kilo", KILO_REJECTED_ARGS),
             ("Pi", "hcom pi", PI_REJECTED_ARGS),

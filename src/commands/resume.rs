@@ -20,7 +20,7 @@ use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::ST_INACTIVE;
-use crate::transcript::claude_projects_dir;
+use crate::transcript::{claude_projects_dir, qoder_projects_dir};
 
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
@@ -1090,6 +1090,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         crate::tool::Tool::Cursor => merge_cursor_args(original, resume),
         crate::tool::Tool::Kimi => merge_kimi_args(original, resume),
         crate::tool::Tool::Copilot => merge_copilot_args(original, resume),
+        crate::tool::Tool::Qoder => merge_qoder_args(original, resume),
         crate::tool::Tool::Grok => merge_grok_args(original, resume),
         crate::tool::Tool::Pi => merge_pi_args(original, resume),
         crate::tool::Tool::Omp => merge_omp_args(original, resume),
@@ -1240,6 +1241,150 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
             }
         } else {
             // Drop bare positional task prompt from original launch.
+            i += 1;
+        }
+    }
+
+    let mut result = resume.to_vec();
+    result.extend(filtered_original);
+    result
+}
+
+/// Merge qoder original launch args with resume args.
+///
+/// qoder launch_args bake in `HCOM_QODER_ARGS` (e.g. `--model Qwen3.8-Flash`)
+/// plus the `--prompt-interactive <initial-prompt>` from the launcher. On
+/// resume: drop the session selectors (`--resume`, `--session-id`,
+/// `--continue`, `--fork-session`), `-i`/`--prompt-interactive` and its value,
+/// and any positional prompt (bare or after `--`). Also drop `--cwd`/`-w` and
+/// `--worktree [name]`: hcom relaunches in the directory the session ended up
+/// in, so replaying them would move it again or start another worktree. Keep
+/// the rest. A value flag also given in the resume args takes the resume value,
+/// whichever of its short and long spellings each side used.
+fn merge_qoder_args(original: &[String], resume: &[String]) -> Vec<String> {
+    // Every qodercli flag that takes a value (single token). Needed so a
+    // flag's value is never mistaken for a bare positional and dropped.
+    const VALUE_FLAGS: &[&str] = &[
+        "--model",
+        "-m",
+        "--reasoning-effort",
+        "--thinking",
+        "--thinking-budget",
+        "--context-window",
+        "--config-dir",
+        "--permission-mode",
+        "--allowed-mcp-server-names",
+        "--tools",
+        "--allowed-tools",
+        "--disallowed-tools",
+        "--attachment",
+        "--plugin-dir",
+        "--name",
+        "-n",
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--append-system-prompt",
+        "--system-prompt",
+        "--output-style",
+        "--mcp-config",
+        "--settings",
+        "--setting-sources",
+        "--max-model-request-retries",
+        "--max-turns",
+        "--max-output-tokens",
+        "--output-format",
+        "-o",
+        "--input-format",
+    ];
+    // `--worktree` takes an optional name; the others always take a value.
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--resume",
+        "-r",
+        "--session-id",
+        "-i",
+        "--prompt-interactive",
+        "--cwd",
+        "-w",
+        "--worktree",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "-c", "--fork-session"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+    let bare_of = |token: &str| match token.find('=') {
+        Some(pos) => (token[..pos].to_string(), true),
+        None => (token.to_string(), false),
+    };
+    // Short and long spellings of one flag must override each other.
+    let canonical = |bare: &str| {
+        match bare {
+            "-m" => "--model",
+            "-n" => "--name",
+            "-o" => "--output-format",
+            other => other,
+        }
+        .to_string()
+    };
+
+    let mut resume_flags: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skip_next = false;
+    for token in resume {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if token == "--" {
+            break;
+        }
+        if is_flag(token) {
+            let (bare, has_eq_value) = bare_of(token);
+            if VALUE_FLAGS.contains(&bare.as_str()) {
+                skip_next = !has_eq_value;
+            }
+            if !DROP_WITH_VALUE.contains(&bare.as_str()) && !DROP_BOOLEAN.contains(&bare.as_str()) {
+                resume_flags.insert(canonical(&bare));
+            }
+        }
+    }
+
+    let mut filtered_original: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        // The launch prompt follows `--`, whatever it looks like: drop it all.
+        if token == "--" {
+            break;
+        }
+        if is_flag(token) {
+            let (bare, has_eq_value) = bare_of(token);
+            if DROP_WITH_VALUE.contains(&bare.as_str()) {
+                i += 1;
+                if !has_eq_value && i < original.len() && !is_flag(&original[i]) {
+                    i += 1;
+                }
+                continue;
+            }
+            if DROP_BOOLEAN.contains(&bare.as_str()) {
+                i += 1;
+                continue;
+            }
+            let takes_value = VALUE_FLAGS.contains(&bare.as_str()) && !has_eq_value;
+            // `--add-dir` repeats; the others are singular.
+            if resume_flags.contains(&canonical(&bare)) && bare != "--add-dir" {
+                i += 1;
+                if takes_value && i < original.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            filtered_original.push(token.clone());
+            i += 1;
+            if takes_value && i < original.len() {
+                filtered_original.push(original[i].clone());
+                i += 1;
+            }
+        } else {
+            // A bare positional is the launch prompt: drop it.
             i += 1;
         }
     }
@@ -1952,6 +2097,11 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
+    // 6b. Qoder (Claude-format transcripts under its own config dir)
+    if let Some(path) = derive_qoder_transcript_path(session_id) {
+        return Some(("qoder".to_string(), Some(path)));
+    }
+
     // 7. Copilot
     if let Some(path) = derive_copilot_transcript_path(session_id) {
         let tool = detect_agent_type(&path).to_string();
@@ -2163,6 +2313,18 @@ fn derive_cursor_transcript_path(session_id: &str) -> Option<String> {
     None
 }
 
+/// Locate a Qoder CLI transcript by session UUID:
+/// `<QODER_CONFIG_DIR or ~/.qoder>/projects/<slug>/<uuid>.jsonl`.
+fn derive_qoder_transcript_path(session_id: &str) -> Option<String> {
+    let projects = qoder_projects_dir();
+    std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(format!("{session_id}.jsonl")))
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
 /// Locate a Copilot CLI transcript by session UUID.
 /// Copilot stores transcripts at `$COPILOT_HOME/session-state/<uuid>/events.jsonl`
 /// where `COPILOT_HOME` defaults to `~/.copilot`.
@@ -2253,7 +2415,10 @@ fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
 ///   scan the first few lines for it.
 fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     match tool {
-        "claude" => scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str())),
+        // Qoder transcripts are Claude-format: `cwd` rides on the first user record.
+        "claude" | "qoder" => {
+            scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str()))
+        }
         "codex" => scan_lines_for_cwd(path, 1, |v| {
             v.get("payload")
                 .and_then(|p| p.get("cwd"))
@@ -2408,6 +2573,7 @@ fn build_adopt_plan(
                  - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
                  - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
+                 - Qoder:    ~/.qoder/projects/*/{sid}.jsonl\n  \
                  - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
                  - Grok:     {grok}/*/{sid}/updates.jsonl\n  \
                  - Oh My Pi: ~/.omp/agent/sessions/**/*{sid}*.jsonl
@@ -4004,6 +4170,121 @@ mod tests {
         let resume = s(&["--resume", "sess-1"]);
         let merged = merge_resume_args("grok", &original, &resume);
         assert_eq!(merged, s(&["--resume", "sess-1", "--model", "grok-4"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_qoder_resume_and_fork() {
+        assert_eq!(
+            build_resume_args("qoder", "sess-abc", false),
+            s(&["--resume", "sess-abc"])
+        );
+        assert_eq!(
+            build_resume_args("qoder", "sess-abc", true),
+            s(&["--resume", "sess-abc", "--fork-session"])
+        );
+    }
+
+    #[test]
+    fn test_merge_qoder_args_drops_prompt_and_selectors_keeps_flags() {
+        let original = s(&[
+            "--model",
+            "Qwen3.8-Flash",
+            "--permission-mode=accept_edits",
+            "--resume",
+            "old",
+            "--fork-session",
+            "-i",
+            "do a task",
+            "--",
+            "-x looks like a flag",
+        ]);
+        let resume = s(&["--resume", "sess-abc", "--fork-session"]);
+        let merged = merge_resume_args("qoder", &original, &resume);
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "sess-abc",
+                "--fork-session",
+                "--model",
+                "Qwen3.8-Flash",
+                "--permission-mode=accept_edits",
+            ])
+        );
+    }
+
+    #[test]
+    fn test_merge_qoder_args_resume_model_wins_and_value_not_orphaned() {
+        let original = s(&[
+            "--model",
+            "Qwen3.8-Flash",
+            "--add-dir",
+            "/a",
+            "--name",
+            "n1",
+        ]);
+        let resume = s(&["--resume", "sess-abc", "-m", "other", "--name", "n2"]);
+        let merged = merge_resume_args("qoder", &original, &resume);
+        // The resume `-m` replaces the original `--model`; the shared `--name`
+        // keeps only the resume value and nothing is left orphaned.
+        assert!(!merged.contains(&"--model".to_string()));
+        assert!(!merged.contains(&"Qwen3.8-Flash".to_string()));
+        assert_eq!(merged.iter().filter(|t| t.as_str() == "--name").count(), 1);
+        assert!(merged.contains(&"n2".to_string()));
+        assert!(!merged.contains(&"n1".to_string()));
+        let at = merged.iter().position(|t| t == "--add-dir").unwrap();
+        assert_eq!(merged[at + 1], "/a");
+    }
+
+    #[test]
+    fn test_merge_qoder_args_drops_saved_cwd_and_worktree() {
+        let original = s(&[
+            "--cwd",
+            "sub",
+            "--worktree",
+            "feature-a",
+            "-w=other",
+            "--worktree",
+            "--model",
+            "Qwen3.8-Flash",
+        ]);
+        let resume = s(&["--resume", "sess-abc"]);
+        assert_eq!(
+            merge_resume_args("qoder", &original, &resume),
+            s(&["--resume", "sess-abc", "--model", "Qwen3.8-Flash"])
+        );
+        // A directory chosen at resume time is the caller's and is kept.
+        let resume = s(&["--resume", "sess-abc", "--cwd", "elsewhere"]);
+        assert_eq!(
+            merge_resume_args("qoder", &original, &resume),
+            s(&[
+                "--resume",
+                "sess-abc",
+                "--cwd",
+                "elsewhere",
+                "--model",
+                "Qwen3.8-Flash"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_extract_cwd_qoder_from_first_user_record() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            concat!(
+                r#"{"type":"workspace-directories","sessionId":"abc","directories":[]}"#,
+                "\n",
+                r#"{"type":"runtime-config","sessionId":"abc"}"#,
+                "\n",
+                r#"{"type":"user","cwd":"/home/user/proj","sessionId":"abc","message":{"role":"user","content":"hi"}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let cwd = extract_cwd_from_transcript(file.path().to_str().unwrap(), "qoder");
+        assert_eq!(cwd, Some("/home/user/proj".to_string()));
     }
 
     #[test]
