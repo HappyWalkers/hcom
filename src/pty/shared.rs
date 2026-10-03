@@ -24,7 +24,7 @@ use crate::delivery::{
 };
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
-use crate::shared::{ST_BLOCKED, ST_LISTENING};
+use crate::shared::{ST_ACTIVE, ST_BLOCKED};
 use crate::tool::Tool;
 
 use super::PtyTarget;
@@ -353,10 +353,14 @@ pub(super) fn publish_approval_status(
 
     // Resolve the approval edge to publish: block on the rising edge, release
     // on the falling edge, and stay silent when the row already matches.
+    // Answering a dialog hands control back to the running turn (the approved
+    // tool runs, or the model reacts to the denial), so release to active; the
+    // tool's turn-end hook sets listening. Releasing to listening let the PTY
+    // gate inject a wake mid-turn.
     let edge = if approval {
         (!already_blocked).then_some((ST_BLOCKED, "pty:approval"))
     } else {
-        already_blocked.then_some((ST_LISTENING, "pty:approval_cleared"))
+        already_blocked.then_some((ST_ACTIVE, "pty:approval_cleared"))
     };
     let Some((status, context)) = edge else {
         // No transition to publish. Still reflect a standing block in the

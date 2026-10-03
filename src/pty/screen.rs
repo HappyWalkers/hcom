@@ -459,8 +459,9 @@ impl ScreenTracker {
     /// prompts as plain text in the prompt area ("Requesting permission for: …",
     /// a per-kind question such as "Run this command?", a "1. Yes … 4. No" menu
     /// and a navigation footer). No OSC9 fires, so scrape the screen. Requires
-    /// the marker plus a question line or the dialog footer so a stray marker
-    /// in input, agent output or scrollback can't flip status to blocked.
+    /// two of marker, exact question line and dialog footer, so a stray marker
+    /// or question in input, agent output or scrollback can't flip status to
+    /// blocked.
     pub fn is_antigravity_approval_visible(&self) -> bool {
         /// Question lines agy 1.2.x renders under the marker, by permission kind.
         const QUESTIONS: &[&str] = &[
@@ -488,7 +489,9 @@ impl ScreenTracker {
                 has_footer = true;
             }
         }
-        has_marker && (has_question || has_footer)
+        // A long command can push the marker off the top of a short pane; the
+        // exact question line plus the dialog footer is the dialog on its own.
+        (has_marker && (has_question || has_footer)) || (has_question && has_footer)
     }
 
     /// Cursor-specific approval detection: cursor renders a shell-command
@@ -1521,6 +1524,15 @@ mod tests {
         let mut t = make_tracker(21, 69, "");
         t.process(
             "Requesting permission for:\r\n  ls\r\n  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command\r\n".as_bytes(),
+        );
+        assert!(t.is_antigravity_approval_visible());
+    }
+
+    #[test]
+    fn antigravity_detects_dialog_with_marker_scrolled_off() {
+        let mut t = make_tracker(6, 69, "");
+        t.process(
+            "Run this command?\r\n> 1. Yes, run command\r\n  4. No, cancel\r\n\r\n  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command\r\nesc to cancel".as_bytes(),
         );
         assert!(t.is_antigravity_approval_visible());
     }
