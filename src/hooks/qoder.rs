@@ -145,11 +145,26 @@ pub fn remove_qoder_hooks() -> bool {
 // ── Handlers ────────────────────────────────────────────────────────────
 
 fn resolve_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> Option<InstanceRow> {
+    if ctx
+        .raw_env
+        .get("HCOM_TOOL")
+        .is_some_and(|tool| tool != "qoder")
+    {
+        return None;
+    }
+    // Validate both owners: process resolution takes precedence over session
+    // resolution and must not hide a session belonging to another tool.
+    if instance_binding::resolve_instance_from_binding(db, payload.session_id.as_deref(), None)
+        .is_some_and(|instance| instance.tool != "qoder")
+    {
+        return None;
+    }
     instance_binding::resolve_instance_from_binding(
         db,
         payload.session_id.as_deref(),
         ctx.process_id.as_deref(),
     )
+    .filter(|instance| instance.tool == "qoder")
 }
 
 fn update_position(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload, instance_name: &str) {
@@ -273,10 +288,8 @@ fn resolved_instance(db: &HcomDb, ctx: &HcomContext, payload: &HookPayload) -> O
         (None, _) => true,
         _ => false,
     };
-    if stale
-        && ctx.process_id.is_some()
-        && let Some(name) = bind_session(db, ctx, payload)
-    {
+    if stale {
+        let name = bind_session(db, ctx, payload)?;
         lifecycle::set_status(db, &name, ST_LISTENING, "start", Default::default());
         instance = db.get_instance_full(&name).ok().flatten();
     }
@@ -775,6 +788,84 @@ mod tests {
             .into_iter()
             .collect();
         HcomContext::from_env(&env, dir.to_path_buf())
+    }
+
+    #[test]
+    fn hooks_refuse_foreign_owners_and_rejected_rebinding() {
+        for incoming in ["own-sid", "new-sid"] {
+            let (dir, db) = db_with_instance("own-sid");
+            db.conn()
+                .execute(
+                    "UPDATE instances SET tool = 'claude' WHERE name = 'memo'",
+                    [],
+                )
+                .unwrap();
+            let ctx = hook_ctx(dir.path());
+            for event in [
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "Stop",
+                "SessionEnd",
+            ] {
+                let payload = HookPayload::from_qoder(
+                    event,
+                    json!({
+                        "session_id": incoming, "cwd": "/wrong", "reason": "exit",
+                        "tool_name": "Bash", "tool_input": {"command": "echo wrong"}
+                    }),
+                );
+                let command = format!("qoder-{}", event.to_lowercase());
+                let (output, ack) = route(&db, &ctx, &command, &payload);
+                assert_eq!(output, json!({}), "{event}");
+                assert!(ack.is_none());
+                let row = db.get_instance_full("memo").unwrap().unwrap();
+                assert_eq!(row.session_id.as_deref(), Some("own-sid"));
+                assert_eq!(row.status, ST_LISTENING);
+                assert_ne!(row.directory, "/wrong");
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_session_owner_cannot_replace_qoder_process_session() {
+        let (dir, db) = db_with_instance("own-sid");
+        db.conn().execute(
+            "INSERT INTO instances (name, tool, status, status_time, created_at, session_id) VALUES ('other', 'claude', 'listening', 0, 0, 'foreign-sid')", []
+        ).unwrap();
+        db.set_process_binding("foreign-proc", "foreign-sid", "other")
+            .unwrap();
+        db.rebind_instance_session("other", "foreign-sid").unwrap();
+        let payload = HookPayload::from_qoder(
+            "UserPromptSubmit",
+            json!({
+                "session_id": "foreign-sid", "cwd": "/wrong"
+            }),
+        );
+        assert!(resolved_instance(&db, &hook_ctx(dir.path()), &payload).is_none());
+        let row = db.get_instance_full("memo").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("own-sid"));
+        assert_eq!(
+            db.get_session_binding("foreign-sid").unwrap().as_deref(),
+            Some("other")
+        );
+    }
+
+    #[test]
+    fn lazy_binding_rejection_preserves_existing_qoder_instance() {
+        let (dir, db) = db_with_instance("own-sid");
+        let mut ctx = hook_ctx(dir.path());
+        ctx.raw_env.insert("HCOM_TOOL".into(), "claude".into());
+        let payload = HookPayload::from_qoder(
+            "UserPromptSubmit",
+            json!({
+                "session_id": "new-sid", "cwd": "/wrong"
+            }),
+        );
+        assert!(resolved_instance(&db, &ctx, &payload).is_none());
+        let row = db.get_instance_full("memo").unwrap().unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("own-sid"));
+        assert_eq!(row.status, ST_LISTENING);
     }
 
     #[test]

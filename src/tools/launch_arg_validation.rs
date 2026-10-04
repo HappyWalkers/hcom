@@ -65,6 +65,31 @@ pub(crate) const QODER_REJECTED_ARGS: &[RejectedArg] = &[
         reason: "starts an ACP server instead of the interactive TUI",
         kind: RejectedArgKind::Flag,
     },
+    RejectedArg {
+        token: "--remote",
+        reason: "creates a cloud session and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--remote-control",
+        reason: "starts a headless remote-control worker",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--list-sessions",
+        reason: "lists sessions and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--delete-session",
+        reason: "deletes a session and exits",
+        kind: RejectedArgKind::Flag,
+    },
+    RejectedArg {
+        token: "--list-models",
+        reason: "lists models instead of starting an interactive agent",
+        kind: RejectedArgKind::Flag,
+    },
 ];
 
 pub(crate) const OPENCODE_REJECTED_ARGS: &[RejectedArg] = &[
@@ -228,6 +253,30 @@ pub(crate) fn validate_rejected_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qoder_rejects_modes_without_an_interactive_agent() {
+        for flag in [
+            "--remote",
+            "--remote=task",
+            "--remote-control",
+            "--list-sessions",
+            "--delete-session",
+            "--list-models",
+        ] {
+            assert_eq!(
+                validate_rejected_args(
+                    "Qoder",
+                    "hcom qoder",
+                    &[flag.to_string()],
+                    QODER_REJECTED_ARGS
+                )
+                .len(),
+                1,
+                "{flag}"
+            );
+        }
+    }
 
     #[test]
     fn long_flags_match_equals_form() {

@@ -146,7 +146,7 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
     ),
     (
         "HCOM_AUTO_TRUST_WORKSPACE",
-        "Auto-inject ephemeral workspace trust for gemini/codex/cursor at launch (true/false)",
+        "Auto-approve workspace trust at launch; may persist in tool config (true/false)",
         "boolean",
     ),
     (

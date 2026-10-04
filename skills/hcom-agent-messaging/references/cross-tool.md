@@ -76,7 +76,8 @@ Verified behavior when mixing different AI coding tools via hcom.
 - **Status**: `blocked: approval` from the `permission_prompt` notification, cleared when the tool call finishes.
 - **Resume/Fork**: `--resume <id>` / `--resume <id> --fork-session`
 - **Transcript**: Claude-format JSONL at `$QODER_CONFIG_DIR/projects/<slug>/<session-id>.jsonl` (default `~/.qoder`).
-- **Rejected flags**: `-p`/`--print` (one-shot) and `--acp`.
+- **System prompt**: `--hcom-system-prompt` maps to Qoder’s `--system-prompt` and is preserved on resume/fork.
+- **Rejected flags**: `-p`/`--print` (one-shot), `--acp`, `--remote`, `--remote-control`, `--list-sessions`, `--delete-session`, and `--list-models` (non-interactive modes).
 - **Not covered**: Qoder subagent events (SubagentStart/SubagentStop).
 
 ### Grok Build

@@ -1253,6 +1253,7 @@ fn qoder_e2e_hook_dispatch() {
     let mut start_cmd = h.cmd();
     start_cmd.arg("start");
     start_cmd.env("HCOM_PROCESS_ID", pid);
+    start_cmd.env("QODER_CLI", "1");
     let start_out = start_cmd.output().expect("failed to run hcom start");
     let me = support::parse_hcom_marker(&String::from_utf8_lossy(&start_out.stdout))
         .expect("no [hcom:NAME] marker");

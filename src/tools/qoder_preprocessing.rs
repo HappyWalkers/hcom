@@ -12,6 +12,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde_json::{Value, json};
 
+/// Apply hcom's explicit system prompt and persist it with the launch args.
+pub(crate) fn apply_system_prompt(args: &mut Vec<String>, prompt: Option<&str>) {
+    if let Some(prompt) = prompt {
+        crate::hooks::runtime::take_flag_values(args, &["--system-prompt"]);
+        crate::hooks::runtime::insert_before_separator(
+            args,
+            ["--system-prompt".to_string(), prompt.to_string()],
+        );
+    }
+}
+
 /// Last value of `--flag value` / `--flag=value` before any `--` separator.
 fn flag_value<'a>(args: &'a [String], names: &[&str]) -> Option<&'a str> {
     let mut found = None;
@@ -170,6 +181,29 @@ pub(crate) fn ensure_qoder_workspace_trusted(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_replaces_native_value_before_separator() {
+        let mut args = ["--system-prompt=old", "--model", "m", "--", "query"]
+            .map(String::from)
+            .to_vec();
+        apply_system_prompt(&mut args, Some("new prompt"));
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "m",
+                "--system-prompt",
+                "new prompt",
+                "--",
+                "query"
+            ]
+            .map(String::from)
+        );
+        let saved = args.clone();
+        apply_system_prompt(&mut args, None);
+        assert_eq!(args, saved);
+    }
 
     /// The shape Qoder itself writes (sorted keys, 2-space indent, no trailing newline).
     const QODER_WRITTEN: &str = r#"{

@@ -1802,6 +1802,13 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         crate::tools::codex_preprocessing::ensure_codex_home_writable_at(path, explicit_env)?;
     }
 
+    if matches!(normalized, LaunchTool::Qoder) {
+        qoder_preprocessing::apply_system_prompt(&mut params.args, params.system_prompt.as_deref());
+        if let Some(args) = params.persisted_args.as_mut() {
+            qoder_preprocessing::apply_system_prompt(args, params.system_prompt.as_deref());
+        }
+    }
+
     // Hooks: per-run tools get a fresh injection built from the effective env,
     // cwd and args (applied to args after the persisted snapshot below);
     // persistent tools must have their global install (strict: refuse to launch

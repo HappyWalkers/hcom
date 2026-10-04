@@ -854,9 +854,10 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
         custom_initial_prompt,
     } = input;
 
-    // Codex tracked-instance fork identity reset belongs in the initial prompt.
+    // Codex and Qoder fork identity resets belong in the initial prompt.
+    // Qoder must preserve its saved system prompt across resume/fork.
     // Adoption-fork has no prior hcom identity, so normal bootstrap handles it.
-    let initial_prompt = if fork && tool == "codex" && !is_adoption {
+    let initial_prompt = if fork && matches!(tool, "codex" | "qoder") && !is_adoption {
         let child_name = child_name.expect("tracked fork child name should be available");
         let child_display = effective_tag
             .map(|tag| format!("{tag}-{child_name}"))
@@ -874,6 +875,12 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
             }
             _ => identity_reset,
         })
+    } else if tool == "qoder" && !is_adoption {
+        let identity = resume_system_prompt(tool, display_name, false, None);
+        Some(match custom_initial_prompt {
+            Some(prompt) => format!("{identity}\n\n{prompt}"),
+            None => identity,
+        })
     } else {
         custom_initial_prompt.map(ToString::to_string)
     };
@@ -881,7 +888,7 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
     // System prompt:
     // - Tracked-instance resume/fork: identity-carrying prompt (existing behavior).
     // - Adoption: None — SessionStart issues the normal fresh-launch bootstrap.
-    let base_system_prompt = if is_adoption {
+    let base_system_prompt = if is_adoption || tool == "qoder" {
         None
     } else {
         Some(resume_system_prompt(tool, display_name, fork, child_name))
@@ -897,7 +904,7 @@ fn build_resume_prompts(input: ResumePromptInput<'_>) -> (Option<String>, Option
 
     // Codex tracked-instance fork uses initial_prompt for an identity reset;
     // don't dilute it with a reply-handoff suffix. Adoption-fork has no reset.
-    let append_reply_handoff = !(fork && tool == "codex" && !is_adoption);
+    let append_reply_handoff = !(fork && matches!(tool, "codex" | "qoder") && !is_adoption);
     (system_prompt, initial_prompt, append_reply_handoff)
 }
 
@@ -1262,8 +1269,8 @@ fn merge_grok_args(original: &[String], resume: &[String]) -> Vec<String> {
 /// the rest. A value flag also given in the resume args takes the resume value,
 /// whichever of its short and long spellings each side used.
 fn merge_qoder_args(original: &[String], resume: &[String]) -> Vec<String> {
-    // Every qodercli flag that takes a value (single token). Needed so a
-    // flag's value is never mistaken for a bare positional and dropped.
+    // Single-value flags; --tools consumes all values up to the next flag.
+    // Values must never be mistaken for positional prompt text.
     const VALUE_FLAGS: &[&str] = &[
         "--model",
         "-m",
@@ -1369,20 +1376,19 @@ fn merge_qoder_args(original: &[String], resume: &[String]) -> Vec<String> {
                 continue;
             }
             let takes_value = VALUE_FLAGS.contains(&bare.as_str()) && !has_eq_value;
-            // `--add-dir` repeats; the others are singular.
-            if resume_flags.contains(&canonical(&bare)) && bare != "--add-dir" {
-                i += 1;
-                if takes_value && i < original.len() {
-                    i += 1;
+            let mut end = i + 1;
+            if bare == "--tools" {
+                while end < original.len() && !is_flag(&original[end]) {
+                    end += 1;
                 }
-                continue;
+            } else if takes_value && end < original.len() {
+                end += 1;
             }
-            filtered_original.push(token.clone());
-            i += 1;
-            if takes_value && i < original.len() {
-                filtered_original.push(original[i].clone());
-                i += 1;
+            // --add-dir repeats; singular flags are replaced as a whole.
+            if !resume_flags.contains(&canonical(&bare)) || bare == "--add-dir" {
+                filtered_original.extend_from_slice(&original[i..end]);
             }
+            i = end;
         } else {
             // A bare positional is the launch prompt: drop it.
             i += 1;
@@ -4234,6 +4240,58 @@ mod tests {
         assert!(!merged.contains(&"n1".to_string()));
         let at = merged.iter().position(|t| t == "--add-dir").unwrap();
         assert_eq!(merged[at + 1], "/a");
+    }
+
+    #[test]
+    fn qoder_resume_identity_does_not_replace_saved_system_prompt() {
+        for fork in [false, true] {
+            let (system, initial, _) = build_resume_prompts(ResumePromptInput {
+                tool: "qoder",
+                display_name: "memo",
+                fork,
+                is_adoption: false,
+                child_name: Some("nova"),
+                effective_tag: None,
+                custom_system_prompt: None,
+                custom_initial_prompt: Some("do work"),
+            });
+            assert!(system.is_none());
+            let initial = initial.unwrap();
+            assert!(initial.contains(if fork { "nova" } else { "memo" }));
+            assert!(initial.contains("do work"));
+        }
+    }
+
+    #[test]
+    fn qoder_resume_preserves_and_replaces_variadic_tools() {
+        for original in [
+            s(&[
+                "--tools", "Read", "Grep", "Edit", "--model", "m", "--", "prompt",
+            ]),
+            s(&[
+                "--tools=Read",
+                "Grep",
+                "Edit",
+                "--model",
+                "m",
+                "--",
+                "prompt",
+            ]),
+        ] {
+            let merged = merge_qoder_args(&original, &s(&["--resume", "sid"]));
+            assert_eq!(&merged[2..], &original[..original.len() - 2]);
+            let resume = s(&["--resume", "sid", "--tools", "Bash", "Write"]);
+            assert_eq!(
+                merge_qoder_args(&original, &resume),
+                s(&[
+                    "--resume", "sid", "--tools", "Bash", "Write", "--model", "m"
+                ])
+            );
+        }
+        assert_eq!(
+            merge_qoder_args(&s(&["--tools", ""]), &s(&["--resume", "sid"])),
+            s(&["--resume", "sid", "--tools", ""])
+        );
     }
 
     #[test]
